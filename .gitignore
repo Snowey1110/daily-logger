@@ -1,0 +1,6 @@
+settings/daily_logger_api_key.txt
+settings/daily_logger_prefs.json
+settings/wifi_warn_list.json
+settings/journal_window_draft.json
+daily_logs/
+__pycache__/
