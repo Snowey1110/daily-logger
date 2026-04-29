@@ -10,6 +10,7 @@
   - `H` to list commands
   - `restore` to reopen latest unsaved journal window draft
   - `startup true` / `startup false` to manage Windows startup
+  - `SB bat` / `SB journal` to add Start Menu shortcuts (under Programs → Daily Logger) so Windows Search can surface the `.bat` launcher or `Journal.xlsx`
   - `Enter` to skip/exit
 - Saves data to Excel files in `daily_logs/`.
 - Supports flexible date input such as:

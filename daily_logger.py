@@ -26,6 +26,10 @@ try:
     import msvcrt
 except Exception:
     msvcrt = None
+try:
+    import readline as _readline  # type: ignore[assignment]
+except ImportError:
+    _readline = None
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -614,6 +618,89 @@ def is_startup_enabled() -> bool:
     return bool(shortcut_path and shortcut_path.exists())
 
 
+def get_start_menu_programs_dir() -> Optional[Path]:
+    appdata = os.getenv("APPDATA", "").strip()
+    if not appdata:
+        return None
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+
+
+def create_start_menu_search_shortcut(
+    shortcut_path: Path,
+    target_path: Path,
+    working_directory: Path,
+    description: str,
+) -> bool:
+    """Create a .lnk in Start Menu Programs so Windows Search can surface the target."""
+    try:
+        shortcut_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    target = str(target_path.resolve()).replace("'", "''")
+    work_dir = str(working_directory.resolve()).replace("'", "''")
+    desc = description.replace("'", "''")
+    lnk = str(shortcut_path).replace("'", "''")
+    ps_script = (
+        "$WshShell = New-Object -ComObject WScript.Shell; "
+        f"$Shortcut = $WshShell.CreateShortcut('{lnk}'); "
+        f"$Shortcut.TargetPath = '{target}'; "
+        f"$Shortcut.WorkingDirectory = '{work_dir}'; "
+        f"$Shortcut.Description = '{desc}'; "
+        "$Shortcut.Save();"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0 and shortcut_path.exists()
+    except OSError:
+        return False
+
+
+def sb_create_bat_search_shortcut() -> bool:
+    programs = get_start_menu_programs_dir()
+    if programs is None:
+        return False
+    folder = programs / "Daily Logger"
+    shortcut_path = folder / "Daily Logger BAT Launcher.lnk"
+    bat_path = BASE_DIR / "launch_daily_logger.bat"
+    if not bat_path.exists():
+        print(f"Missing launcher file: {bat_path}")
+        return False
+    ok = create_start_menu_search_shortcut(
+        shortcut_path,
+        bat_path,
+        BASE_DIR,
+        "Daily Logger batch launcher - search: Daily Logger, BAT, batch, logger",
+    )
+    if ok:
+        print(f"Search shortcut created: {shortcut_path}")
+        print("Try Windows search for: Daily Logger, BAT, or batch.")
+    return ok
+
+
+def sb_create_journal_search_shortcut() -> bool:
+    programs = get_start_menu_programs_dir()
+    if programs is None:
+        return False
+    journal_path = ensure_workbook(MODULES["J"])
+    folder = programs / "Daily Logger"
+    shortcut_path = folder / "Daily Logger Journal Excel.lnk"
+    ok = create_start_menu_search_shortcut(
+        shortcut_path,
+        journal_path,
+        journal_path.parent,
+        "Daily Logger journal workbook - search: Journal, Excel, Daily Logger, xlsx",
+    )
+    if ok:
+        print(f"Search shortcut created: {shortcut_path}")
+        print("Try Windows search for: Daily Logger Journal, Excel, or Journal.")
+    return ok
+
+
 def load_wifi_warn_list() -> List[str]:
     if not WIFI_WARN_FILE.exists():
         return []
@@ -1104,6 +1191,7 @@ def print_chat_help() -> None:
     print("  help - show this help")
     print("  ts   - take screenshot and attach to next AI message")
     print("  rs   - remove pending screenshot attachment")
+    print("  Tab  - complete help / ts / rs; empty line + Tab shows this help")
     print("  Enter on empty line - exit chat")
 
 
@@ -1201,7 +1289,9 @@ def run_chat_mode(with_journal_context: bool, use_thinking_model: bool = False) 
         print('GPT: Hello, how can I help you? If you are stuck type "help"')
     while True:
         question_prompt = "Recap: " if with_journal_context else "You: "
-        question = input(question_prompt).strip()
+        question = input_line_with_tab_completions(
+            question_prompt, CHAT_LINE_COMPLETIONS, on_empty_tab=print_chat_help
+        )
         if is_enter_equivalent(question):
             print(f"Leaving {base_mode_label}.")
             return
@@ -1482,8 +1572,11 @@ def print_main_help() -> None:
     print("  TOKEN ADD [token] - save API token")
     print("  TOKEN RESET - delete saved API token")
     print("  TOKEN COPY - copy current API token")
+    print("  SB bat     - Start Menu shortcut so Windows Search finds the .bat launcher")
+    print("  SB journal - Start Menu shortcut so Windows Search finds Journal.xlsx")
     print("  Enter  - Continue/Exit")
     print("  X      - Exit")
+    print("  Tab    - complete a command; empty line + Tab shows this help")
 
 
 def print_menu(app_name: str) -> None:
@@ -1594,6 +1687,17 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
         else:
             print("Could not disable startup shortcut.")
         return True, app_name
+    if key.startswith("SB "):
+        sub = raw[3:].strip().upper()
+        if sub == "BAT":
+            if not sb_create_bat_search_shortcut():
+                print("Could not create BAT search shortcut.")
+        elif sub == "JOURNAL":
+            if not sb_create_journal_search_shortcut():
+                print("Could not create Journal search shortcut.")
+        else:
+            print('Usage: SB bat   or   SB journal')
+        return True, app_name
     if key == "R":
         run_chat_mode(with_journal_context=True)
         return True, app_name
@@ -1615,7 +1719,7 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
     module = MODULES.get(key)
     if not module:
         print(
-            "Unknown choice. Please enter J, R, RT, C, CT, H, HELP, RENAME, STARTUP TRUE/FALSE, WIFI WARN [name], RESTORE, TOKEN ADD/RESET/COPY, or press Enter to skip."
+            "Unknown choice. Please enter J, R, RT, C, CT, H, HELP, RENAME, STARTUP TRUE/FALSE, SB bat/journal, WIFI WARN [name], RESTORE, TOKEN ADD/RESET/COPY, or press Enter to skip."
         )
         return True, app_name
 
@@ -1627,12 +1731,235 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
     return True, app_name
 
 
+# Full-line menu strings for Tab completion (canonical spelling).
+MAIN_MENU_COMPLETIONS: Tuple[str, ...] = tuple(
+    sorted(
+        {
+            "J",
+            "R",
+            "RT",
+            "C",
+            "CT",
+            "H",
+            "HELP",
+            "X",
+            "RENAME",
+            "RESTORE",
+            "STARTUP TRUE",
+            "STARTUP FALSE",
+            "WIFI WARN ",
+            "TOKEN ADD ",
+            "TOKEN RESET",
+            "TOKEN COPY",
+            "SB bat",
+            "SB journal",
+            "REANAME ",
+        },
+        key=lambda s: s.upper(),
+    )
+)
+
+
+def _lcp_length_case_insensitive(strings: List[str]) -> int:
+    if not strings:
+        return 0
+    upper = [s.upper() for s in strings]
+    limit = min(len(s) for s in upper)
+    i = 0
+    while i < limit and all(s[i] == upper[0][i] for s in upper):
+        i += 1
+    return i
+
+
+CHAT_LINE_COMPLETIONS: Tuple[str, ...] = ("help", "rs", "ts")
+
+
+def _apply_typing_casing(user_line: str, completed_canonical: str) -> str:
+    """Match completion casing to how the user typed (see print_main_help Tab note)."""
+    if not user_line:
+        return completed_canonical
+    if user_line.islower():
+        return completed_canonical.lower()
+    # Sentence-style: "Startup t", "Startup ", "Startup true" — first word Title, rest lowercase.
+    if " " in user_line:
+        first_sp = user_line.find(" ")
+        first_word = user_line[:first_sp]
+        after_last_sp = user_line[user_line.rfind(" ") + 1 :]
+        if (
+            first_word
+            and first_word[0].isupper()
+            and (len(first_word) == 1 or first_word[1:].islower())
+            and (after_last_sp == "" or after_last_sp.islower())
+        ):
+            return completed_canonical.lower()
+    if (
+        len(user_line) >= 2
+        and user_line[0].isupper()
+        and user_line[1:].islower()
+    ):
+        return completed_canonical.lower()
+    return completed_canonical.upper()
+
+
+def _readline_completion_suffix(before: str, cased_full: str, raw_m: str) -> str:
+    """Return the string readline should insert; align before/cased_full by case-insensitive prefix."""
+    n = min(len(before), len(cased_full))
+    i = 0
+    while i < n and before[i].upper() == cased_full[i].upper():
+        i += 1
+    if i == len(before):
+        return cased_full[i:]
+    if cased_full.upper().startswith(before.upper()):
+        return cased_full[len(before) :]
+    return raw_m[len(before) :]
+
+
+def _line_tab_extend(line: str, completions: Tuple[str, ...]) -> Tuple[str, bool]:
+    """Return (new_line, extended) after one Tab press for a fixed completion list."""
+    matches = [c for c in completions if c.upper().startswith(line.upper())]
+    if not matches:
+        return line, False
+    if len(matches) == 1:
+        m = matches[0]
+        if line.upper() == m.upper():
+            return line, False
+        cased = _apply_typing_casing(line, m)
+        return cased, True
+    k = _lcp_length_case_insensitive(matches)
+    unified_canon = matches[0][:k]
+    cased = _apply_typing_casing(line, unified_canon)
+    if cased != line:
+        return cased, True
+    return line, False
+
+
+def _build_readline_line_completer(
+    completions: Tuple[str, ...],
+    on_empty_tab: Optional[Callable[[], None]] = None,
+):
+    def completer(text: str, state: int) -> Optional[str]:
+        if _readline is None:
+            return None
+        if state == 0:
+            line0 = _readline.get_line_buffer()
+            if on_empty_tab and not line0.strip():
+                on_empty_tab()
+                completer._matches = []  # type: ignore[attr-defined]
+                completer._empty_tab_only = True  # type: ignore[attr-defined]
+            else:
+                completer._empty_tab_only = False  # type: ignore[attr-defined]
+                beg = _readline.get_begidx()
+                before = line0[:beg]
+                stem_u = (before + text).upper()
+                completer._matches = sorted(  # type: ignore[attr-defined]
+                    [m for m in completions if m.upper().startswith(stem_u)],
+                    key=lambda s: (len(s), s.upper()),
+                )
+                completer._line0 = line0  # type: ignore[attr-defined]
+                completer._beg0 = beg  # type: ignore[attr-defined]
+        if getattr(completer, "_empty_tab_only", False):
+            return None
+        matches: List[str] = getattr(completer, "_matches", [])
+        line0 = getattr(completer, "_line0", _readline.get_line_buffer())
+        beg0 = getattr(completer, "_beg0", _readline.get_begidx())
+        try:
+            m = matches[state]
+            before = line0[:beg0]
+            cased_full = _apply_typing_casing(line0, m)
+            return _readline_completion_suffix(before, cased_full, m)
+        except (IndexError, AttributeError):
+            return None
+
+    return completer
+
+
+def input_line_with_tab_completions(
+    prompt: str,
+    completions: Tuple[str, ...],
+    on_empty_tab: Optional[Callable[[], None]] = None,
+) -> str:
+    """Read one line with Tab completing against a fixed list (readline, Windows msvcrt, or plain input)."""
+    if _readline is not None:
+        old_completer = _readline.get_completer()
+        old_delims = _readline.get_completer_delims()
+        try:
+            _readline.set_completer(
+                _build_readline_line_completer(completions, on_empty_tab=on_empty_tab)
+            )
+            _readline.set_completer_delims(" \t\n`!@#$%^&*()-=+[{]}\\|;:'\",<>/?")
+            _readline.parse_and_bind("tab: complete")
+            return input(prompt).strip()
+        finally:
+            _readline.set_completer(old_completer)
+            _readline.set_completer_delims(old_delims)
+
+    if msvcrt is not None and sys.platform == "win32":
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        buf: List[str] = []
+        while True:
+            ch = msvcrt.getwch()
+            if ch in "\r\n":
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(buf).strip()
+            if ch == "\x03":
+                sys.stdout.write("\n")
+                raise KeyboardInterrupt
+            if ch in ("\x08", "\x7f"):
+                if buf:
+                    buf.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if ch == "\t":
+                line = "".join(buf)
+                if not line.strip() and on_empty_tab:
+                    on_empty_tab()
+                    sys.stdout.write("\n")
+                    sys.stdout.write(prompt)
+                    sys.stdout.flush()
+                    continue
+                new_line, extended = _line_tab_extend(line, completions)
+                if extended:
+                    for _ in range(len(line)):
+                        sys.stdout.write("\b \b")
+                    sys.stdout.write(new_line)
+                    buf = list(new_line)
+                    sys.stdout.flush()
+                else:
+                    matches = [
+                        c for c in completions if c.upper().startswith(line.upper())
+                    ]
+                    if len(matches) > 1:
+                        sys.stdout.write("\n  " + "\n  ".join(matches) + "\n")
+                        sys.stdout.write(prompt + "".join(buf))
+                        sys.stdout.flush()
+                    else:
+                        sys.stdout.write("\a")
+                        sys.stdout.flush()
+                continue
+            if ord(ch) >= 32:
+                buf.append(ch)
+                sys.stdout.write(ch)
+                sys.stdout.flush()
+
+    return input(prompt).strip()
+
+
+def input_menu_choice(prompt: str) -> str:
+    """Read main menu input with Tab completing known commands."""
+    return input_line_with_tab_completions(
+        prompt, MAIN_MENU_COMPLETIONS, on_empty_tab=print_main_help
+    )
+
+
 def run() -> None:
     app_name = setup_first_time_preferences()
     print(f"{app_name} started.")
     while True:
         print_menu(app_name)
-        choice = input("Your choice: ")
+        choice = input_menu_choice("Your choice: ")
         keep_running, app_name = handle_choice(choice, app_name)
         if not keep_running:
             break
