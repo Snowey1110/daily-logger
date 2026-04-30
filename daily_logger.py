@@ -13,6 +13,7 @@ import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib import error, request
+import zipfile
 
 from openpyxl import Workbook, load_workbook
 try:
@@ -34,6 +35,7 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "daily_logs"
+BACKUP_DIR = DATA_DIR / "backup"
 SETTINGS_DIR = BASE_DIR / "settings"
 MASTER_JOURNAL_SHEET = "Master Journal"
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
@@ -515,6 +517,102 @@ def save_preferences(prefs: Dict[str, str]) -> bool:
         return False
 
 
+def _is_pref_true(value: str) -> bool:
+    return value.strip().lower() == "true"
+
+
+def ensure_backup_folder() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _list_backup_zip_files() -> List[Path]:
+    ensure_backup_folder()
+    return sorted(
+        [path for path in BACKUP_DIR.glob("*.zip") if path.is_file()],
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def run_backup_now() -> Optional[Path]:
+    ensure_backup_folder()
+    items_to_backup = [
+        path
+        for path in DATA_DIR.iterdir()
+        if path.name.lower() != BACKUP_DIR.name.lower()
+    ]
+    if not items_to_backup:
+        return None
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    zip_path = BACKUP_DIR / f"backup_{timestamp}.zip"
+
+    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for item in items_to_backup:
+            if item.is_file():
+                archive.write(item, arcname=item.name)
+                continue
+            if item.is_dir():
+                for nested in item.rglob("*"):
+                    if nested.is_file():
+                        archive.write(nested, arcname=str(nested.relative_to(DATA_DIR)))
+    return zip_path
+
+
+def trim_backups_if_limited(prefs: Dict[str, str]) -> None:
+    if not _is_pref_true(prefs.get("backup_limited", "false")):
+        return
+    backups = _list_backup_zip_files()
+    if len(backups) <= 3:
+        return
+    oldest_backup = backups[-1]
+    try:
+        oldest_backup.unlink()
+        print(f"Backup limited mode: removed oldest backup {oldest_backup.name}")
+    except OSError:
+        print(f"Backup limited mode: could not remove {oldest_backup.name}")
+
+
+def evict_oldest_backup_if_limited_full(prefs: Dict[str, str]) -> None:
+    if not _is_pref_true(prefs.get("backup_limited", "false")):
+        return
+    backups = _list_backup_zip_files()
+    if len(backups) < 3:
+        return
+    oldest_backup = backups[-1]
+    try:
+        oldest_backup.unlink()
+        print(f"Backup limited mode: removed oldest backup {oldest_backup.name} before new backup")
+    except OSError:
+        print(f"Backup limited mode: could not remove {oldest_backup.name} before new backup")
+
+
+def maybe_run_daily_auto_backup() -> None:
+    prefs = load_preferences()
+    backup_enabled = prefs.get("backup_enabled", "true")
+    if not _is_pref_true(backup_enabled):
+        return
+
+    ensure_backup_folder()
+    today = datetime.now().strftime("%Y-%m-%d")
+    last_program_run_date = prefs.get("last_program_run_date", "").strip()
+    if last_program_run_date != today:
+        evict_oldest_backup_if_limited_full(prefs)
+        backup_path = run_backup_now()
+        if backup_path is None:
+            print("Auto backup skipped: nothing in daily_logs to back up.")
+        else:
+            print(f"Auto backup created: {backup_path.name}")
+            trim_backups_if_limited(prefs)
+            prefs["last_backup_date"] = today
+
+    prefs["backup_enabled"] = "true" if _is_pref_true(backup_enabled) else "false"
+    prefs["last_program_run_date"] = today
+    if not save_preferences(prefs):
+        print("Warning: could not save backup preferences.")
+
+
 def prompt_for_app_name() -> str:
     entered = input(
         "What would you like to name this app? (Press Enter for default name): "
@@ -616,6 +714,20 @@ def remove_startup_shortcut() -> bool:
 def is_startup_enabled() -> bool:
     shortcut_path = get_startup_shortcut_path()
     return bool(shortcut_path and shortcut_path.exists())
+
+
+def open_current_directory_in_explorer() -> bool:
+    return open_path_with_default_app(BASE_DIR)
+
+
+def open_path_with_default_app(path: Path) -> bool:
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+            return True
+        return False
+    except OSError:
+        return False
 
 
 def get_start_menu_programs_dir() -> Optional[Path]:
@@ -829,7 +941,7 @@ def normalize_window_time_input(raw: str) -> Optional[str]:
 
 
 def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -> bool:
-    if tk is None or filedialog is None or messagebox is None:
+    if tk is None or messagebox is None:
         print("Window mode is not available on this Python setup.")
         return False
 
@@ -858,6 +970,11 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     root = tk.Tk()
     root.title("Journal Window")
     root.geometry("720x560")
+    # Bring the journal window to front so it does not hide behind the console.
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(250, lambda: root.attributes("-topmost", False))
+    root.focus_force()
     is_edit_mode = bool(edit_target_sheet and edit_target_row > 0)
 
     top = tk.Frame(root)
@@ -870,15 +987,26 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     time_entry = tk.Entry(top, width=16)
     time_entry.grid(row=0, column=3, padx=(6, 0))
     time_entry.insert(0, draft_time)
+    def update_date_time_to_now() -> None:
+        current_now = datetime.now()
+        date_entry.delete(0, "end")
+        date_entry.insert(0, current_now.strftime("%m/%d/%Y"))
+        time_entry.delete(0, "end")
+        time_entry.insert(0, current_now.strftime("%I:%M%p").lstrip("0"))
+        save_draft()
+    tk.Button(top, text="Update Time", command=update_date_time_to_now).grid(
+        row=0, column=4, padx=(10, 0), sticky="w"
+    )
 
     tk.Label(root, text="Journal text:").pack(anchor="w", padx=10)
     text_box = tk.Text(root, wrap="word", height=18)
     text_box.pack(fill="both", expand=True, padx=10, pady=(4, 8))
     text_box.insert("1.0", draft_text)
 
-    images_var = tk.StringVar(value="No image paths attached.")
+    images_var = tk.StringVar(value="No screenshots captured.")
     if draft_images:
-        images_var.set("Attached images:\n" + "\n".join(draft_images))
+        image_lines = [f"P{index}: {path}" for index, path in enumerate(draft_images, start=1)]
+        images_var.set("Screenshots:\n" + "\n".join(image_lines))
     tk.Label(root, textvariable=images_var, justify="left").pack(anchor="w", padx=10)
 
     saved = {"value": False}
@@ -906,20 +1034,19 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     def update_images_label() -> None:
         current = image_paths["value"]
         if not current:
-            images_var.set("No image paths attached.")
+            images_var.set("No screenshots captured.")
         else:
-            images_var.set("Attached images:\n" + "\n".join(current))
+            image_lines = [f"P{index}: {path}" for index, path in enumerate(current, start=1)]
+            images_var.set("Screenshots:\n" + "\n".join(image_lines))
 
-    def attach_images() -> None:
-        selected = filedialog.askopenfilenames(
-            title="Select image(s)",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.webp *.bmp"), ("All files", "*.*")],
-        )
-        if not selected:
+    def take_screenshot_for_entry() -> None:
+        screenshot_path = take_chat_screenshot_hidden_console()
+        if not screenshot_path:
+            messagebox.showerror("Journal Window", "Could not capture screenshot.")
             return
-        for path in selected:
-            if path not in image_paths["value"]:
-                image_paths["value"].append(path)
+        screenshot_value = str(screenshot_path)
+        if screenshot_value not in image_paths["value"]:
+            image_paths["value"].append(screenshot_value)
         update_images_label()
         save_draft()
 
@@ -958,7 +1085,10 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         if not text_value:
             text_value = "(no details entered)"
         if image_paths["value"]:
-            text_value = text_value + "\n\nAttached image paths:\n" + "\n".join(image_paths["value"])
+            screenshot_lines = [
+                f"P{index}: {path}" for index, path in enumerate(image_paths["value"], start=1)
+            ]
+            text_value = text_value + "\n\nScreenshots:\n" + "\n".join(screenshot_lines)
         if edit_target_sheet and edit_target_row > 0:
             saved_ok = update_journal_entry_at(
                 edit_target_sheet,
@@ -980,19 +1110,36 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         root.destroy()
 
     def on_close() -> None:
-        save_draft()
-        should_close = messagebox.askyesno(
-            "Close Journal Window",
-            "Unsaved draft backup is kept. Do you want to close this window?",
-        )
-        if should_close:
+        current_text = text_box.get("1.0", "end-1c").strip()
+        if not current_text and not image_paths["value"]:
+            clear_journal_window_draft()
             if autosave_id["value"] is not None:
                 root.after_cancel(autosave_id["value"])
             root.destroy()
+            return
+        save_choice = messagebox.askyesnocancel(
+            "Close Journal Window",
+            "Do you want to save this journal entry before closing?",
+        )
+        if save_choice is None:
+            return
+        if save_choice:
+            do_save()
+            return
+        should_discard = messagebox.askyesno(
+            "Discard Changes",
+            "Are you sure you want to close without saving to journal? Draft backup is kept.",
+        )
+        if not should_discard:
+            return
+        save_draft()
+        if autosave_id["value"] is not None:
+            root.after_cancel(autosave_id["value"])
+        root.destroy()
 
     button_row = tk.Frame(root)
     button_row.pack(fill="x", padx=10, pady=10)
-    tk.Button(button_row, text="Attach Image Path(s)", command=attach_images).pack(side="left")
+    tk.Button(button_row, text="Take Screenshot 📸", command=take_screenshot_for_entry).pack(side="left")
     tk.Button(button_row, text="Save", command=do_save).pack(side="right")
 
     root.protocol("WM_DELETE_WINDOW", on_close)
@@ -1251,6 +1398,8 @@ def build_user_message(question: str, screenshot_path: Optional[Path]) -> Dict[s
 
 def run_chat_mode(with_journal_context: bool, use_thinking_model: bool = False) -> None:
     base_mode_label = "Recap" if with_journal_context else "Chatbot"
+    if use_thinking_model and with_journal_context:
+        base_mode_label = "Recap (Thinking)"
     if use_thinking_model and not with_journal_context:
         base_mode_label = "Chatbot(Thinking)"
     maybe_warn_for_current_wifi()
@@ -1475,20 +1624,64 @@ def is_journal_workbook_write_locked() -> bool:
         return False
 
 
-def journal_prompts() -> Optional[List[str]]:
+def journal_settings_menu() -> Optional[List[str]]:
+    def print_journal_choice_help() -> None:
+        print("Journal choices:")
+        print("  WINDOW               - open window editor")
+        print("  COINSOLE             - type journal text in console")
+        print("  EDITPREV             - edit latest entry in window")
+        print("  DP                   - delete latest entry")
+        print("  RESTORE              - reopen latest unsaved draft")
+        print("  HELP                 - show this list")
+        print("  Enter                - return to main menu")
+        print("  DEFAULT WINDOWS      - set preferred journal input to window")
+        print("  DEFAULT CONSOLE      - set preferred journal input to console")
+
     while True:
-        note = input("What happened today? ").strip()
+        print_journal_choice_help()
+        note = input_line_with_tab_completions(
+            "Journal choice: ",
+            (
+                "help",
+                "c",
+                "console",
+                "coinsole",
+                "dp",
+                "w",
+                "window",
+                "windows",
+                "editprev",
+                "edit previous",
+                "openprev",
+                "open previous",
+                "restore",
+                "default windows",
+                "default console",
+            ),
+        )
         if is_enter_equivalent(note):
             return None
         if note.lower() == "help":
-            print("Journal commands:")
-            print("  dp   - delete previous journal entry")
-            print("  window - open window editor (text/image/date/time)")
-            print("  editprev - edit latest entry in window")
-            print("  help - show this help")
-            print("  Enter - return to main menu")
+            print_journal_choice_help()
             continue
-        if note.lower() in ("editprev", "edit prev", "edit previous"):
+        if note.lower() in ("c", "console", "coinsole"):
+            typed_note = input("What happened today? ").strip()
+            if is_enter_equivalent(typed_note):
+                return None
+            date_time = ask_entry_date_time()
+            if date_time is None:
+                return None
+            date_value, time_value = date_time
+            return [date_value, time_value, typed_note]
+        if note.lower() in (
+            "editprev",
+            "edit prev",
+            "edit previous",
+            "openprev",
+            "open prev",
+            "openprevious",
+            "open previous",
+        ):
             latest = get_latest_journal_entry_for_edit()
             if not latest:
                 print("No previous journal entry found to edit.")
@@ -1504,8 +1697,31 @@ def journal_prompts() -> Optional[List[str]]:
                 }
             )
             return None
-        if note.lower() == "window":
+        if note.lower() in ("w", "window", "windows"):
             open_journal_window_editor()
+            return None
+        if note.lower() in ("default windows", "default console"):
+            prefs = load_preferences()
+            default_mode = "windows" if note.lower().endswith("windows") else "console"
+            prefs["journal_input_default"] = default_mode
+            if save_preferences(prefs):
+                if default_mode == "windows":
+                    print("Default set to windows. Typing J opens the window editor.")
+                else:
+                    print("Default set to console. Typing J shows journal choices.")
+            else:
+                print("Could not save default journal input preference.")
+            return None
+        if note.lower() == "restore":
+            draft = load_journal_window_draft()
+            if not draft:
+                print("No journal draft to restore.")
+                return None
+            restored = open_journal_window_editor(draft)
+            if restored:
+                print("Restored draft saved.")
+            else:
+                print("Draft restore opened. Unsaved draft remains available.")
             return None
         if note.upper() == "DP":
             latest = get_latest_journal_entry_for_delete()
@@ -1536,13 +1752,27 @@ def journal_prompts() -> Optional[List[str]]:
                 print("Delete cancelled.")
                 break
             return None
-        break
+        print(
+            "Unknown journal choice. Type HELP to see commands, or use C/CONSOLE to write in console."
+        )
 
-    date_time = ask_entry_date_time()
-    if date_time is None:
+
+def journal_prompts() -> Optional[List[str]]:
+    prefs = load_preferences()
+    default_mode = prefs.get("journal_input_default", "").strip().lower() or "windows"
+    if default_mode == "windows":
+        open_journal_window_editor()
         return None
-    date_value, time_value = date_time
-    return [date_value, time_value, note]
+    if default_mode == "console":
+        typed_note = input("What happened today? ").strip()
+        if is_enter_equivalent(typed_note):
+            return None
+        date_time = ask_entry_date_time()
+        if date_time is None:
+            return None
+        date_value, time_value = date_time
+        return [date_value, time_value, typed_note]
+    return journal_settings_menu()
 
 
 MODULES: Dict[str, ModuleConfig] = {
@@ -1564,9 +1794,20 @@ def print_main_help() -> None:
     print("  C      - Chatbot")
     print("  CT     - Chatbot (thinking)")
     print("  H/HELP - show this help")
+    print("  J SETTINGS / JOURNAL SETTINGS - open journal command menu")
     print("  RENAME - change app name")
     print("  STARTUP TRUE  - enable startup shortcut")
     print("  STARTUP FALSE - disable startup shortcut")
+    print("  DEFAULT WINDOWS - typing J opens journal window directly")
+    print("  DEFAULT CONSOLE - typing J shows journal command choices")
+    print("  OPEN DIRECTORY   - open current app folder")
+    print("  OPEN JOURNAL     - open Journal.xlsx")
+    print("  OPEN SCREENSHOTS - open chat_screenshots folder")
+    print("  DIRECTOR OPEN - open current app folder in File Explorer")
+    print("  BACKUP START   - create backup zip in daily_logs/backup")
+    print("  BACKUP TRUE    - auto backup once on each new day (default)")
+    print("  BACKUP FALSE   - disable auto backup")
+    print("  BACKUP LIMITED - keep at most 3 zip files; remove latest when adding")
     print("  WIFI WARN [name] - warn when connected to that Wi-Fi")
     print("  RESTORE - reopen latest unsaved journal window draft")
     print("  TOKEN ADD [token] - save API token")
@@ -1576,6 +1817,7 @@ def print_main_help() -> None:
     print("  SB journal - Start Menu shortcut so Windows Search finds Journal.xlsx")
     print("  Enter  - Continue/Exit")
     print("  X      - Exit")
+    print("  TS     - take screenshot now (not attached outside chat mode)")
     print("  Tab    - complete a command; empty line + Tab shows this help")
 
 
@@ -1600,6 +1842,15 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
         return False, app_name
     if key in ("H", "HELP"):
         print_main_help()
+        return True, app_name
+    if key in ("J SETTINGS", "JOURNAL SETTINGS"):
+        values = journal_settings_menu()
+        if values is None:
+            if load_journal_window_draft():
+                print("Draft saved without journal entry. Use RESTORE to reopen it.")
+            return True, app_name
+        append_row(MODULES["J"], values)
+        print(f'Journal saved to: {DATA_DIR / MODULES["J"].workbook_name}')
         return True, app_name
     if key == "X":
         print("Exit requested.")
@@ -1687,6 +1938,95 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
         else:
             print("Could not disable startup shortcut.")
         return True, app_name
+    if key == "DEFAULT WINDOWS":
+        prefs = load_preferences()
+        prefs["journal_input_default"] = "windows"
+        if save_preferences(prefs):
+            print("Default set to windows. Typing J opens the window editor.")
+        else:
+            print("Could not save default journal input preference.")
+        return True, app_name
+    if key == "DEFAULT CONSOLE":
+        prefs = load_preferences()
+        prefs["journal_input_default"] = "console"
+        if save_preferences(prefs):
+            print("Default set to console. Typing J shows journal choices.")
+        else:
+            print("Could not save default journal input preference.")
+        return True, app_name
+    if key == "DIRECTOR OPEN":
+        if open_current_directory_in_explorer():
+            print(f"Opened folder: {BASE_DIR}")
+        else:
+            print("Could not open current folder in File Explorer.")
+        return True, app_name
+    if key.startswith("OPEN "):
+        open_target = raw[5:].strip().upper()
+        if open_target == "DIRECTORY":
+            if open_current_directory_in_explorer():
+                print(f"Opened folder: {BASE_DIR}")
+            else:
+                print("Could not open current folder in File Explorer.")
+            return True, app_name
+        if open_target == "JOURNAL":
+            journal_path = ensure_workbook(MODULES["J"])
+            if open_path_with_default_app(journal_path):
+                print(f"Opened journal file: {journal_path}")
+            else:
+                print("Could not open Journal.xlsx.")
+            return True, app_name
+        if open_target == "SCREENSHOTS":
+            SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+            if open_path_with_default_app(SCREENSHOT_DIR):
+                print(f"Opened screenshots folder: {SCREENSHOT_DIR}")
+            else:
+                print("Could not open screenshots folder.")
+            return True, app_name
+        print("Usage: OPEN DIRECTORY | OPEN JOURNAL | OPEN SCREENSHOTS")
+        return True, app_name
+    if key == "TS":
+        print("Taking screenshot...")
+        screenshot_path = take_chat_screenshot_hidden_console()
+        if screenshot_path:
+            print(f"Screenshot saved: {screenshot_path}")
+        return True, app_name
+    if key == "BACKUP START":
+        prefs = load_preferences()
+        evict_oldest_backup_if_limited_full(prefs)
+        backup_path = run_backup_now()
+        if backup_path is None:
+            print("No files/folders in daily_logs to back up.")
+            return True, app_name
+        trim_backups_if_limited(prefs)
+        prefs["last_backup_date"] = datetime.now().strftime("%Y-%m-%d")
+        save_preferences(prefs)
+        print(f"Backup created: {backup_path}")
+        return True, app_name
+    if key == "BACKUP TRUE":
+        prefs = load_preferences()
+        prefs["backup_enabled"] = "true"
+        if save_preferences(prefs):
+            print("Auto backup enabled.")
+        else:
+            print("Could not save backup preference.")
+        return True, app_name
+    if key == "BACKUP FALSE":
+        prefs = load_preferences()
+        prefs["backup_enabled"] = "false"
+        if save_preferences(prefs):
+            print("Auto backup disabled.")
+        else:
+            print("Could not save backup preference.")
+        return True, app_name
+    if key == "BACKUP LIMITED":
+        prefs = load_preferences()
+        prefs["backup_limited"] = "true"
+        trim_backups_if_limited(prefs)
+        if save_preferences(prefs):
+            print("Backup limited mode enabled (max 3 zip files).")
+        else:
+            print("Could not save backup limit preference.")
+        return True, app_name
     if key.startswith("SB "):
         sub = raw[3:].strip().upper()
         if sub == "BAT":
@@ -1719,12 +2059,14 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
     module = MODULES.get(key)
     if not module:
         print(
-            "Unknown choice. Please enter J, R, RT, C, CT, H, HELP, RENAME, STARTUP TRUE/FALSE, SB bat/journal, WIFI WARN [name], RESTORE, TOKEN ADD/RESET/COPY, or press Enter to skip."
+            "Unknown choice. Please enter J, J SETTINGS, JOURNAL SETTINGS, R, RT, C, CT, H, HELP, RENAME, STARTUP TRUE/FALSE, DEFAULT WINDOWS/CONSOLE, OPEN DIRECTORY/JOURNAL/SCREENSHOTS, DIRECTOR OPEN, BACKUP START/TRUE/FALSE/LIMITED, TS, SB bat/journal, WIFI WARN [name], RESTORE, TOKEN ADD/RESET/COPY, or press Enter to skip."
         )
         return True, app_name
 
     values = module.prompt_builder()
     if values is None:
+        if key == "J" and load_journal_window_draft():
+            print("Draft saved without journal entry. Use RESTORE to reopen it.")
         return True, app_name
     append_row(module, values)
     print(f"{module.name} saved to: {DATA_DIR / module.workbook_name}")
@@ -1736,6 +2078,8 @@ MAIN_MENU_COMPLETIONS: Tuple[str, ...] = tuple(
     sorted(
         {
             "J",
+            "J SETTINGS",
+            "JOURNAL SETTINGS",
             "R",
             "RT",
             "C",
@@ -1747,6 +2091,17 @@ MAIN_MENU_COMPLETIONS: Tuple[str, ...] = tuple(
             "RESTORE",
             "STARTUP TRUE",
             "STARTUP FALSE",
+            "DEFAULT WINDOWS",
+            "DEFAULT CONSOLE",
+            "OPEN DIRECTORY",
+            "OPEN JOURNAL",
+            "OPEN SCREENSHOTS",
+            "DIRECTOR OPEN",
+            "BACKUP START",
+            "BACKUP TRUE",
+            "BACKUP FALSE",
+            "BACKUP LIMITED",
+            "TS",
             "WIFI WARN ",
             "TOKEN ADD ",
             "TOKEN RESET",
@@ -1899,6 +2254,10 @@ def input_line_with_tab_completions(
         buf: List[str] = []
         while True:
             ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                # Consume second byte for arrow/function keys and ignore them.
+                msvcrt.getwch()
+                continue
             if ch in "\r\n":
                 sys.stdout.write("\n")
                 sys.stdout.flush()
@@ -1956,6 +2315,8 @@ def input_menu_choice(prompt: str) -> str:
 
 def run() -> None:
     app_name = setup_first_time_preferences()
+    ensure_backup_folder()
+    maybe_run_daily_auto_backup()
     print(f"{app_name} started.")
     while True:
         print_menu(app_name)
