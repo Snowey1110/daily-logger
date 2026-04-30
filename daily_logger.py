@@ -1109,7 +1109,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     draft_text = ""
     draft_date = default_date
     draft_time = default_time
-    draft_images: List[str] = []
     edit_target_sheet = ""
     edit_target_row = 0
     if draft_data:
@@ -1121,9 +1120,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             edit_target_row = int(draft_data.get("edit_target_row", 0) or 0)
         except (TypeError, ValueError):
             edit_target_row = 0
-        parsed_images = draft_data.get("images", [])
-        if isinstance(parsed_images, list):
-            draft_images = [str(item) for item in parsed_images if isinstance(item, str)]
 
     root = tk.Tk()
     root.title("Journal Window")
@@ -1160,23 +1156,17 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     text_box = tk.Text(root, wrap="word", height=18)
     text_box.pack(fill="both", expand=True, padx=10, pady=(4, 8))
     text_box.insert("1.0", draft_text)
-
-    images_var = tk.StringVar(value="No screenshots captured.")
-    if draft_images:
-        image_lines = [f"P{index}: {path}" for index, path in enumerate(draft_images, start=1)]
-        images_var.set("Screenshots:\n" + "\n".join(image_lines))
-    tk.Label(root, textvariable=images_var, justify="left").pack(anchor="w", padx=10)
+    text_box.focus_set()
+    root.after(50, text_box.focus_set)
 
     saved = {"value": False}
     autosave_id = {"value": None}
-    image_paths = {"value": draft_images[:]}
 
     def build_draft_dict() -> Dict[str, object]:
         return {
             "text": text_box.get("1.0", "end-1c"),
             "date": date_entry.get().strip(),
             "time": time_entry.get().strip(),
-            "images": image_paths["value"][:],
             "edit_target_sheet": edit_target_sheet,
             "edit_target_row": edit_target_row,
             "updated_at": datetime.now().isoformat(),
@@ -1188,25 +1178,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     def autosave() -> None:
         save_draft()
         autosave_id["value"] = root.after(1500, autosave)
-
-    def update_images_label() -> None:
-        current = image_paths["value"]
-        if not current:
-            images_var.set("No screenshots captured.")
-        else:
-            image_lines = [f"P{index}: {path}" for index, path in enumerate(current, start=1)]
-            images_var.set("Screenshots:\n" + "\n".join(image_lines))
-
-    def take_screenshot_for_entry() -> None:
-        screenshot_path = take_chat_screenshot_hidden_console()
-        if not screenshot_path:
-            messagebox.showerror("Journal Window", "Could not capture screenshot.")
-            return
-        screenshot_value = str(screenshot_path)
-        if screenshot_value not in image_paths["value"]:
-            image_paths["value"].append(screenshot_value)
-        update_images_label()
-        save_draft()
 
     def do_save() -> None:
         raw_date = date_entry.get().strip()
@@ -1242,11 +1213,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             return
         if not text_value:
             text_value = "(no details entered)"
-        if image_paths["value"]:
-            screenshot_lines = [
-                f"P{index}: {path}" for index, path in enumerate(image_paths["value"], start=1)
-            ]
-            text_value = text_value + "\n\nScreenshots:\n" + "\n".join(screenshot_lines)
         if edit_target_sheet and edit_target_row > 0:
             saved_ok = update_journal_entry_at(
                 edit_target_sheet,
@@ -1267,9 +1233,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             root.after_cancel(autosave_id["value"])
         root.destroy()
 
-    def on_close() -> None:
+    def on_close(event=None) -> None:
         current_text = text_box.get("1.0", "end-1c").strip()
-        if not current_text and not image_paths["value"]:
+        if not current_text:
             clear_journal_window_draft()
             if autosave_id["value"] is not None:
                 root.after_cancel(autosave_id["value"])
@@ -1297,9 +1263,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     button_row = tk.Frame(root)
     button_row.pack(fill="x", padx=10, pady=10)
-    tk.Button(button_row, text="Take Screenshot 📸", command=take_screenshot_for_entry).pack(side="left")
     tk.Button(button_row, text="Save", command=do_save).pack(side="right")
 
+    root.bind("<Escape>", on_close)
     root.protocol("WM_DELETE_WINDOW", on_close)
     autosave()
     root.mainloop()
