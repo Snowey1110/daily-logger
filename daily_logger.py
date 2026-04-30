@@ -407,13 +407,65 @@ def load_all_journal_entries() -> List[Tuple[datetime, str, str]]:
 
 
 def build_journal_context() -> str:
+    return build_journal_context_for_range(None)
+
+
+def build_journal_context_for_range(
+    date_range: Optional[Tuple[datetime, datetime]]
+) -> str:
     entries = load_all_journal_entries()
     if not entries:
         return "No journal entries available."
+    if date_range is not None:
+        start_date, end_date = date_range
+        entries = [
+            item
+            for item in entries
+            if start_date.date() <= item[0].date() <= end_date.date()
+        ]
+        if not entries:
+            return "No journal entries available in the selected date range."
     lines = []
     for _, when_value, text in entries:
         lines.append(f"- [{when_value}] {text}")
     return "\n".join(lines)
+
+
+def parse_recap_date_range(raw_range: str, default_year: int) -> Optional[Tuple[datetime, datetime]]:
+    cleaned = " ".join(raw_range.strip().split())
+    if not cleaned:
+        return None
+    normalized = cleaned.replace(".", "/")
+    tokens: List[str]
+    if "-" in normalized:
+        tokens = [part.strip() for part in normalized.split("-", 1)]
+    else:
+        parts = normalized.split()
+        if len(parts) != 2:
+            return None
+        tokens = parts
+    if len(tokens) != 2 or not tokens[0] or not tokens[1]:
+        return None
+    start = parse_flexible_date(tokens[0], default_year)
+    end = parse_flexible_date(tokens[1], default_year)
+    if start is None or end is None:
+        return None
+    if end < start:
+        start, end = end, start
+    return start, end
+
+
+def list_journal_dates_in_range(date_range: Tuple[datetime, datetime]) -> List[str]:
+    start_date, end_date = date_range
+    matched_dates = {
+        entry_date.strftime("%m/%d/%Y")
+        for entry_date, _, _ in load_all_journal_entries()
+        if start_date.date() <= entry_date.date() <= end_date.date()
+    }
+    return sorted(
+        matched_dates,
+        key=lambda value: datetime.strptime(value, "%m/%d/%Y"),
+    )
 
 
 def get_openai_api_key() -> Optional[str]:
@@ -1396,7 +1448,11 @@ def build_user_message(question: str, screenshot_path: Optional[Path]) -> Dict[s
     }
 
 
-def run_chat_mode(with_journal_context: bool, use_thinking_model: bool = False) -> None:
+def run_chat_mode(
+    with_journal_context: bool,
+    use_thinking_model: bool = False,
+    recap_date_range: Optional[Tuple[datetime, datetime]] = None,
+) -> None:
     base_mode_label = "Recap" if with_journal_context else "Chatbot"
     if use_thinking_model and with_journal_context:
         base_mode_label = "Recap (Thinking)"
@@ -1409,7 +1465,14 @@ def run_chat_mode(with_journal_context: bool, use_thinking_model: bool = False) 
 
     system_message = "You are a helpful assistant."
     if with_journal_context:
-        journal_context = build_journal_context()
+        journal_context = build_journal_context_for_range(recap_date_range)
+        if recap_date_range is not None:
+            included_dates = list_journal_dates_in_range(recap_date_range)
+            if included_dates:
+                print("Recap includes journal dates:")
+                print("  " + ", ".join(included_dates))
+            else:
+                print("Recap includes journal dates: (none found in selected range)")
         system_message = (
             "You answer questions only using the user's journal context. "
             "If the answer is not in the journal, say you do not know based on the journal."
@@ -1791,10 +1854,12 @@ def print_main_help() -> None:
     print("  J      - Journal")
     print("  R      - Recap")
     print("  RT     - Recap (thinking)")
+    print("  R [date range] / RT [date range] - recap only within date range")
+    print("      Examples: 4.27 4.30 | 4/27 4/30 | 4/27 - 4/30 | 4/27/2026 - 4/30/2026")
     print("  C      - Chatbot")
     print("  CT     - Chatbot (thinking)")
     print("  H/HELP - show this help")
-    print("  J SETTINGS / JOURNAL SETTINGS - open journal command menu")
+    print("  J SETTINGS / J SETTING / JOURNAL SETTINGS / JS - open journal command menu")
     print("  RENAME - change app name")
     print("  STARTUP TRUE  - enable startup shortcut")
     print("  STARTUP FALSE - disable startup shortcut")
@@ -1843,7 +1908,7 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
     if key in ("H", "HELP"):
         print_main_help()
         return True, app_name
-    if key in ("J SETTINGS", "JOURNAL SETTINGS"):
+    if key in ("J SETTINGS", "J SETTING", "JOURNAL SETTINGS", "JS"):
         values = journal_settings_menu()
         if values is None:
             if load_journal_window_draft():
@@ -2038,6 +2103,20 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
         else:
             print('Usage: SB bat   or   SB journal')
         return True, app_name
+    if key.startswith("RT "):
+        recap_range = parse_recap_date_range(raw[3:].strip(), datetime.now().year)
+        if recap_range is None:
+            print("Invalid date range. Examples: 4.27 4.30 | 4/27 4/30 | 4/27 - 4/30 | 4/27/2026 - 4/30/2026")
+            return True, app_name
+        run_chat_mode(with_journal_context=True, use_thinking_model=True, recap_date_range=recap_range)
+        return True, app_name
+    if key.startswith("R "):
+        recap_range = parse_recap_date_range(raw[2:].strip(), datetime.now().year)
+        if recap_range is None:
+            print("Invalid date range. Examples: 4.27 4.30 | 4/27 4/30 | 4/27 - 4/30 | 4/27/2026 - 4/30/2026")
+            return True, app_name
+        run_chat_mode(with_journal_context=True, recap_date_range=recap_range)
+        return True, app_name
     if key == "R":
         run_chat_mode(with_journal_context=True)
         return True, app_name
@@ -2059,7 +2138,7 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
     module = MODULES.get(key)
     if not module:
         print(
-            "Unknown choice. Please enter J, J SETTINGS, JOURNAL SETTINGS, R, RT, C, CT, H, HELP, RENAME, STARTUP TRUE/FALSE, DEFAULT WINDOWS/CONSOLE, OPEN DIRECTORY/JOURNAL/SCREENSHOTS, DIRECTOR OPEN, BACKUP START/TRUE/FALSE/LIMITED, TS, SB bat/journal, WIFI WARN [name], RESTORE, TOKEN ADD/RESET/COPY, or press Enter to skip."
+            "Unknown choice. Please enter J, J SETTINGS, J SETTING, JOURNAL SETTINGS, JS, R, RT, C, CT, H, HELP, RENAME, STARTUP TRUE/FALSE, DEFAULT WINDOWS/CONSOLE, OPEN DIRECTORY/JOURNAL/SCREENSHOTS, DIRECTOR OPEN, BACKUP START/TRUE/FALSE/LIMITED, TS, SB bat/journal, WIFI WARN [name], RESTORE, TOKEN ADD/RESET/COPY, or press Enter to skip."
         )
         return True, app_name
 
@@ -2079,9 +2158,13 @@ MAIN_MENU_COMPLETIONS: Tuple[str, ...] = tuple(
         {
             "J",
             "J SETTINGS",
+            "J SETTING",
             "JOURNAL SETTINGS",
+            "JS",
             "R",
+            "R ",
             "RT",
+            "RT ",
             "C",
             "CT",
             "H",
