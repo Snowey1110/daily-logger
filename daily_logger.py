@@ -4,18 +4,25 @@ from dataclasses import dataclass
 from datetime import datetime
 import base64
 import ctypes
+import importlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib import error, request
 import zipfile
 
-from openpyxl import Workbook, load_workbook
+try:
+    from openpyxl import Workbook, load_workbook
+except Exception:
+    Workbook = None  # type: ignore[assignment]
+    load_workbook = None  # type: ignore[assignment]
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox
@@ -33,7 +40,10 @@ except ImportError:
     _readline = None
 
 
-BASE_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "daily_logs"
 BACKUP_DIR = DATA_DIR / "backup"
 SETTINGS_DIR = BASE_DIR / "settings"
@@ -56,6 +66,58 @@ class ModuleConfig:
     sheet_name: str
     headers: List[str]
     prompt_builder: Callable[[], Optional[List[str]]]
+
+
+PENDING_UNINSTALL_CONFIRM = False
+
+
+def bind_openpyxl_symbols() -> bool:
+    global Workbook, load_workbook
+    try:
+        openpyxl_module = importlib.import_module("openpyxl")
+        Workbook = openpyxl_module.Workbook
+        load_workbook = openpyxl_module.load_workbook
+        return True
+    except Exception:
+        Workbook = None  # type: ignore[assignment]
+        load_workbook = None  # type: ignore[assignment]
+        return False
+
+
+def ensure_runtime_dependencies() -> bool:
+    required_packages = [
+        ("openpyxl", "openpyxl"),
+        ("mss", "mss"),
+    ]
+    missing = [
+        package_name
+        for module_name, package_name in required_packages
+        if importlib.util.find_spec(module_name) is None
+    ]
+    if missing:
+        print("Missing required Python package(s):")
+        for package_name in missing:
+            print(f"  - {package_name}")
+        print("Install all missing packages now? (y/N): ", end="")
+        answer = input().strip().lower()
+        if answer in ("y", "yes"):
+            print("Installing missing packages...")
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", *missing],
+                capture_output=False,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                print("Package installation failed. Please install manually and try again.")
+                return False
+        else:
+            print("Skipped package installation.")
+
+    if not bind_openpyxl_symbols():
+        print("openpyxl is required to run this app. Please install it and retry.")
+        return False
+    return True
 
 
 def is_enter_equivalent(value: str) -> bool:
@@ -780,6 +842,50 @@ def open_path_with_default_app(path: Path) -> bool:
         return False
     except OSError:
         return False
+
+
+def _remove_path_quietly(path: Path) -> None:
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _schedule_windows_self_delete(exe_path: Path, base_dir: Path) -> None:
+    script_path = Path(tempfile.gettempdir()) / f"daily_logger_uninstall_{int(time.time())}.cmd"
+    script = (
+        "@echo off\n"
+        "timeout /t 2 /nobreak >nul\n"
+        f'del /f /q "{exe_path}" >nul 2>&1\n'
+        f'rd /s /q "{base_dir}" >nul 2>&1\n'
+        f'del /f /q "{script_path}" >nul 2>&1\n'
+    )
+    try:
+        script_path.write_text(script, encoding="utf-8")
+        subprocess.Popen(
+            ["cmd", "/c", str(script_path)],
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+    except OSError:
+        pass
+
+
+def run_clean_uninstall() -> None:
+    remove_startup_shortcut()
+    _remove_path_quietly(DATA_DIR)
+    _remove_path_quietly(SETTINGS_DIR)
+
+    if getattr(sys, "frozen", False):
+        exe_path = Path(sys.executable).resolve()
+        _schedule_windows_self_delete(exe_path, exe_path.parent)
+        print("Uninstall started. App files will be removed after this window closes.")
+        return
+
+    # Dev-mode fallback: do not delete source code automatically.
+    print("Uninstall cleaned app data folders (daily_logs/settings).")
 
 
 def get_start_menu_programs_dir() -> Optional[Path]:
@@ -1873,6 +1979,8 @@ def print_main_help() -> None:
     print("  BACKUP TRUE    - auto backup once on each new day (default)")
     print("  BACKUP FALSE   - disable auto backup")
     print("  BACKUP LIMITED - keep at most 3 zip files; remove latest when adding")
+    print("  UNINSTALL - request uninstall (requires CONFIRM UNINSTALL)")
+    print("  CONFIRM UNINSTALL - permanently remove app data/app files")
     print("  WIFI WARN [name] - warn when connected to that Wi-Fi")
     print("  RESTORE - reopen latest unsaved journal window draft")
     print("  TOKEN ADD [token] - save API token")
@@ -1900,6 +2008,7 @@ def print_menu(app_name: str) -> None:
 
 
 def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
+    global PENDING_UNINSTALL_CONFIRM
     raw = choice.strip()
     key = raw.upper()
     if is_enter_equivalent(key):
@@ -1908,6 +2017,16 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
     if key in ("H", "HELP"):
         print_main_help()
         return True, app_name
+    if key == "UNINSTALL":
+        PENDING_UNINSTALL_CONFIRM = True
+        print('Uninstall requested. Type "CONFIRM UNINSTALL" to continue.')
+        return True, app_name
+    if key == "CONFIRM UNINSTALL":
+        if not PENDING_UNINSTALL_CONFIRM:
+            print('Type "UNINSTALL" first, then "CONFIRM UNINSTALL".')
+            return True, app_name
+        run_clean_uninstall()
+        return False, app_name
     if key in ("J SETTINGS", "J SETTING", "JOURNAL SETTINGS", "JS"):
         values = journal_settings_menu()
         if values is None:
@@ -2138,7 +2257,7 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
     module = MODULES.get(key)
     if not module:
         print(
-            "Unknown choice. Please enter J, J SETTINGS, J SETTING, JOURNAL SETTINGS, JS, R, RT, C, CT, H, HELP, RENAME, STARTUP TRUE/FALSE, DEFAULT WINDOWS/CONSOLE, OPEN DIRECTORY/JOURNAL/SCREENSHOTS, DIRECTOR OPEN, BACKUP START/TRUE/FALSE/LIMITED, TS, SB bat/journal, WIFI WARN [name], RESTORE, TOKEN ADD/RESET/COPY, or press Enter to skip."
+            "Unknown choice. Please enter J, J SETTINGS, J SETTING, JOURNAL SETTINGS, JS, R, RT, C, CT, H, HELP, RENAME, STARTUP TRUE/FALSE, DEFAULT WINDOWS/CONSOLE, OPEN DIRECTORY/JOURNAL/SCREENSHOTS, DIRECTOR OPEN, BACKUP START/TRUE/FALSE/LIMITED, TS, UNINSTALL, CONFIRM UNINSTALL, SB bat/journal, WIFI WARN [name], RESTORE, TOKEN ADD/RESET/COPY, or press Enter to skip."
         )
         return True, app_name
 
@@ -2184,6 +2303,8 @@ MAIN_MENU_COMPLETIONS: Tuple[str, ...] = tuple(
             "BACKUP TRUE",
             "BACKUP FALSE",
             "BACKUP LIMITED",
+            "UNINSTALL",
+            "CONFIRM UNINSTALL",
             "TS",
             "WIFI WARN ",
             "TOKEN ADD ",
@@ -2397,6 +2518,8 @@ def input_menu_choice(prompt: str) -> str:
 
 
 def run() -> None:
+    if not ensure_runtime_dependencies():
+        return
     app_name = setup_first_time_preferences()
     ensure_backup_folder()
     maybe_run_daily_auto_backup()
