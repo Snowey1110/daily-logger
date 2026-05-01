@@ -31,6 +31,10 @@ except Exception:
     filedialog = None
     messagebox = None
 try:
+    from tkcalendar import DateEntry
+except Exception:
+    DateEntry = None  # type: ignore[assignment]
+try:
     import msvcrt
 except Exception:
     msvcrt = None
@@ -1123,7 +1127,15 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     root = tk.Tk()
     root.title("Journal Window")
-    root.geometry("720x560")
+    root.geometry("860x620")
+    root.minsize(760, 560)
+    surface_color = "#0F0F0F"
+    panel_color = "#1A1A1A"
+    field_color = "#141414"
+    text_color = "#E6E6E6"
+    muted_text_color = "#B5B5B5"
+    accent_color = "#2E5A88"
+    root.configure(bg=surface_color)
     # Bring the journal window to front so it does not hide behind the console.
     root.lift()
     root.attributes("-topmost", True)
@@ -1131,15 +1143,68 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     root.focus_force()
     is_edit_mode = bool(edit_target_sheet and edit_target_row > 0)
 
-    top = tk.Frame(root)
-    top.pack(fill="x", padx=10, pady=8)
-    tk.Label(top, text="Date (mm/dd/yyyy):").grid(row=0, column=0, sticky="w")
-    date_entry = tk.Entry(top, width=16)
-    date_entry.grid(row=0, column=1, padx=(6, 20))
-    date_entry.insert(0, draft_date)
-    tk.Label(top, text="Time (hh:mmAM/PM or rn):").grid(row=0, column=2, sticky="w")
-    time_entry = tk.Entry(top, width=16)
-    time_entry.grid(row=0, column=3, padx=(6, 0))
+    top = tk.Frame(root, bg=panel_color, bd=0, highlightthickness=0)
+    top.pack(fill="x", padx=14, pady=(14, 10))
+    top.grid_columnconfigure(5, weight=1)
+    tk.Label(
+        top,
+        text="Date (mm/dd/yyyy):",
+        bg=panel_color,
+        fg=muted_text_color,
+        font=("Segoe UI", 10, "bold"),
+    ).grid(row=0, column=0, sticky="w", padx=(12, 0), pady=12)
+    date_entry: object
+    if DateEntry is not None:
+        date_entry = DateEntry(
+            top,
+            width=14,
+            date_pattern="mm/dd/yyyy",
+            state="normal",  # Keep typing enabled while allowing popup calendar selection.
+            background=accent_color,
+            foreground="white",
+            borderwidth=1,
+        )
+        date_entry.grid(row=0, column=1, padx=(8, 20), pady=12, sticky="w")
+        try:
+            date_entry.set_date(draft_date)
+        except Exception:
+            date_entry.delete(0, "end")
+            date_entry.insert(0, draft_date)
+    else:
+        date_entry = tk.Entry(
+            top,
+            width=16,
+            bg=field_color,
+            fg=text_color,
+            insertbackground=text_color,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#2B2B2B",
+            highlightcolor=accent_color,
+            font=("Segoe UI", 10),
+        )
+        date_entry.grid(row=0, column=1, padx=(8, 20), pady=12, sticky="w")
+        date_entry.insert(0, draft_date)
+    tk.Label(
+        top,
+        text="Time (hh:mmAM/PM or rn):",
+        bg=panel_color,
+        fg=muted_text_color,
+        font=("Segoe UI", 10, "bold"),
+    ).grid(row=0, column=2, sticky="w", pady=12)
+    time_entry = tk.Entry(
+        top,
+        width=16,
+        bg=field_color,
+        fg=text_color,
+        insertbackground=text_color,
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground="#2B2B2B",
+        highlightcolor=accent_color,
+        font=("Segoe UI", 10),
+    )
+    time_entry.grid(row=0, column=3, padx=(8, 0), pady=12)
     time_entry.insert(0, draft_time)
     def update_date_time_to_now() -> None:
         current_now = datetime.now()
@@ -1148,13 +1213,51 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         time_entry.delete(0, "end")
         time_entry.insert(0, current_now.strftime("%I:%M%p").lstrip("0"))
         save_draft()
-    tk.Button(top, text="Update Time", command=update_date_time_to_now).grid(
-        row=0, column=4, padx=(10, 0), sticky="w"
+    tk.Button(
+        top,
+        text="Update Time",
+        command=update_date_time_to_now,
+        bg="#253F5A",
+        fg=text_color,
+        activebackground=accent_color,
+        activeforeground="white",
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+    ).grid(
+        row=0, column=4, padx=(12, 12), sticky="w"
     )
 
-    tk.Label(root, text="Journal text:").pack(anchor="w", padx=10)
-    text_box = tk.Text(root, wrap="word", height=18)
-    text_box.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+    tk.Label(
+        root,
+        text="Journal Text",
+        bg=surface_color,
+        fg=muted_text_color,
+        font=("Segoe UI", 10, "bold"),
+    ).pack(anchor="w", padx=16, pady=(0, 6))
+    editor_frame = tk.Frame(root, bg=panel_color, bd=0, highlightthickness=0)
+    editor_frame.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+    text_box = tk.Text(
+        editor_frame,
+        wrap="word",
+        height=18,
+        bg=field_color,
+        fg=text_color,
+        insertbackground=text_color,
+        relief="flat",
+        padx=12,
+        pady=12,
+        font=("Consolas", 11),
+        highlightthickness=1,
+        highlightbackground="#2B2B2B",
+        highlightcolor=accent_color,
+    )
+    scroll_bar = tk.Scrollbar(editor_frame, command=text_box.yview)
+    text_box.configure(yscrollcommand=scroll_bar.set)
+    text_box.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=12)
+    scroll_bar.pack(side="right", fill="y", padx=(0, 12), pady=12)
     text_box.insert("1.0", draft_text)
     text_box.focus_set()
     root.after(50, text_box.focus_set)
@@ -1261,9 +1364,22 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             root.after_cancel(autosave_id["value"])
         root.destroy()
 
-    button_row = tk.Frame(root)
-    button_row.pack(fill="x", padx=10, pady=10)
-    tk.Button(button_row, text="Save", command=do_save).pack(side="right")
+    button_row = tk.Frame(root, bg=surface_color)
+    button_row.pack(fill="x", padx=14, pady=(0, 14))
+    tk.Button(
+        button_row,
+        text="Save Entry",
+        command=do_save,
+        bg=accent_color,
+        fg="white",
+        activebackground="#3D6C9F",
+        activeforeground="white",
+        relief="flat",
+        font=("Segoe UI", 10, "bold"),
+        padx=18,
+        pady=8,
+        cursor="hand2",
+    ).pack(side="right")
 
     root.bind("<Escape>", on_close)
     root.protocol("WM_DELETE_WINDOW", on_close)
