@@ -5,6 +5,7 @@ from datetime import datetime
 import base64
 import ctypes
 import importlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,9 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+import uuid
+import wave
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib import error, request
 import zipfile
 
@@ -25,11 +28,12 @@ except Exception:
     load_workbook = None  # type: ignore[assignment]
 try:
     import tkinter as tk
-    from tkinter import filedialog, messagebox
+    from tkinter import filedialog, messagebox, ttk
 except Exception:
     tk = None
     filedialog = None
     messagebox = None
+    ttk = None
 try:
     from tkcalendar import DateEntry
 except Exception:
@@ -49,10 +53,31 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "daily_logs"
+RECORDING_DIR = DATA_DIR / "Recording"
 BACKUP_DIR = DATA_DIR / "backup"
 SETTINGS_DIR = BASE_DIR / "settings"
 MASTER_JOURNAL_SHEET = "Master Journal"
+JOURNAL_HEADERS_LEGACY = ["Date", "Time", "Journal"]
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_TRANSCRIPTION_URL = os.getenv(
+    "OPENAI_TRANSCRIPTION_URL", "https://api.openai.com/v1/audio/transcriptions"
+).strip()
+LIVE_STT_CHUNK_INTERVAL_SEC = 5.0
+LIVE_STT_MIN_CHUNK_SAMPLES = int(16000 * 0.4)
+# Journal waveform: int16 PCM RMS soft noise floor and display scale.
+WAVEFORM_RMS_NOISE_FLOOR = 40.0
+WAVEFORM_MAX_DRAW_SAMPLES = 4000
+WAVEFORM_RMS_NORM = 6000.0
+# Smaller input blocks when metering so the canvas updates often enough to feel live.
+WAVEFORM_INPUT_BLOCK_SAMPLES = 512
+# Journal STT / AI report: same button width (text units) and grid min width so text areas align.
+JOURNAL_SIDE_ACTION_BTN_WIDTH_CH = 16
+JOURNAL_SIDE_ACTION_GRID_MINSIZE = 130
+# Whisper list price per audio minute (USD); verify at https://openai.com/pricing
+WHISPER_USD_PER_MIN = 0.006
+# Hover tooltips: narrow wrap → shorter line length, more lines (taller block).
+TOOLTIP_WRAP_PX = 220
+TOOLTIP_WRAP_PX_MAX = 280
 OPENAI_MODEL = "gpt-4o-mini"
 OPENAI_THINKING_MODEL = "gpt-5.5"
 API_KEY_FILE = SETTINGS_DIR / "daily_logger_api_key.txt"
@@ -88,44 +113,129 @@ def bind_openpyxl_symbols() -> bool:
         return False
 
 
+def _pip_install_packages(packages: List[str]) -> bool:
+    if not packages:
+        return True
+    print("Installing:", ", ".join(packages))
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", *packages],
+        capture_output=False,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        print("Package installation failed. Try installing manually:")
+        print(f"  {sys.executable} -m pip install {' '.join(packages)}")
+        return False
+    return True
+
+
+def _missing_modules(specs: List[Tuple[str, str]]) -> List[str]:
+    """Return pip package names whose import modules are not available."""
+    return [
+        pip_name
+        for module_name, pip_name in specs
+        if importlib.util.find_spec(module_name) is None
+    ]
+
+
 def ensure_runtime_dependencies() -> bool:
-    required_packages = [
+    core_specs: List[Tuple[str, str]] = [
         ("openpyxl", "openpyxl"),
         ("mss", "mss"),
     ]
-    missing = [
-        package_name
-        for module_name, package_name in required_packages
-        if importlib.util.find_spec(module_name) is None
+    optional_specs: List[Tuple[str, str, str]] = [
+        ("sounddevice", "sounddevice", "microphone recording for journal speech-to-text"),
+        ("numpy", "numpy", "audio buffers for journal speech-to-text"),
+        ("tkcalendar", "tkcalendar", "calendar popup on the journal date field"),
     ]
-    if missing:
-        print("Missing required Python package(s):")
-        for package_name in missing:
-            print(f"  - {package_name}")
-        print("Install all missing packages now? (y/N): ", end="")
+
+    missing_core = _missing_modules(core_specs)
+    if missing_core:
+        print("Daily Logger requires these Python packages:")
+        for pip_name in missing_core:
+            print(f"  - {pip_name}")
+        print("Install them now? (y/N): ", end="")
         answer = input().strip().lower()
         if answer in ("y", "yes"):
-            print("Installing missing packages...")
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", *missing],
-                capture_output=False,
-                text=True,
-                check=False,
-            )
-            if result.returncode != 0:
-                print("Package installation failed. Please install manually and try again.")
+            if not _pip_install_packages(missing_core):
                 return False
         else:
-            print("Skipped package installation.")
+            print("Skipped installation of required packages.")
+        missing_core = _missing_modules(core_specs)
+        if missing_core:
+            print(
+                "Cannot start: still missing "
+                + ", ".join(missing_core)
+                + ". Install them, then run the app again."
+            )
+            return False
 
     if not bind_openpyxl_symbols():
         print("openpyxl is required to run this app. Please install it and retry.")
         return False
+
+    optional_missing = [
+        (pip_name, blurb)
+        for module_name, pip_name, blurb in optional_specs
+        if importlib.util.find_spec(module_name) is None
+    ]
+    if optional_missing:
+        print("Optional packages for full journal window features:")
+        for pip_name, blurb in optional_missing:
+            print(f"  - {pip_name}: {blurb}")
+        print("Install these now? (y/N): ", end="")
+        answer = input().strip().lower()
+        if answer in ("y", "yes"):
+            pip_names = [item[0] for item in optional_missing]
+            if not _pip_install_packages(pip_names):
+                print("You can install them later with:")
+                print(f"  {sys.executable} -m pip install {' '.join(pip_names)}")
+        else:
+            print("Skipped optional packages. Speech-to-text needs sounddevice and numpy.")
+
     return True
 
 
 def is_enter_equivalent(value: str) -> bool:
     return not value or value.upper() == "X"
+
+
+def _normalize_journal_header_cell(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def migrate_journal_workbook_columns_if_needed(wb, new_headers: List[str]) -> bool:
+    """Expand legacy 3-column journal sheets to five columns without deleting data."""
+    if len(new_headers) != 5:
+        return False
+    legacy = JOURNAL_HEADERS_LEGACY
+    modified = False
+    for ws in wb.worksheets:
+        if ws.max_row < 1:
+            continue
+        first_three = [_normalize_journal_header_cell(ws.cell(row=1, column=col).value) for col in (1, 2, 3)]
+        if first_three != legacy:
+            continue
+        if ws.max_column == 3:
+            ws.insert_cols(4, amount=2)
+            ws.cell(row=1, column=4, value=new_headers[3])
+            ws.cell(row=1, column=5, value=new_headers[4])
+            modified = True
+            continue
+        d1 = _normalize_journal_header_cell(ws.cell(row=1, column=4).value)
+        e1 = _normalize_journal_header_cell(ws.cell(row=1, column=5).value)
+        want_d = new_headers[3].strip()
+        want_e = new_headers[4].strip()
+        if d1 != want_d or e1 != want_e:
+            ws.cell(row=1, column=4, value=new_headers[3])
+            ws.cell(row=1, column=5, value=new_headers[4])
+            modified = True
+    return modified
 
 
 def red_text(value: str) -> str:
@@ -157,6 +267,9 @@ def ensure_workbook(module: ModuleConfig) -> Path:
         return workbook_path
 
     wb = load_workbook(workbook_path)
+    if module.name == "Journal":
+        if migrate_journal_workbook_columns_if_needed(wb, module.headers):
+            save_workbook_with_retry(wb, workbook_path)
     if module.sheet_name not in wb.sheetnames:
         ws = wb.create_sheet(module.sheet_name)
         ws.append(module.headers)
@@ -179,6 +292,10 @@ def append_row(module: ModuleConfig, row: List[str]) -> None:
     wb = load_workbook(workbook_path)
 
     if module.name == "Journal":
+        row_list = list(row)
+        while len(row_list) < len(module.headers):
+            row_list.append("")
+        row = row_list[: len(module.headers)]
         daily_ws = get_or_create_journal_daily_sheet(wb, module, row[0])
         target_row = find_first_empty_data_row(daily_ws, len(module.headers))
         for col_index, value in enumerate(row, start=1):
@@ -379,12 +496,20 @@ def get_latest_journal_entry_for_edit() -> Optional[Dict[str, object]]:
     date_value = "" if latest_values[0] is None else str(latest_values[0])
     time_value = "" if latest_values[1] is None else str(latest_values[1])
     journal_value = "" if latest_values[2] is None else str(latest_values[2])
+    speech_value = ""
+    report_value = ""
+    if len(latest_values) > 3 and latest_values[3] is not None:
+        speech_value = str(latest_values[3])
+    if len(latest_values) > 4 and latest_values[4] is not None:
+        report_value = str(latest_values[4])
     return {
         "sheet_name": latest_sheet.title,
         "row_index": latest_row,
         "date": date_value,
         "time": time_value,
         "text": journal_value,
+        "speech_transcript": speech_value,
+        "ai_report": report_value,
         "images": [],
     }
 
@@ -402,6 +527,11 @@ def update_journal_entry_at(sheet_name: str, row_index: int, row_values: List[st
     ws = wb[sheet_name]
     if row_index < 2:
         return False
+
+    row_list = list(row_values)
+    while len(row_list) < len(module.headers):
+        row_list.append("")
+    row_values = row_list[: len(module.headers)]
 
     for col_index, value in enumerate(row_values, start=1):
         ws.cell(row=row_index, column=col_index, value=value)
@@ -1102,6 +1232,340 @@ def normalize_window_time_input(raw: str) -> Optional[str]:
         return None
 
 
+def transcribe_audio_openai(
+    file_path: Path,
+    language: Optional[str],
+    *,
+    prompt: Optional[str] = None,
+    temperature: float = 0.0,
+) -> str:
+    """Send a local audio file to OpenAI Whisper. Returns transcript text or an error message."""
+    api_key = get_openai_api_key()
+    if not api_key:
+        return "OPENAI_API_KEY is not set. Use TOKEN ADD in the main menu or set the environment variable."
+
+    boundary = uuid.uuid4().hex.encode("ascii")
+    crlf = b"\r\n"
+    body_chunks: List[bytes] = []
+
+    def add_field(name: str, value: str) -> None:
+        body_chunks.append(b"--" + boundary + crlf)
+        body_chunks.append(
+            f'Content-Disposition: form-data; name="{name}"'.encode("utf-8") + crlf + crlf
+        )
+        body_chunks.append(value.encode("utf-8") + crlf)
+
+    add_field("model", "whisper-1")
+    if language:
+        add_field("language", language)
+    if prompt and prompt.strip():
+        add_field("prompt", prompt.strip()[:1500])
+    add_field("temperature", str(temperature))
+
+    filename = file_path.name
+    try:
+        audio_bytes = file_path.read_bytes()
+    except OSError as exc:
+        return f"Could not read audio file: {exc}"
+
+    body_chunks.append(b"--" + boundary + crlf)
+    body_chunks.append(
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"'.encode("utf-8")
+        + crlf
+    )
+    body_chunks.append(b"Content-Type: audio/wav" + crlf + crlf)
+    body_chunks.append(audio_bytes + crlf)
+    body_chunks.append(b"--" + boundary + b"--" + crlf)
+    body = b"".join(body_chunks)
+
+    req = request.Request(
+        OPENAI_TRANSCRIPTION_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary.decode('ascii')}",
+        },
+    )
+
+    try:
+        with request.urlopen(req, timeout=120) as response:
+            raw = response.read().decode("utf-8")
+    except error.HTTPError as exc:
+        try:
+            details = exc.read().decode("utf-8")
+        except Exception:
+            details = str(exc)
+        return f"Whisper API error ({exc.code}): {details}"
+    except Exception as exc:
+        return f"Whisper request failed: {exc}"
+
+    try:
+        parsed = json.loads(raw)
+        text = parsed.get("text")
+        if isinstance(text, str):
+            return text.strip()
+        return "Whisper returned an unexpected response format."
+    except json.JSONDecodeError:
+        return "Whisper returned invalid JSON."
+
+
+def archive_journal_recording(wav_path: Path) -> Optional[Path]:
+    """Copy a session WAV into RECORDING_DIR.
+
+    Files are named rcdYYYYMMDD.wav, then rcdYYYYMMDD1.wav, rcdYYYYMMDD2.wav, … for the same day.
+    """
+    try:
+        RECORDING_DIR.mkdir(parents=True, exist_ok=True)
+        day = datetime.now().strftime("%Y%m%d")
+        base = f"rcd{day}"
+        for n in range(0, 10000):
+            name = f"{base}.wav" if n == 0 else f"{base}{n}.wav"
+            dest = RECORDING_DIR / name
+            if dest.exists():
+                continue
+            shutil.copy2(wav_path, dest)
+            return dest.resolve()
+    except OSError:
+        return None
+
+
+def wav_mono_duration_seconds(path: Path) -> float:
+    """Return duration in seconds for a readable mono WAV, or 0.0 on error."""
+    try:
+        with wave.open(str(path), "rb") as wf:
+            rate = wf.getframerate() or 16000
+            return wf.getnframes() / float(rate)
+    except Exception:
+        return 0.0
+
+
+def estimate_whisper_cost_usd(wav_path: Path) -> Tuple[float, float]:
+    """Return (duration_sec, approximate_usd) using WHISPER_USD_PER_MIN."""
+    dur = wav_mono_duration_seconds(wav_path)
+    usd = (dur / 60.0) * WHISPER_USD_PER_MIN if dur > 0 else 0.0
+    return dur, usd
+
+
+def bind_hover_tooltip(widget: Any, text_callable: Callable[[], str]) -> None:
+    """Show a tooltip only for this widget; place inside its toplevel, hugging edges when clipped."""
+    if tk is None:
+        return
+    tip: Dict[str, Optional[Any]] = {"w": None}
+
+    def hide(_evt: Optional[Any] = None) -> None:
+        tw = tip["w"]
+        if tw is not None:
+            try:
+                tw.destroy()
+            except tk.TclError:
+                pass
+            tip["w"] = None
+
+    def show(evt: Any) -> None:
+        hide()
+        msg = (text_callable() or "").strip()
+        if not msg:
+            return
+        tw = tk.Toplevel(widget)
+        tip["w"] = tw
+        tw.wm_overrideredirect(True)
+        tw.wm_attributes("-topmost", True)
+        lbl = tk.Label(
+            tw,
+            text=msg,
+            justify="left",
+            background="#ffffe0",
+            foreground="#000000",
+            relief="solid",
+            borderwidth=1,
+            font=("Segoe UI", 9),
+            wraplength=TOOLTIP_WRAP_PX,
+        )
+        lbl.pack(ipadx=4, ipady=2)
+        m = 8
+        try:
+            top = widget.winfo_toplevel()
+            top.update_idletasks()
+            win_x = int(top.winfo_rootx())
+            win_y = int(top.winfo_rooty())
+            win_w = max(int(top.winfo_width()), 160)
+            win_h = max(int(top.winfo_height()), 120)
+        except tk.TclError:
+            win_x, win_y = 0, 0
+            win_w, win_h = 800, 600
+        win_r = win_x + win_w
+        win_b = win_y + win_h
+        cx = int(evt.x_root)
+        cy = int(evt.y_root)
+        pref_x = cx + 12
+        pref_y = cy + 12
+        space_right = max(0, win_r - m - pref_x)
+        space_left = max(0, pref_x - win_x - m)
+        if space_right >= space_left:
+            wrap = max(100, min(TOOLTIP_WRAP_PX_MAX, space_right - 8))
+        else:
+            wrap = max(100, min(TOOLTIP_WRAP_PX_MAX, space_left - 8))
+        max_inner = max(100, win_w - 2 * m - 16)
+        lbl.config(wraplength=min(wrap, max_inner, TOOLTIP_WRAP_PX_MAX))
+        tw.update_idletasks()
+        tip_w = int(tw.winfo_reqwidth())
+        tip_h = int(tw.winfo_reqheight())
+        if tip_w > win_w - 2 * m:
+            lbl.config(wraplength=max_inner)
+            tw.update_idletasks()
+            tip_w = int(tw.winfo_reqwidth())
+            tip_h = int(tw.winfo_reqheight())
+        x = pref_x
+        if x + tip_w > win_r - m:
+            x = win_r - m - tip_w
+        if x < win_x + m:
+            x = win_x + m
+        y = pref_y
+        if y + tip_h > win_b - m:
+            y = win_b - m - tip_h
+        if y < win_y + m:
+            y = win_y + m
+        x = max(win_x + m, min(x, win_r - tip_w - m))
+        y = max(win_y + m, min(y, win_b - tip_h - m))
+        tw.wm_geometry(f"+{x}+{y}")
+
+    widget.bind("<Enter>", show, add="+")
+    widget.bind("<Leave>", hide, add="+")
+    widget.bind("<ButtonPress>", hide, add="+")
+
+
+def write_mono_int16_wav(path: Path, samples: object, sample_rate: int) -> Optional[str]:
+    """Write mono int16 PCM to WAV. Returns error string or None on success."""
+    try:
+        import numpy as np
+    except Exception as exc:
+        return str(exc)
+    if not isinstance(samples, np.ndarray):
+        return "Internal error: audio must be a numpy array."
+    arr = np.atleast_1d(samples.squeeze())
+    if arr.dtype != np.int16:
+        arr = arr.astype(np.int16)
+    if arr.size == 0:
+        return "Empty audio buffer."
+    try:
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(arr.tobytes())
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def record_microphone_session_wav(
+    output_path: Path,
+    stop_event: threading.Event,
+    *,
+    sample_rate: int = 16000,
+    chunk_interval_sec: float = LIVE_STT_CHUNK_INTERVAL_SEC,
+    on_audio_chunk: Optional[Callable[[Path], None]] = None,
+    on_pcm_block: Optional[Callable[[Any], None]] = None,
+    pause_event: Optional[threading.Event] = None,
+) -> Optional[str]:
+    """Record mono WAV until stop_event.
+
+    Optional on_audio_chunk(path): periodic temp WAV paths for live STT (legacy).
+    Optional on_pcm_block(block): each captured block as int16 numpy array (mono); runs in the record thread.
+    Optional pause_event: while set, input is still read (to avoid device overrun) but not written to the
+    output buffer and on_pcm_block is not called so metering/waveform can stay frozen until resumed.
+    """
+    try:
+        import numpy as np
+        import sounddevice as sd
+    except Exception as exc:
+        return (
+            "Recording needs optional packages. Install with:\n"
+            f"  {sys.executable} -m pip install sounddevice numpy\n"
+            f"Details: {exc}"
+        )
+
+    frames: List[object] = []
+    last_flushed_samples = 0
+    next_chunk_at = time.monotonic() + chunk_interval_sec
+    block_samples = (
+        WAVEFORM_INPUT_BLOCK_SAMPLES if on_pcm_block is not None else 4096
+    )
+    try:
+        with sd.InputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype=np.int16,
+            blocksize=block_samples,
+        ) as stream:
+            while not stop_event.is_set():
+                data, _overflowed = stream.read(block_samples)
+                if not data.size:
+                    continue
+                if pause_event is not None and pause_event.is_set():
+                    continue
+                frames.append(data.copy())
+                if on_pcm_block is not None:
+                    try:
+                        on_pcm_block(data.copy())
+                    except Exception:
+                        pass
+                if on_audio_chunk is not None:
+                    now = time.monotonic()
+                    if now >= next_chunk_at and frames:
+                        big = np.concatenate(frames, axis=0)
+                        delta = big[last_flushed_samples:]
+                        if delta.size >= LIVE_STT_MIN_CHUNK_SAMPLES:
+                            fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="stt_chunk_")
+                            os.close(fd)
+                            chunk_path = Path(tmp_name)
+                            werr = write_mono_int16_wav(chunk_path, delta, sample_rate)
+                            if werr is None:
+                                on_audio_chunk(chunk_path)
+                                last_flushed_samples = int(big.shape[0])
+                            else:
+                                try:
+                                    chunk_path.unlink(missing_ok=True)
+                                except OSError:
+                                    pass
+                        next_chunk_at = now + chunk_interval_sec
+    except Exception as exc:
+        return str(exc)
+
+    if not frames:
+        return "No audio captured."
+
+    audio = np.concatenate(frames, axis=0)
+    werr = write_mono_int16_wav(output_path, audio, sample_rate)
+    if werr is not None:
+        return werr
+    return None
+
+
+def generate_journal_report_from_sources(journal_text: str, speech_transcript: str) -> str:
+    system_message = (
+        "You produce clear, professional summaries of daily work notes. "
+        "Highlight key activities, decisions, blockers, and suggested follow-ups. "
+        "Use short sections with bullets where appropriate."
+    )
+    user_content = (
+        "### Journal text\n"
+        + (journal_text.strip() or "(empty)")
+        + "\n\n### Speech-to-text transcript\n"
+        + (speech_transcript.strip() or "(none)")
+    )
+    messages: List[Dict[str, object]] = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": user_content},
+    ]
+    return chat_completion(
+        messages,
+        model=OPENAI_THINKING_MODEL,
+        reasoning_effort="high",
+    )
+
+
 def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -> bool:
     if tk is None or messagebox is None:
         print("Window mode is not available on this Python setup.")
@@ -1111,12 +1575,16 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     default_date = now.strftime("%m/%d/%Y")
     default_time = now.strftime("%I:%M%p").lstrip("0")
     draft_text = ""
+    draft_speech = ""
+    draft_report = ""
     draft_date = default_date
     draft_time = default_time
     edit_target_sheet = ""
     edit_target_row = 0
     if draft_data:
         draft_text = str(draft_data.get("text", "") or "")
+        draft_speech = str(draft_data.get("speech_transcript", "") or "")
+        draft_report = str(draft_data.get("ai_report", "") or "")
         draft_date = str(draft_data.get("date", default_date) or default_date)
         draft_time = str(draft_data.get("time", default_time) or default_time)
         edit_target_sheet = str(draft_data.get("edit_target_sheet", "") or "")
@@ -1127,8 +1595,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     root = tk.Tk()
     root.title("Journal Window")
-    root.geometry("860x620")
-    root.minsize(760, 560)
+    root.geometry("1360x720")
+    root.minsize(1020, 620)
     surface_color = "#0F0F0F"
     panel_color = "#1A1A1A"
     field_color = "#141414"
@@ -1230,19 +1698,30 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         row=0, column=4, padx=(12, 12), sticky="w"
     )
 
+    center = tk.Frame(root, bg=surface_color)
+    center.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+    center.grid_columnconfigure(0, weight=2)
+    center.grid_columnconfigure(1, weight=2)
+    center.grid_rowconfigure(0, weight=1)
+
+    left_col = tk.Frame(center, bg=surface_color)
+    left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+    left_col.grid_rowconfigure(1, weight=1)
     tk.Label(
-        root,
+        left_col,
         text="Journal Text",
         bg=surface_color,
         fg=muted_text_color,
         font=("Segoe UI", 10, "bold"),
-    ).pack(anchor="w", padx=16, pady=(0, 6))
-    editor_frame = tk.Frame(root, bg=panel_color, bd=0, highlightthickness=0)
-    editor_frame.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+    ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+    editor_frame = tk.Frame(left_col, bg=panel_color, bd=0, highlightthickness=0)
+    editor_frame.grid(row=1, column=0, sticky="nsew")
+    editor_frame.grid_rowconfigure(0, weight=1)
+    editor_frame.grid_columnconfigure(0, weight=1)
     text_box = tk.Text(
         editor_frame,
         wrap="word",
-        height=18,
+        height=12,
         bg=field_color,
         fg=text_color,
         insertbackground=text_color,
@@ -1256,11 +1735,706 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     )
     scroll_bar = tk.Scrollbar(editor_frame, command=text_box.yview)
     text_box.configure(yscrollcommand=scroll_bar.set)
-    text_box.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=12)
-    scroll_bar.pack(side="right", fill="y", padx=(0, 12), pady=12)
+    text_box.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=12)
+    scroll_bar.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=12)
     text_box.insert("1.0", draft_text)
     text_box.focus_set()
     root.after(50, text_box.focus_set)
+
+    right_col = tk.Frame(center, bg=surface_color)
+    right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+    right_col.grid_rowconfigure(0, weight=1)
+    right_col.grid_rowconfigure(1, weight=1)
+    right_col.grid_columnconfigure(0, weight=1)
+
+    stt_outer = tk.Frame(right_col, bg=surface_color)
+    stt_outer.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
+    stt_outer.grid_columnconfigure(0, weight=1)
+    stt_header = tk.Frame(stt_outer, bg=surface_color)
+    stt_header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+    stt_header.grid_columnconfigure(1, weight=1)
+    tk.Label(
+        stt_header,
+        text="Speech to text",
+        bg=surface_color,
+        fg=muted_text_color,
+        font=("Segoe UI", 10, "bold"),
+    ).grid(row=0, column=0, sticky="w")
+    stt_saved_path_var = tk.StringVar(value="")
+    stt_saved_path_entry = tk.Entry(
+        stt_header,
+        textvariable=stt_saved_path_var,
+        state="readonly",
+        readonlybackground=surface_color,
+        fg=muted_text_color,
+        font=("Segoe UI", 8),
+        relief="flat",
+        borderwidth=0,
+        highlightthickness=0,
+        highlightbackground=surface_color,
+        insertwidth=0,
+        justify="right",
+        takefocus=1,
+        selectbackground=accent_color,
+        selectforeground="white",
+        cursor="xterm",
+    )
+    stt_saved_path_entry.grid(row=0, column=1, sticky="ew", padx=(14, 8))
+
+    def _set_stt_saved_path_display(text: str) -> None:
+        stt_saved_path_entry.config(state="normal")
+        stt_saved_path_var.set(text)
+        stt_saved_path_entry.config(state="readonly")
+
+    def open_journal_recording_folder() -> None:
+        try:
+            RECORDING_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        open_path_with_default_app(RECORDING_DIR)
+
+    open_recording_btn = tk.Button(
+        stt_header,
+        text="Open",
+        command=open_journal_recording_folder,
+        bg="#253F5A",
+        fg=text_color,
+        activebackground=accent_color,
+        activeforeground="white",
+        relief="flat",
+        font=("Segoe UI", 8, "bold"),
+        padx=6,
+        pady=2,
+        cursor="hand2",
+    )
+    open_recording_btn.grid(row=0, column=2, sticky="e")
+
+    def open_recording_tooltip_text() -> str:
+        return "Opens the recording directory."
+
+    bind_hover_tooltip(open_recording_btn, open_recording_tooltip_text)
+
+    stt_top = tk.Frame(stt_outer, bg=panel_color, bd=0, highlightthickness=0)
+    stt_top.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+    stt_top.grid_columnconfigure(5, weight=1)
+    lang_var = tk.StringVar(value="Auto")
+
+    stt_status = tk.Label(
+        stt_top,
+        text="",
+        bg=panel_color,
+        fg=muted_text_color,
+        font=("Segoe UI", 9),
+        anchor="w",
+        justify="left",
+        wraplength=420,
+    )
+
+    if ttk is not None:
+        lang_combo = ttk.Combobox(
+            stt_top,
+            textvariable=lang_var,
+            values=("Auto", "English", "简体中文"),
+            state="readonly",
+            width=11,
+        )
+    else:
+        lang_combo = tk.OptionMenu(stt_top, lang_var, "Auto", "English", "简体中文")
+        lang_combo.config(bg=panel_color, fg=text_color, highlightthickness=0)
+
+    stt_frame = tk.Frame(stt_outer, bg=panel_color, bd=0, highlightthickness=0)
+    stt_frame.grid(row=2, column=0, sticky="nsew")
+    stt_frame.grid_rowconfigure(0, weight=0)
+    stt_frame.grid_rowconfigure(1, weight=1)
+    stt_frame.grid_columnconfigure(0, weight=1)
+    stt_frame.grid_columnconfigure(2, minsize=JOURNAL_SIDE_ACTION_GRID_MINSIZE)
+    stt_outer.grid_rowconfigure(2, weight=1)
+
+    wave_canvas = tk.Canvas(
+        stt_frame,
+        height=52,
+        bg=field_color,
+        highlightthickness=1,
+        highlightbackground="#2B2B2B",
+        highlightcolor=accent_color,
+    )
+    wave_canvas.grid(row=0, column=0, columnspan=3, sticky="ew", padx=10, pady=(10, 4))
+
+    stt_box = tk.Text(
+        stt_frame,
+        wrap="word",
+        height=8,
+        bg=field_color,
+        fg=text_color,
+        insertbackground=text_color,
+        relief="flat",
+        padx=10,
+        pady=10,
+        font=("Segoe UI", 10),
+        highlightthickness=1,
+        highlightbackground="#2B2B2B",
+        highlightcolor=accent_color,
+    )
+    stt_scroll = tk.Scrollbar(stt_frame, command=stt_box.yview)
+    stt_box.configure(yscrollcommand=stt_scroll.set)
+    stt_box.grid(row=1, column=0, sticky="nsew", padx=(10, 0), pady=(4, 10))
+    stt_scroll.grid(row=1, column=1, sticky="ns", padx=(0, 2), pady=(4, 10))
+    transcribe_hover = tk.Frame(stt_frame, bg=panel_color)
+    transcribe_hover.grid(row=1, column=2, sticky="ns", padx=(2, 10), pady=(4, 10))
+    transcribe_btn = tk.Button(
+        transcribe_hover,
+        text="Transcribe",
+        state="disabled",
+        width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+        bg="#1a2d42",
+        fg=muted_text_color,
+        activebackground="#253F5A",
+        activeforeground=text_color,
+        disabledforeground=muted_text_color,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=8,
+        cursor="hand2",
+    )
+    transcribe_btn.pack()
+    stt_box.insert("1.0", draft_speech)
+
+    report_outer = tk.Frame(right_col, bg=surface_color)
+    report_outer.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+    report_outer.grid_rowconfigure(1, weight=1)
+    report_outer.grid_columnconfigure(0, weight=1)
+    report_header = tk.Frame(report_outer, bg=surface_color)
+    report_header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+    report_header.grid_columnconfigure(1, weight=1)
+    tk.Label(
+        report_header,
+        text="AI report",
+        bg=surface_color,
+        fg=muted_text_color,
+        font=("Segoe UI", 10, "bold"),
+    ).grid(row=0, column=0, sticky="w")
+    report_status = tk.Label(
+        report_header,
+        text="",
+        bg=surface_color,
+        fg=muted_text_color,
+        font=("Segoe UI", 9),
+        anchor="e",
+    )
+    report_status.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+    report_frame = tk.Frame(report_outer, bg=panel_color, bd=0, highlightthickness=0)
+    report_frame.grid(row=1, column=0, sticky="nsew")
+    report_frame.grid_rowconfigure(0, weight=1)
+    report_frame.grid_columnconfigure(0, weight=1)
+    report_frame.grid_columnconfigure(2, minsize=JOURNAL_SIDE_ACTION_GRID_MINSIZE)
+    report_box = tk.Text(
+        report_frame,
+        wrap="word",
+        height=8,
+        bg=field_color,
+        fg=text_color,
+        insertbackground=text_color,
+        relief="flat",
+        padx=10,
+        pady=10,
+        font=("Consolas", 10),
+        highlightthickness=1,
+        highlightbackground="#2B2B2B",
+        highlightcolor=accent_color,
+    )
+    report_scroll = tk.Scrollbar(report_frame, command=report_box.yview)
+    report_box.configure(yscrollcommand=report_scroll.set)
+    report_box.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=(4, 10))
+    report_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 2), pady=(4, 10))
+    gen_report_hover = tk.Frame(report_frame, bg=panel_color)
+    gen_report_hover.grid(row=0, column=2, sticky="ns", padx=(2, 10), pady=(4, 10))
+    gen_button = tk.Button(
+        gen_report_hover,
+        text="Generate report",
+        width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+        bg="#253F5A",
+        fg=text_color,
+        activebackground=accent_color,
+        activeforeground="white",
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=8,
+        cursor="hand2",
+    )
+    gen_button.pack()
+    report_box.insert("1.0", draft_report)
+
+    save_entry_btn_holder: Dict[str, Any] = {"btn": None}
+
+    def refresh_save_entry_state() -> None:
+        btn = save_entry_btn_holder.get("btn")
+        if btn is None:
+            return
+        has_any = bool(
+            text_box.get("1.0", "end-1c").strip()
+            or stt_box.get("1.0", "end-1c").strip()
+            or report_box.get("1.0", "end-1c").strip()
+        )
+        if has_any:
+            btn.config(
+                state="normal",
+                bg=accent_color,
+                fg="white",
+                activebackground="#3D6C9F",
+                activeforeground="white",
+                cursor="hand2",
+            )
+        else:
+            btn.config(
+                state="disabled",
+                bg="#1a2d42",
+                fg=muted_text_color,
+                disabledforeground=muted_text_color,
+                cursor="arrow",
+            )
+
+    record_stop = threading.Event()
+    record_pause = threading.Event()
+    record_thread_holder: Dict[str, object] = {"thread": None}
+    record_path_holder: Dict[str, object] = {"path": None}
+    recording_ui_busy = {"v": False}
+    last_journal_wav: Dict[str, Optional[Path]] = {"path": None}
+    transcribing_busy = {"v": False}
+    wave_lock = threading.Lock()
+    wave_holder: Dict[str, List[float]] = {"levels": []}
+    wave_gate: Dict[str, Any] = {"rms": 0.0}
+    wave_after: Dict[str, Optional[Any]] = {"id": None}
+
+    def cancel_wave_tick() -> None:
+        wid = wave_after["id"]
+        if wid is not None:
+            try:
+                root.after_cancel(wid)
+            except tk.TclError:
+                pass
+            wave_after["id"] = None
+
+    def redraw_waveform_canvas() -> None:
+        with wave_lock:
+            pts = list(wave_holder["levels"])
+        wave_canvas.update_idletasks()
+        wpx = max(40, int(wave_canvas.winfo_width()))
+        hpx = max(30, int(wave_canvas.winfo_height()))
+        wave_canvas.delete("all")
+        mid = hpx * 0.5
+        base_color = muted_text_color if isinstance(muted_text_color, str) else "#888888"
+        if len(pts) < 1:
+            wave_canvas.create_line(4, mid, wpx - 4, mid, fill=base_color, width=1)
+            return
+        if len(pts) == 1:
+            v = float(pts[0])
+            y0 = mid - v * (hpx * 0.38)
+            wave_canvas.create_line(4, y0, wpx - 4, y0, fill=accent_color, width=1)
+            return
+        n = len(pts)
+        coords: List[float] = []
+        for i, v in enumerate(pts):
+            x = 4.0 + (wpx - 8.0) * (i / max(n - 1, 1))
+            y = mid - float(v) * (hpx * 0.38)
+            coords.extend([x, y])
+        wave_canvas.create_line(*coords, fill=accent_color, width=1)
+
+    def wave_tick() -> None:
+        if not recording_ui_busy["v"]:
+            wave_after["id"] = None
+            return
+        redraw_waveform_canvas()
+        wave_after["id"] = root.after(33, wave_tick)
+
+    def start_wave_tick() -> None:
+        cancel_wave_tick()
+        wave_after["id"] = root.after(33, wave_tick)
+
+    def reset_waveform_session() -> None:
+        cancel_wave_tick()
+        with wave_lock:
+            wave_holder["levels"].clear()
+        wave_gate["rms"] = 0.0
+        redraw_waveform_canvas()
+
+    def on_pcm_block_journal(block: Any) -> None:
+        try:
+            import numpy as np
+
+            flat = np.asarray(block, dtype=np.float64).reshape(-1)
+            if flat.size == 0:
+                return
+            rms = float(np.sqrt(np.mean(flat * flat)))
+            wave_gate["rms"] = rms
+            adj = max(0.0, rms - WAVEFORM_RMS_NOISE_FLOOR)
+            denom = max(WAVEFORM_RMS_NORM - WAVEFORM_RMS_NOISE_FLOOR, 1.0)
+            peak = min(1.0, adj / denom)
+            with wave_lock:
+                levels = wave_holder["levels"]
+                levels.append(peak)
+                over = len(levels) - WAVEFORM_MAX_DRAW_SAMPLES
+                if over > 0:
+                    del levels[:over]
+        except Exception:
+            pass
+
+    def update_transcribe_ui() -> None:
+        if transcribing_busy["v"]:
+            transcribe_btn.config(
+                state="disabled",
+                width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+            )
+            return
+        p = last_journal_wav.get("path")
+        if p is not None and isinstance(p, Path) and p.exists():
+            transcribe_btn.config(
+                state="normal",
+                width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+                bg="#253F5A",
+                fg=text_color,
+                activebackground=accent_color,
+                activeforeground="white",
+            )
+        else:
+            transcribe_btn.config(
+                state="disabled",
+                width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+                bg="#1a2d42",
+                fg=muted_text_color,
+                activebackground="#253F5A",
+                activeforeground=text_color,
+            )
+
+    def transcribe_tooltip_text() -> str:
+        if transcribing_busy["v"]:
+            return "Transcribing…"
+        p = last_journal_wav.get("path")
+        if p is None or not isinstance(p, Path) or not p.exists():
+            return "Record an audio first"
+        return (
+            "Transcribe previous recording to text.\n"
+            "Uses a small amount of API cost."
+        )
+
+    def run_transcribe() -> None:
+        p = last_journal_wav.get("path")
+        if p is None or not isinstance(p, Path) or not p.exists():
+            return
+        if transcribing_busy["v"]:
+            return
+        if not get_openai_api_key():
+            messagebox.showerror(
+                "Speech to text",
+                "No OpenAI API key. Use TOKEN ADD in the main menu or set OPENAI_API_KEY.",
+            )
+            return
+        transcribing_busy["v"] = True
+        update_transcribe_ui()
+        stt_status.config(text="Transcribing…")
+        lang_snap = _language_code_for_whisper()
+
+        def work() -> None:
+            result = transcribe_audio_openai(p, lang_snap, temperature=0.0)
+
+            def done() -> None:
+                transcribing_busy["v"] = False
+                update_transcribe_ui()
+                stt_status.config(text="")
+                if _is_likely_api_error_message(result):
+                    messagebox.showerror("Speech to text", result[:4000])
+                    return
+                final_text = result.strip()
+                if final_text:
+                    if stt_box.get("1.0", "end-1c").strip():
+                        stt_box.insert("end", " ")
+                    stt_box.insert("end", final_text)
+                save_draft()
+                refresh_save_entry_state()
+
+            root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    transcribe_btn.config(command=run_transcribe)
+    bind_hover_tooltip(transcribe_btn, transcribe_tooltip_text)
+    wave_canvas.bind("<Configure>", lambda _e: redraw_waveform_canvas())
+    wave_canvas.after(80, redraw_waveform_canvas)
+
+    def _language_code_for_whisper() -> Optional[str]:
+        choice = lang_var.get().strip()
+        if choice == "English":
+            return "en"
+        if choice in ("简体中文", "中文", "Chinese"):
+            return "zh"
+        return None
+
+    def _is_likely_api_error_message(text: str) -> bool:
+        t = text.strip()
+        if not t:
+            return False
+        prefixes = (
+            "OPENAI_API_KEY",
+            "ChatGPT API error",
+            "Failed to contact ChatGPT",
+            "ChatGPT returned",
+            "No response received",
+            "Whisper API error",
+            "Whisper request failed",
+            "Whisper returned",
+            "Could not read audio file",
+            "Recording needs optional packages",
+        )
+        return any(t.startswith(p) for p in prefixes)
+
+    def _journal_rec_btn_set(btn: Any, enabled: bool) -> None:
+        if enabled:
+            btn.config(
+                state="normal",
+                bg="#253F5A",
+                fg=text_color,
+                activebackground=accent_color,
+                activeforeground="white",
+                cursor="hand2",
+            )
+        else:
+            btn.config(
+                state="disabled",
+                bg="#1a2d42",
+                fg=muted_text_color,
+                disabledforeground=muted_text_color,
+                cursor="arrow",
+            )
+
+    def on_record_worker_finished(err: Optional[str], wav_path: Optional[Path]) -> None:
+        record_thread_holder["thread"] = None
+        record_pause.clear()
+        cancel_wave_tick()
+        if err:
+            recording_ui_busy["v"] = False
+            last_journal_wav["path"] = None
+            update_transcribe_ui()
+            stt_status.config(text="")
+            _set_stt_saved_path_display("")
+            _journal_rec_btn_set(start_rec_button, True)
+            _journal_rec_btn_set(pause_rec_button, False)
+            _journal_rec_btn_set(stop_rec_button, False)
+            pause_rec_button.config(text="Pause recording")
+            if ttk is not None:
+                lang_combo.config(state="readonly")
+            else:
+                lang_combo.config(state="normal")
+            if wav_path is not None:
+                try:
+                    wav_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            reset_waveform_session()
+            messagebox.showerror("Speech to text", err[:4000])
+            return
+        if wav_path is None or not wav_path.exists():
+            recording_ui_busy["v"] = False
+            last_journal_wav["path"] = None
+            update_transcribe_ui()
+            stt_status.config(text="")
+            _set_stt_saved_path_display("")
+            _journal_rec_btn_set(start_rec_button, True)
+            _journal_rec_btn_set(pause_rec_button, False)
+            _journal_rec_btn_set(stop_rec_button, False)
+            pause_rec_button.config(text="Pause recording")
+            if ttk is not None:
+                lang_combo.config(state="readonly")
+            else:
+                lang_combo.config(state="normal")
+            reset_waveform_session()
+            return
+        dest = archive_journal_recording(wav_path)
+        try:
+            wav_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        recording_ui_busy["v"] = False
+        _journal_rec_btn_set(start_rec_button, True)
+        _journal_rec_btn_set(pause_rec_button, False)
+        _journal_rec_btn_set(stop_rec_button, False)
+        pause_rec_button.config(text="Pause recording")
+        if ttk is not None:
+            lang_combo.config(state="readonly")
+        else:
+            lang_combo.config(state="normal")
+        reset_waveform_session()
+        if dest is not None:
+            last_journal_wav["path"] = dest
+            stt_status.config(text="")
+            _set_stt_saved_path_display(f"Saved: {str(dest)}")
+        else:
+            last_journal_wav["path"] = None
+            _set_stt_saved_path_display("")
+            stt_status.config(
+                text=f"Recording finished (could not copy to {RECORDING_DIR}).",
+            )
+        update_transcribe_ui()
+
+    def record_worker_main(wav_path: Path) -> None:
+        err = record_microphone_session_wav(
+            wav_path,
+            record_stop,
+            chunk_interval_sec=LIVE_STT_CHUNK_INTERVAL_SEC,
+            on_audio_chunk=None,
+            on_pcm_block=on_pcm_block_journal,
+            pause_event=record_pause,
+        )
+        root.after(0, lambda: on_record_worker_finished(err, wav_path))
+
+    def start_recording() -> None:
+        if recording_ui_busy["v"]:
+            return
+        fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="journal_mic_")
+        os.close(fd)
+        tmp = Path(tmp_name)
+        record_path_holder["path"] = tmp
+        last_journal_wav["path"] = None
+        update_transcribe_ui()
+        _set_stt_saved_path_display("")
+        record_stop.clear()
+        record_pause.clear()
+        recording_ui_busy["v"] = True
+        reset_waveform_session()
+        start_wave_tick()
+        _journal_rec_btn_set(start_rec_button, False)
+        _journal_rec_btn_set(pause_rec_button, True)
+        _journal_rec_btn_set(stop_rec_button, True)
+        pause_rec_button.config(text="Pause recording")
+        if ttk is not None:
+            lang_combo.config(state="disabled")
+        else:
+            lang_combo.config(state="disabled")
+        stt_status.config(text="Recording…")
+        th = threading.Thread(target=record_worker_main, args=(tmp,), daemon=True)
+        record_thread_holder["thread"] = th
+        th.start()
+
+    def stop_recording() -> None:
+        th = record_thread_holder["thread"]
+        if not (
+            recording_ui_busy["v"]
+            and isinstance(th, threading.Thread)
+            and th.is_alive()
+        ):
+            return
+        stt_status.config(text="Stopping…")
+        record_stop.set()
+        record_pause.clear()
+        _journal_rec_btn_set(start_rec_button, False)
+        _journal_rec_btn_set(pause_rec_button, False)
+        _journal_rec_btn_set(stop_rec_button, False)
+
+    def toggle_pause_recording() -> None:
+        th = record_thread_holder["thread"]
+        if not (
+            recording_ui_busy["v"]
+            and isinstance(th, threading.Thread)
+            and th.is_alive()
+        ):
+            return
+        if record_pause.is_set():
+            record_pause.clear()
+            pause_rec_button.config(text="Pause recording")
+            stt_status.config(text="Recording…")
+        else:
+            record_pause.set()
+            pause_rec_button.config(text="Resume recording")
+            stt_status.config(text="Recording paused")
+
+    start_rec_button = tk.Button(
+        stt_top,
+        text="Start recording",
+        command=start_recording,
+        bg="#253F5A",
+        fg=text_color,
+        activebackground=accent_color,
+        activeforeground="white",
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=6,
+        cursor="hand2",
+    )
+    pause_rec_button = tk.Button(
+        stt_top,
+        text="Pause recording",
+        command=toggle_pause_recording,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=8,
+        pady=6,
+    )
+    stop_rec_button = tk.Button(
+        stt_top,
+        text="Stop recording",
+        command=stop_recording,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=8,
+        pady=6,
+    )
+    _journal_rec_btn_set(pause_rec_button, False)
+    _journal_rec_btn_set(stop_rec_button, False)
+    start_rec_button.grid(row=0, column=0, sticky="w", padx=(12, 4), pady=8)
+    pause_rec_button.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=8)
+    stop_rec_button.grid(row=0, column=2, sticky="w", padx=(0, 8), pady=8)
+    stt_status.grid(row=0, column=3, sticky="ew", padx=(4, 12), pady=8)
+    stt_lang_lbl = tk.Label(
+        stt_top,
+        text="Language:",
+        bg=panel_color,
+        fg=muted_text_color,
+        font=("Segoe UI", 9),
+    )
+    stt_lang_lbl.grid(row=0, column=4, sticky="w", padx=(4, 0), pady=8)
+    lang_combo.grid(row=0, column=5, sticky="ew", padx=(8, 12), pady=8)
+
+    def run_generate_report() -> None:
+        if not get_openai_api_key():
+            messagebox.showerror(
+                "Journal Window",
+                "No OpenAI API key. Use TOKEN ADD in the main menu or set OPENAI_API_KEY.",
+            )
+            return
+        gen_button.config(state="disabled")
+        report_status.config(text="Generating…")
+
+        def work() -> None:
+            body = generate_journal_report_from_sources(
+                text_box.get("1.0", "end-1c"),
+                stt_box.get("1.0", "end-1c"),
+            )
+            root.after(0, lambda b=body: on_generate_report_done(b))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_generate_report_done(body: str) -> None:
+        gen_button.config(state="normal")
+        report_status.config(text="")
+        if _is_likely_api_error_message(body):
+            messagebox.showerror("AI report", body[:4000])
+            return
+        report_box.delete("1.0", "end")
+        report_box.insert("1.0", body.strip())
+        save_draft()
+        refresh_save_entry_state()
+
+    gen_button.config(command=run_generate_report)
+
+    def generate_report_tooltip_text() -> str:
+        return (
+            "Uses the AI report feature (ChatGPT) to build a summary from your journal text "
+            "and speech transcript. Requires an API key and uses paid API usage."
+        )
+
+    bind_hover_tooltip(gen_button, generate_report_tooltip_text)
 
     saved = {"value": False}
     autosave_id = {"value": None}
@@ -1268,6 +2442,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     def build_draft_dict() -> Dict[str, object]:
         return {
             "text": text_box.get("1.0", "end-1c"),
+            "speech_transcript": stt_box.get("1.0", "end-1c"),
+            "ai_report": report_box.get("1.0", "end-1c"),
             "date": date_entry.get().strip(),
             "time": time_entry.get().strip(),
             "edit_target_sheet": edit_target_sheet,
@@ -1283,6 +2459,12 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         autosave_id["value"] = root.after(1500, autosave)
 
     def do_save() -> None:
+        if not (
+            text_box.get("1.0", "end-1c").strip()
+            or stt_box.get("1.0", "end-1c").strip()
+            or report_box.get("1.0", "end-1c").strip()
+        ):
+            return
         raw_date = date_entry.get().strip()
         parsed_date = parse_flexible_date(raw_date, now.year)
         if parsed_date is None:
@@ -1316,11 +2498,14 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             return
         if not text_value:
             text_value = "(no details entered)"
+        speech_value = stt_box.get("1.0", "end-1c").strip()
+        report_value = report_box.get("1.0", "end-1c").strip()
+        row_payload = [date_value, normalized_time, text_value, speech_value, report_value]
         if edit_target_sheet and edit_target_row > 0:
             saved_ok = update_journal_entry_at(
                 edit_target_sheet,
                 edit_target_row,
-                [date_value, normalized_time, text_value],
+                row_payload,
             )
             if not saved_ok:
                 messagebox.showerror(
@@ -1329,7 +2514,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 )
                 return
         else:
-            append_row(MODULES["J"], [date_value, normalized_time, text_value])
+            append_row(MODULES["J"], row_payload)
         clear_journal_window_draft()
         saved["value"] = True
         if autosave_id["value"] is not None:
@@ -1337,8 +2522,14 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         root.destroy()
 
     def on_close(event=None) -> None:
-        current_text = text_box.get("1.0", "end-1c").strip()
-        if not current_text:
+        has_content = any(
+            [
+                text_box.get("1.0", "end-1c").strip(),
+                stt_box.get("1.0", "end-1c").strip(),
+                report_box.get("1.0", "end-1c").strip(),
+            ]
+        )
+        if not has_content:
             clear_journal_window_draft()
             if autosave_id["value"] is not None:
                 root.after_cancel(autosave_id["value"])
@@ -1366,24 +2557,36 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     button_row = tk.Frame(root, bg=surface_color)
     button_row.pack(fill="x", padx=14, pady=(0, 14))
-    tk.Button(
+    save_entry_btn = tk.Button(
         button_row,
         text="Save Entry",
         command=do_save,
-        bg=accent_color,
-        fg="white",
+        bg="#1a2d42",
+        fg=muted_text_color,
         activebackground="#3D6C9F",
         activeforeground="white",
+        disabledforeground=muted_text_color,
         relief="flat",
         font=("Segoe UI", 10, "bold"),
         padx=18,
         pady=8,
-        cursor="hand2",
-    ).pack(side="right")
+        state="disabled",
+        cursor="arrow",
+    )
+    save_entry_btn.pack(side="right")
+    save_entry_btn_holder["btn"] = save_entry_btn
+
+    def _on_journal_text_changed(_evt: Optional[Any] = None) -> None:
+        refresh_save_entry_state()
+
+    for _tb in (text_box, stt_box, report_box):
+        _tb.bind("<KeyRelease>", _on_journal_text_changed, add="+")
+        _tb.bind("<ButtonRelease-1>", _on_journal_text_changed, add="+")
 
     root.bind("<Escape>", on_close)
     root.protocol("WM_DELETE_WINDOW", on_close)
     autosave()
+    refresh_save_entry_state()
     root.mainloop()
     return saved["value"]
 
@@ -1923,7 +3126,7 @@ def journal_settings_menu() -> Optional[List[str]]:
             if date_time is None:
                 return None
             date_value, time_value = date_time
-            return [date_value, time_value, typed_note]
+            return [date_value, time_value, typed_note, "", ""]
         if note.lower() in (
             "editprev",
             "edit prev",
@@ -1940,6 +3143,8 @@ def journal_settings_menu() -> Optional[List[str]]:
             open_journal_window_editor(
                 {
                     "text": str(latest.get("text", "")),
+                    "speech_transcript": str(latest.get("speech_transcript", "")),
+                    "ai_report": str(latest.get("ai_report", "")),
                     "date": str(latest.get("date", "")),
                     "time": str(latest.get("time", "")),
                     "images": [],
@@ -2022,7 +3227,7 @@ def journal_prompts() -> Optional[List[str]]:
         if date_time is None:
             return None
         date_value, time_value = date_time
-        return [date_value, time_value, typed_note]
+        return [date_value, time_value, typed_note, "", ""]
     return journal_settings_menu()
 
 
@@ -2031,7 +3236,7 @@ MODULES: Dict[str, ModuleConfig] = {
         name="Journal",
         workbook_name="Journal.xlsx",
         sheet_name="Journal",
-        headers=["Date", "Time", "Journal"],
+        headers=["Date", "Time", "Journal", "Speech to text", "AI report"],
         prompt_builder=journal_prompts,
     ),
 }
