@@ -264,6 +264,17 @@ def save_workbook_with_retry(wb, workbook_path: Path) -> None:
             input("Close the file and press Enter to retry saving...")
 
 
+def load_workbook_with_retry(workbook_path: Path):
+    while True:
+        try:
+            return load_workbook(workbook_path)
+        except PermissionError:
+            print(
+                f"Cannot open '{workbook_path.name}' because access is blocked (open/locked by another program or sync)."
+            )
+            input("Close the file or wait for sync, then press Enter to retry...")
+
+
 def ensure_workbook(module: ModuleConfig) -> Path:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     workbook_path = DATA_DIR / module.workbook_name
@@ -276,7 +287,7 @@ def ensure_workbook(module: ModuleConfig) -> Path:
         save_workbook_with_retry(wb, workbook_path)
         return workbook_path
 
-    wb = load_workbook(workbook_path)
+    wb = load_workbook_with_retry(workbook_path)
     if module.name == "Journal":
         if migrate_journal_workbook_columns_if_needed(wb, module.headers):
             save_workbook_with_retry(wb, workbook_path)
@@ -299,7 +310,7 @@ def ensure_workbook(module: ModuleConfig) -> Path:
 
 def append_row(module: ModuleConfig, row: List[str]) -> None:
     workbook_path = ensure_workbook(module)
-    wb = load_workbook(workbook_path)
+    wb = load_workbook_with_retry(workbook_path)
 
     if module.name == "Journal":
         row_list = list(row)
@@ -415,7 +426,7 @@ def rebuild_master_journal_from_daily_pages(wb, module: ModuleConfig) -> None:
 def delete_latest_journal_entry() -> bool:
     module = MODULES["J"]
     workbook_path = ensure_workbook(module)
-    wb = load_workbook(workbook_path)
+    wb = load_workbook_with_retry(workbook_path)
 
     latest_sheet = None
     latest_date = None
@@ -470,7 +481,7 @@ def delete_latest_journal_entry() -> bool:
 def get_latest_journal_entry_for_edit() -> Optional[Dict[str, object]]:
     module = MODULES["J"]
     workbook_path = ensure_workbook(module)
-    wb = load_workbook(workbook_path)
+    wb = load_workbook_with_retry(workbook_path)
 
     latest_sheet = None
     latest_date = None
@@ -531,7 +542,7 @@ def get_latest_journal_entry_for_delete() -> Optional[Dict[str, object]]:
 def update_journal_entry_at(sheet_name: str, row_index: int, row_values: List[str]) -> bool:
     module = MODULES["J"]
     workbook_path = ensure_workbook(module)
-    wb = load_workbook(workbook_path)
+    wb = load_workbook_with_retry(workbook_path)
     if sheet_name not in wb.sheetnames:
         return False
     ws = wb[sheet_name]
@@ -555,7 +566,7 @@ def update_journal_entry_at(sheet_name: str, row_index: int, row_values: List[st
 def delete_journal_entry_at(sheet_name: str, row_index: int) -> bool:
     module = MODULES["J"]
     workbook_path = ensure_workbook(module)
-    wb = load_workbook(workbook_path)
+    wb = load_workbook_with_retry(workbook_path)
     if sheet_name not in wb.sheetnames:
         return False
     ws = wb[sheet_name]
@@ -584,7 +595,7 @@ def delete_journal_entry_at(sheet_name: str, row_index: int) -> bool:
 def load_all_journal_entries() -> List[Tuple[datetime, str, str]]:
     module = MODULES["J"]
     workbook_path = ensure_workbook(module)
-    wb = load_workbook(workbook_path)
+    wb = load_workbook_with_retry(workbook_path)
     entries: List[Tuple[datetime, str, str]] = []
 
     for sheet in wb.worksheets:
@@ -647,9 +658,19 @@ def parse_recap_date_range(raw_range: str, default_year: int) -> Optional[Tuple[
         tokens = [part.strip() for part in normalized.split("-", 1)]
     else:
         parts = normalized.split()
+        if len(parts) == 1:
+            single = parse_flexible_date(parts[0], default_year)
+            if single is None:
+                return None
+            return single, single
         if len(parts) != 2:
             return None
         tokens = parts
+    if len(tokens) == 1:
+        single = parse_flexible_date(tokens[0], default_year)
+        if single is None:
+            return None
+        return single, single
     if len(tokens) != 2 or not tokens[0] or not tokens[1]:
         return None
     start = parse_flexible_date(tokens[0], default_year)
@@ -671,6 +692,58 @@ def list_journal_dates_in_range(date_range: Tuple[datetime, datetime]) -> List[s
     return sorted(
         matched_dates,
         key=lambda value: datetime.strptime(value, "%m/%d/%Y"),
+    )
+
+
+def load_recap_context_from_file(raw_path: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return (context_text, resolved_path, error_message)."""
+    if not raw_path.strip():
+        return None, None, "Missing file path."
+    token = raw_path.strip().strip('"').strip("'")
+    candidates = [
+        Path(token),
+        BASE_DIR / token,
+        DATA_DIR / token,
+    ]
+    file_path: Optional[Path] = None
+    for cand in candidates:
+        if cand.exists() and cand.is_file():
+            file_path = cand
+            break
+    if file_path is None:
+        return None, None, f"File not found: {token}"
+    suffix = file_path.suffix.lower()
+    if suffix in (".xlsx", ".xlsm", ".xls"):
+        return None, None, "Recap file lookup only supports text-like files (not Excel)."
+    try:
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return None, None, f"Could not read file: {exc}"
+    if not text.strip():
+        return None, None, "Selected file is empty."
+    clipped = text
+    if len(clipped) > 120000:
+        clipped = clipped[:120000] + "\n\n[Truncated for recap]"
+    header = f"Recap source file: {file_path.resolve()}\n"
+    return header + clipped, str(file_path.resolve()), None
+
+
+def resolve_recap_target(
+    raw_arg: str, default_year: int
+) -> Tuple[Optional[Tuple[datetime, datetime]], Optional[str], Optional[str], Optional[str]]:
+    """Return (date_range, file_context, file_path, error)."""
+    arg = raw_arg.strip()
+    if not arg:
+        return None, None, None, "Missing recap argument."
+    recap_range = parse_recap_date_range(arg, default_year)
+    if recap_range is not None:
+        return recap_range, None, None, None
+    file_context, file_path, file_error = load_recap_context_from_file(arg)
+    if file_error is None:
+        return None, file_context, file_path, None
+    return None, None, None, (
+        "Invalid recap target. Use a date range (e.g. 4/27 - 4/30) "
+        "or a file path (e.g. notes.txt)."
     )
 
 
@@ -3161,6 +3234,8 @@ def run_chat_mode(
     with_journal_context: bool,
     use_thinking_model: bool = False,
     recap_date_range: Optional[Tuple[datetime, datetime]] = None,
+    recap_context_override: Optional[str] = None,
+    recap_context_label: Optional[str] = None,
 ) -> None:
     base_mode_label = "Recap" if with_journal_context else "Chatbot"
     if use_thinking_model and with_journal_context:
@@ -3174,8 +3249,13 @@ def run_chat_mode(
 
     system_message = "You are a helpful assistant."
     if with_journal_context:
-        journal_context = build_journal_context_for_range(recap_date_range)
-        if recap_date_range is not None:
+        if recap_context_override is not None:
+            journal_context = recap_context_override
+            if recap_context_label:
+                print(f"Recap source: {recap_context_label}")
+        else:
+            journal_context = build_journal_context_for_range(recap_date_range)
+        if recap_context_override is None and recap_date_range is not None:
             included_dates = list_journal_dates_in_range(recap_date_range)
             if included_dates:
                 print("Recap includes journal dates:")
@@ -3377,7 +3457,7 @@ def parse_flexible_date(raw: str, default_year: int):
 def sync_journal_workbook() -> None:
     module = MODULES["J"]
     workbook_path = ensure_workbook(module)
-    wb = load_workbook(workbook_path)
+    wb = load_workbook_with_retry(workbook_path)
     rebuild_master_journal_from_daily_pages(wb, module)
     reorder_journal_sheets(wb)
     save_workbook_with_retry(wb, workbook_path)
@@ -3567,6 +3647,8 @@ def print_main_help() -> None:
     print("  RT     - Recap (thinking)")
     print("  R [date range] / RT [date range] - recap only within date range")
     print("      Examples: 4.27 4.30 | 4/27 4/30 | 4/27 - 4/30 | 4/27/2026 - 4/30/2026")
+    print("  R [file] / RT [file] - recap using file text as context")
+    print("      Examples: R notes.txt | RT daily_logs/meeting.md")
     print("  C      - Chatbot")
     print("  CT     - Chatbot (thinking)")
     print("  H/HELP - show this help")
@@ -3828,18 +3910,33 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
             print('Usage: SB bat   or   SB journal')
         return True, app_name
     if key.startswith("RT "):
-        recap_range = parse_recap_date_range(raw[3:].strip(), datetime.now().year)
-        if recap_range is None:
-            print("Invalid date range. Examples: 4.27 4.30 | 4/27 4/30 | 4/27 - 4/30 | 4/27/2026 - 4/30/2026")
+        recap_range, file_context, file_path, recap_err = resolve_recap_target(
+            raw[3:].strip(), datetime.now().year
+        )
+        if recap_err is not None:
+            print(recap_err)
             return True, app_name
-        run_chat_mode(with_journal_context=True, use_thinking_model=True, recap_date_range=recap_range)
+        run_chat_mode(
+            with_journal_context=True,
+            use_thinking_model=True,
+            recap_date_range=recap_range,
+            recap_context_override=file_context,
+            recap_context_label=file_path,
+        )
         return True, app_name
     if key.startswith("R "):
-        recap_range = parse_recap_date_range(raw[2:].strip(), datetime.now().year)
-        if recap_range is None:
-            print("Invalid date range. Examples: 4.27 4.30 | 4/27 4/30 | 4/27 - 4/30 | 4/27/2026 - 4/30/2026")
+        recap_range, file_context, file_path, recap_err = resolve_recap_target(
+            raw[2:].strip(), datetime.now().year
+        )
+        if recap_err is not None:
+            print(recap_err)
             return True, app_name
-        run_chat_mode(with_journal_context=True, recap_date_range=recap_range)
+        run_chat_mode(
+            with_journal_context=True,
+            recap_date_range=recap_range,
+            recap_context_override=file_context,
+            recap_context_label=file_path,
+        )
         return True, app_name
     if key == "R":
         run_chat_mode(with_journal_context=True)
