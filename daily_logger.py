@@ -1071,13 +1071,12 @@ def _remove_path_quietly(path: Path) -> None:
         pass
 
 
-def _schedule_windows_self_delete(exe_path: Path, base_dir: Path) -> None:
+def _schedule_windows_self_delete(exe_path: Path) -> None:
     script_path = Path(tempfile.gettempdir()) / f"daily_logger_uninstall_{int(time.time())}.cmd"
     script = (
         "@echo off\n"
         "timeout /t 2 /nobreak >nul\n"
         f'del /f /q "{exe_path}" >nul 2>&1\n'
-        f'rd /s /q "{base_dir}" >nul 2>&1\n'
         f'del /f /q "{script_path}" >nul 2>&1\n'
     )
     try:
@@ -1097,8 +1096,8 @@ def run_clean_uninstall() -> None:
 
     if getattr(sys, "frozen", False):
         exe_path = Path(sys.executable).resolve()
-        _schedule_windows_self_delete(exe_path, exe_path.parent)
-        print("Uninstall started. App files will be removed after this window closes.")
+        _schedule_windows_self_delete(exe_path)
+        print("Uninstall started. App data folders and this EXE will be removed after this window closes.")
         return
 
     # Dev-mode fallback: do not delete source code automatically.
