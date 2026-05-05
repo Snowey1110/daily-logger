@@ -75,9 +75,19 @@ JOURNAL_SIDE_ACTION_BTN_WIDTH_CH = 16
 JOURNAL_SIDE_ACTION_GRID_MINSIZE = 130
 # Whisper list price per audio minute (USD); verify at https://openai.com/pricing
 WHISPER_USD_PER_MIN = 0.006
+# Pre-send WAV cleanup (RMS on int16-scale, same ballpark as WAVEFORM_RMS_NOISE_FLOOR).
+WHISPER_PRE_FRAME_MS = 25
+WHISPER_PRE_SILENCE_RMS = 32.0
+WHISPER_PRE_EDGE_PAD_MS = 120
+WHISPER_PRE_MIN_SPEECH_MS = 50
+WHISPER_PRE_MAX_INTERNAL_SILENCE_SEC = 1.25
+WHISPER_PRE_KEEP_INTERNAL_SILENCE_SEC = 0.35
 # Hover tooltips: narrow wrap → shorter line length, more lines (taller block).
 TOOLTIP_WRAP_PX = 220
 TOOLTIP_WRAP_PX_MAX = 280
+# Journal window: slightly lighter bg on hover when the button is clickable.
+JOURNAL_BTN_HOVER_BG = "#3D6C9F"
+JOURNAL_BTN_HOVER_SAVE_BG = "#457AB8"
 OPENAI_MODEL = "gpt-4o-mini"
 OPENAI_THINKING_MODEL = "gpt-5.5"
 API_KEY_FILE = SETTINGS_DIR / "daily_logger_api_key.txt"
@@ -1232,6 +1242,149 @@ def normalize_window_time_input(raw: str) -> Optional[str]:
         return None
 
 
+def _read_wav_mono_int16(path: Path) -> Tuple[Optional[Any], int, Optional[str]]:
+    """Load 16-bit PCM WAV as mono int16 ndarray. Returns (samples, sample_rate, error)."""
+    try:
+        import numpy as np
+    except Exception as exc:
+        return None, 0, str(exc)
+    try:
+        with wave.open(str(path), "rb") as wf:
+            ch = wf.getnchannels()
+            sw = wf.getsampwidth()
+            rate = wf.getframerate() or 16000
+            nframes = wf.getnframes()
+            raw = wf.readframes(nframes)
+    except Exception as exc:
+        return None, 0, str(exc)
+    if sw != 2:
+        return None, 0, "Whisper preprocessing needs 16-bit PCM WAV."
+    data = np.frombuffer(raw, dtype=np.int16)
+    if ch == 1:
+        mono = data
+    elif ch >= 2:
+        flat = data.reshape(-1, ch).astype(np.float32)
+        mono = np.mean(flat, axis=1).astype(np.int16)
+    else:
+        return None, 0, "Invalid WAV channel count."
+    return mono, int(rate), None
+
+
+def _rms_per_frame_int16(samples: Any, frame: int) -> Any:
+    import numpy as np
+
+    n = (int(samples.shape[0]) // frame) * frame
+    if n <= 0:
+        return np.array([], dtype=np.float64)
+    blocks = samples[:n].reshape(-1, frame).astype(np.float64)
+    return np.sqrt(np.mean(blocks * blocks, axis=1))
+
+
+def preprocess_wav_for_whisper(samples: Any, sample_rate: int) -> Tuple[Any, Optional[str]]:
+    """Trim edge silence and shorten long internal silences. Returns (mono int16 ndarray, error)."""
+    try:
+        import numpy as np
+    except Exception as exc:
+        return None, str(exc)
+    if samples is None or int(samples.shape[0]) < 1:
+        return None, "Empty audio."
+    rate = max(1, int(sample_rate))
+    frame = max(int(rate * (WHISPER_PRE_FRAME_MS / 1000.0)), 1)
+    thr = float(WHISPER_PRE_SILENCE_RMS)
+    rms = _rms_per_frame_int16(samples, frame)
+    if rms.size < 1:
+        return samples, None
+    voiced = rms > thr
+    if not bool(np.any(voiced)):
+        return samples[:0], "No speech detected (audio is mostly silence)."
+    first = int(np.argmax(voiced))
+    last = int(rms.shape[0] - 1 - np.argmax(voiced[::-1]))
+    pad = int(rate * (WHISPER_PRE_EDGE_PAD_MS / 1000.0))
+    min_sp = int(rate * (WHISPER_PRE_MIN_SPEECH_MS / 1000.0))
+    start = max(0, first * frame - pad)
+    end = min(int(samples.shape[0]), (last + 1) * frame + pad)
+    if end - start < min_sp:
+        start = max(0, first * frame)
+        end = min(int(samples.shape[0]), (last + 1) * frame)
+    trimmed = samples[start:end].copy()
+    if int(trimmed.shape[0]) < min_sp:
+        return trimmed[:0], "No speech detected (audio is mostly silence)."
+
+    rms2 = _rms_per_frame_int16(trimmed, frame)
+    if rms2.size < 1:
+        return trimmed, None
+    v2 = rms2 > thr
+    max_gap = int((rate * WHISPER_PRE_MAX_INTERNAL_SILENCE_SEC) / frame)
+    keep_gap = max(1, int((rate * WHISPER_PRE_KEEP_INTERNAL_SILENCE_SEC) / frame))
+    keep_samples = keep_gap * frame
+
+    out_parts: List[Any] = []
+    f = 0
+    nfr = int(v2.shape[0])
+    while f < nfr:
+        while f < nfr and not bool(v2[f]):
+            f += 1
+        if f >= nfr:
+            break
+        t = f
+        while t < nfr and bool(v2[t]):
+            t += 1
+        out_parts.append(trimmed[f * frame : t * frame])
+        if t >= nfr:
+            break
+        u = t
+        while u < nfr and not bool(v2[u]):
+            u += 1
+        silence_frames = u - t
+        if silence_frames > max_gap:
+            out_parts.append(np.zeros(keep_samples, dtype=np.int16))
+        else:
+            out_parts.append(trimmed[t * frame : u * frame])
+        f = u
+
+    if not out_parts:
+        return trimmed, None
+    merged = np.concatenate(out_parts, axis=0)
+    n_sample_full = (int(trimmed.shape[0]) // frame) * frame
+    if n_sample_full < int(trimmed.shape[0]):
+        merged = np.concatenate([merged, trimmed[n_sample_full:]], axis=0)
+    if int(merged.shape[0]) < 1:
+        return merged, "No speech detected after preprocessing."
+    return merged, None
+
+
+def prepare_wav_path_for_whisper(source: Path) -> Tuple[Path, Optional[str], Optional[Path]]:
+    """Pick WAV bytes to upload: trimmed/collapsed copy when possible.
+
+    Returns (upload_path, fatal_error_string_or_none, temp_path_to_delete_or_none).
+    """
+    mono, rate, err = _read_wav_mono_int16(source)
+    if err is not None or mono is None:
+        return source, None, None
+    processed, perr = preprocess_wav_for_whisper(mono, rate)
+    if perr is not None:
+        return source, perr, None
+    try:
+        import numpy as np
+    except Exception:
+        return source, None, None
+    if processed is None or int(processed.shape[0]) < 1:
+        return source, "No speech detected (audio is mostly silence).", None
+    if int(processed.shape[0]) == int(mono.shape[0]) and bool(np.array_equal(processed, mono)):
+        return source, None, None
+    fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="whisper_pre_")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    werr = write_mono_int16_wav(tmp, processed, rate)
+    if werr is not None:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return source, None, None
+    return tmp, None, tmp
+
+
 def transcribe_audio_openai(
     file_path: Path,
     language: Optional[str],
@@ -1243,6 +1396,10 @@ def transcribe_audio_openai(
     api_key = get_openai_api_key()
     if not api_key:
         return "OPENAI_API_KEY is not set. Use TOKEN ADD in the main menu or set the environment variable."
+
+    upload_path, prep_err, temp_upload = prepare_wav_path_for_whisper(file_path)
+    if prep_err is not None:
+        return prep_err
 
     boundary = uuid.uuid4().hex.encode("ascii")
     crlf = b"\r\n"
@@ -1262,10 +1419,15 @@ def transcribe_audio_openai(
         add_field("prompt", prompt.strip()[:1500])
     add_field("temperature", str(temperature))
 
-    filename = file_path.name
+    filename = upload_path.name
     try:
-        audio_bytes = file_path.read_bytes()
+        audio_bytes = upload_path.read_bytes()
     except OSError as exc:
+        if temp_upload is not None:
+            try:
+                temp_upload.unlink(missing_ok=True)
+            except OSError:
+                pass
         return f"Could not read audio file: {exc}"
 
     body_chunks.append(b"--" + boundary + crlf)
@@ -1296,18 +1458,26 @@ def transcribe_audio_openai(
             details = exc.read().decode("utf-8")
         except Exception:
             details = str(exc)
-        return f"Whisper API error ({exc.code}): {details}"
+        result = f"Whisper API error ({exc.code}): {details}"
     except Exception as exc:
-        return f"Whisper request failed: {exc}"
+        result = f"Whisper request failed: {exc}"
+    else:
+        try:
+            parsed = json.loads(raw)
+            text = parsed.get("text")
+            if isinstance(text, str):
+                result = text.strip()
+            else:
+                result = "Whisper returned an unexpected response format."
+        except json.JSONDecodeError:
+            result = "Whisper returned invalid JSON."
 
-    try:
-        parsed = json.loads(raw)
-        text = parsed.get("text")
-        if isinstance(text, str):
-            return text.strip()
-        return "Whisper returned an unexpected response format."
-    except json.JSONDecodeError:
-        return "Whisper returned invalid JSON."
+    if temp_upload is not None:
+        try:
+            temp_upload.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return result
 
 
 def archive_journal_recording(wav_path: Path) -> Optional[Path]:
@@ -1433,6 +1603,59 @@ def bind_hover_tooltip(widget: Any, text_callable: Callable[[], str]) -> None:
     widget.bind("<Enter>", show, add="+")
     widget.bind("<Leave>", hide, add="+")
     widget.bind("<ButtonPress>", hide, add="+")
+
+
+def bind_button_hover_if_enabled(
+    widget: Any,
+    get_rest_style: Callable[[], Tuple[str, str, str, str, str]],
+    hover_bg: str,
+    hover_fg: str,
+) -> None:
+    """Apply hover colors on <Enter> only when state is normal; <Leave> restores idle look.
+
+    get_rest_style returns (state, bg, fg, activebackground, activeforeground) for the
+    non-hover appearance; state should match widget.cget('state') logic for that moment.
+    """
+    if tk is None:
+        return
+
+    def on_leave(_evt: Optional[Any] = None) -> None:
+        try:
+            st, bg, fg, abg, afg = get_rest_style()
+        except tk.TclError:
+            return
+        kw: Dict[str, Any] = {
+            "bg": bg,
+            "fg": fg,
+            "activebackground": abg,
+            "activeforeground": afg,
+        }
+        if str(st) == "disabled":
+            kw["disabledforeground"] = fg
+        try:
+            widget.config(**kw)
+        except tk.TclError:
+            pass
+
+    def on_enter(_evt: Optional[Any] = None) -> None:
+        try:
+            st, _b, _f, _ab, _af = get_rest_style()
+        except tk.TclError:
+            return
+        if str(st) != "normal":
+            return
+        try:
+            widget.config(
+                bg=hover_bg,
+                fg=hover_fg,
+                activebackground=hover_bg,
+                activeforeground=hover_fg,
+            )
+        except tk.TclError:
+            pass
+
+    widget.bind("<Enter>", on_enter, add="+")
+    widget.bind("<Leave>", on_leave, add="+")
 
 
 def write_mono_int16_wav(path: Path, samples: object, sample_rate: int) -> Optional[str]:
@@ -1681,7 +1904,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         time_entry.delete(0, "end")
         time_entry.insert(0, current_now.strftime("%I:%M%p").lstrip("0"))
         save_draft()
-    tk.Button(
+    update_time_btn = tk.Button(
         top,
         text="Update Time",
         command=update_date_time_to_now,
@@ -1694,8 +1917,13 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         padx=12,
         pady=6,
         cursor="hand2",
-    ).grid(
-        row=0, column=4, padx=(12, 12), sticky="w"
+    )
+    update_time_btn.grid(row=0, column=4, padx=(12, 12), sticky="w")
+    bind_button_hover_if_enabled(
+        update_time_btn,
+        lambda: ("normal", "#253F5A", text_color, accent_color, "white"),
+        JOURNAL_BTN_HOVER_BG,
+        "white",
     )
 
     center = tk.Frame(root, bg=surface_color)
@@ -1706,6 +1934,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     left_col = tk.Frame(center, bg=surface_color)
     left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+    left_col.grid_columnconfigure(0, weight=1)
     left_col.grid_rowconfigure(1, weight=1)
     tk.Label(
         left_col,
@@ -1813,6 +2042,12 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         return "Opens the recording directory."
 
     bind_hover_tooltip(open_recording_btn, open_recording_tooltip_text)
+    bind_button_hover_if_enabled(
+        open_recording_btn,
+        lambda: ("normal", "#253F5A", text_color, accent_color, "white"),
+        JOURNAL_BTN_HOVER_BG,
+        "white",
+    )
 
     stt_top = tk.Frame(stt_outer, bg=panel_color, bd=0, highlightthickness=0)
     stt_top.grid(row=1, column=0, sticky="ew", pady=(0, 6))
@@ -1967,6 +2202,18 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     gen_button.pack()
     report_box.insert("1.0", draft_report)
 
+    def gen_rest_style() -> Tuple[str, str, str, str, str]:
+        if str(gen_button.cget("state")) != "normal":
+            return ("disabled", "#1a2d42", muted_text_color, "#253F5A", text_color)
+        return ("normal", "#253F5A", text_color, accent_color, "white")
+
+    bind_button_hover_if_enabled(
+        gen_button,
+        gen_rest_style,
+        JOURNAL_BTN_HOVER_BG,
+        "white",
+    )
+
     save_entry_btn_holder: Dict[str, Any] = {"btn": None}
 
     def refresh_save_entry_state() -> None:
@@ -2086,6 +2333,11 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             transcribe_btn.config(
                 state="disabled",
                 width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+                bg="#1a2d42",
+                fg=muted_text_color,
+                activebackground="#253F5A",
+                activeforeground=text_color,
+                disabledforeground=muted_text_color,
             )
             return
         p = last_journal_wav.get("path")
@@ -2160,6 +2412,21 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     transcribe_btn.config(command=run_transcribe)
     bind_hover_tooltip(transcribe_btn, transcribe_tooltip_text)
+
+    def transcribe_rest_style() -> Tuple[str, str, str, str, str]:
+        if transcribing_busy["v"]:
+            return ("disabled", "#1a2d42", muted_text_color, "#253F5A", text_color)
+        p = last_journal_wav.get("path")
+        if p is not None and isinstance(p, Path) and p.exists():
+            return ("normal", "#253F5A", text_color, accent_color, "white")
+        return ("disabled", "#1a2d42", muted_text_color, "#253F5A", text_color)
+
+    bind_button_hover_if_enabled(
+        transcribe_btn,
+        transcribe_rest_style,
+        JOURNAL_BTN_HOVER_BG,
+        "white",
+    )
     wave_canvas.bind("<Configure>", lambda _e: redraw_waveform_canvas())
     wave_canvas.after(80, redraw_waveform_canvas)
 
@@ -2186,6 +2453,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             "Whisper returned",
             "Could not read audio file",
             "Recording needs optional packages",
+            "No speech detected",
+            "Empty audio.",
         )
         return any(t.startswith(p) for p in prefixes)
 
@@ -2385,6 +2654,30 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     start_rec_button.grid(row=0, column=0, sticky="w", padx=(12, 4), pady=8)
     pause_rec_button.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=8)
     stop_rec_button.grid(row=0, column=2, sticky="w", padx=(0, 8), pady=8)
+
+    def rec_primary_rest(btn: Any) -> Tuple[str, str, str, str, str]:
+        if str(btn.cget("state")) == "normal":
+            return ("normal", "#253F5A", text_color, accent_color, "white")
+        return ("disabled", "#1a2d42", muted_text_color, "#253F5A", text_color)
+
+    bind_button_hover_if_enabled(
+        start_rec_button,
+        lambda b=start_rec_button: rec_primary_rest(b),
+        JOURNAL_BTN_HOVER_BG,
+        "white",
+    )
+    bind_button_hover_if_enabled(
+        pause_rec_button,
+        lambda b=pause_rec_button: rec_primary_rest(b),
+        JOURNAL_BTN_HOVER_BG,
+        "white",
+    )
+    bind_button_hover_if_enabled(
+        stop_rec_button,
+        lambda b=stop_rec_button: rec_primary_rest(b),
+        JOURNAL_BTN_HOVER_BG,
+        "white",
+    )
     stt_status.grid(row=0, column=3, sticky="ew", padx=(4, 12), pady=8)
     stt_lang_lbl = tk.Label(
         stt_top,
@@ -2403,7 +2696,13 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 "No OpenAI API key. Use TOKEN ADD in the main menu or set OPENAI_API_KEY.",
             )
             return
-        gen_button.config(state="disabled")
+        gen_button.config(
+            state="disabled",
+            bg="#1a2d42",
+            fg=muted_text_color,
+            disabledforeground=muted_text_color,
+            cursor="arrow",
+        )
         report_status.config(text="Generating…")
 
         def work() -> None:
@@ -2416,7 +2715,14 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         threading.Thread(target=work, daemon=True).start()
 
     def on_generate_report_done(body: str) -> None:
-        gen_button.config(state="normal")
+        gen_button.config(
+            state="normal",
+            bg="#253F5A",
+            fg=text_color,
+            activebackground=accent_color,
+            activeforeground="white",
+            cursor="hand2",
+        )
         report_status.config(text="")
         if _is_likely_api_error_message(body):
             messagebox.showerror("AI report", body[:4000])
@@ -2575,6 +2881,18 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     )
     save_entry_btn.pack(side="right")
     save_entry_btn_holder["btn"] = save_entry_btn
+
+    def save_rest_style() -> Tuple[str, str, str, str, str]:
+        if str(save_entry_btn.cget("state")) != "normal":
+            return ("disabled", "#1a2d42", muted_text_color, "#253F5A", text_color)
+        return ("normal", accent_color, "white", "#3D6C9F", "white")
+
+    bind_button_hover_if_enabled(
+        save_entry_btn,
+        save_rest_style,
+        JOURNAL_BTN_HOVER_SAVE_BG,
+        "white",
+    )
 
     def _on_journal_text_changed(_evt: Optional[Any] = None) -> None:
         refresh_save_entry_state()
