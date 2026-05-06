@@ -18,7 +18,7 @@ Daily Logger helps you quickly capture daily notes and review them later.
 
 If you just want to run the app on Windows, use the packaged executable:
 
-- [Download DailyLogger.exe](dist/DailyLogger.exe)
+- [Download DailyLogger.exe](https://github.com/Snowey1110/daily-logger/releases/download/v1.0.0/DailyLogger.exe)
 
 > If your browser warns about downloading an `.exe`, confirm that the file comes from your trusted project source.
 

@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['daily_logger.py'],
+    ['c:\\Users\\LixiaoKuang\\OneDrive - VisionNav Robotics USA inc\\Desktop\\Code\\daily_logger.py'],
     pathex=[],
     binaries=[],
     datas=[],
