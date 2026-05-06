@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 import wave
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib import error, request
 import zipfile
 
@@ -85,9 +85,214 @@ WHISPER_PRE_KEEP_INTERNAL_SILENCE_SEC = 0.35
 # Hover tooltips: narrow wrap → shorter line length, more lines (taller block).
 TOOLTIP_WRAP_PX = 220
 TOOLTIP_WRAP_PX_MAX = 280
-# Journal window: slightly lighter bg on hover when the button is clickable.
-JOURNAL_BTN_HOVER_BG = "#3D6C9F"
-JOURNAL_BTN_HOVER_SAVE_BG = "#457AB8"
+JOURNAL_PREF_THEME_KEY = "journal_window_theme"
+
+
+@dataclass(frozen=True)
+class JournalWindowThemeSpec:
+    """Colors and layout for the journal Tk window (light vs dark)."""
+
+    id: str
+    toggle_label: str
+    surface: str
+    panel: str
+    field: str
+    text: str
+    muted: str
+    accent: str
+    border: str
+    waveform: str
+    btn_secondary: str
+    btn_disabled: str
+    disabled_fg: str
+    hover_primary: str
+    hover_save: str
+    secondary_hover: str
+    pad_outer: int
+    pad_top_y: Tuple[int, int]
+    pad_center_y: int
+    pad_button_y: int
+    date_label_font: Tuple[Any, ...]
+    section_label_font: Tuple[Any, ...]
+    is_dark: bool
+
+    def toolbar_btn_config(self) -> Tuple[str, str, str, str]:
+        """bg, fg, activebackground, activeforeground for Update Time / Open."""
+        if self.is_dark:
+            return (self.btn_secondary, self.text, self.accent, "white")
+        return (self.btn_secondary, self.text, self.secondary_hover, self.text)
+
+    def toolbar_hover(self) -> Tuple[str, str]:
+        if self.is_dark:
+            return (self.hover_primary, "white")
+        return (self.secondary_hover, self.text)
+
+    def toolbar_bind_rest(self) -> Tuple[str, str, str, str, str]:
+        bg, fg, abg, afg = self.toolbar_btn_config()
+        return ("normal", bg, fg, abg, afg)
+
+    def side_action_config(self) -> Tuple[str, str, str, str]:
+        """bg, fg, activebackground, activeforeground when action is enabled."""
+        if self.is_dark:
+            return (self.btn_secondary, self.text, self.accent, "white")
+        return (self.accent, "white", self.hover_primary, "white")
+
+    def side_action_bind_rest(self) -> Tuple[str, str, str, str, str]:
+        bg, fg, abg, afg = self.side_action_config()
+        return ("normal", bg, fg, abg, afg)
+
+    def side_action_disabled(self) -> Tuple[str, str, str, str, str]:
+        if self.is_dark:
+            return (
+                "disabled",
+                self.btn_disabled,
+                self.muted,
+                self.btn_secondary,
+                self.text,
+            )
+        return (
+            "disabled",
+            self.btn_disabled,
+            self.disabled_fg,
+            self.hover_primary,
+            "white",
+        )
+
+    def transcribe_busy_config(self) -> Tuple[str, str, str, str, str]:
+        if self.is_dark:
+            return (
+                self.btn_disabled,
+                self.muted,
+                self.btn_secondary,
+                self.text,
+                self.muted,
+            )
+        return (
+            self.btn_disabled,
+            self.disabled_fg,
+            self.secondary_hover,
+            self.text,
+            self.disabled_fg,
+        )
+
+    def transcribe_idle_disabled_config(self) -> Tuple[str, str, str, str, str]:
+        return self.transcribe_busy_config()
+
+    def gen_bind_rest(self) -> Tuple[str, str, str, str, str]:
+        if self.is_dark:
+            bg, fg, abg, afg = self.side_action_config()
+            return ("normal", bg, fg, abg, afg)
+        return ("normal", self.accent, "white", self.hover_primary, "white")
+
+    def gen_bind_disabled(self) -> Tuple[str, str, str, str, str]:
+        if self.is_dark:
+            return (
+                "disabled",
+                self.btn_disabled,
+                self.muted,
+                self.btn_secondary,
+                self.text,
+            )
+        return (
+            "disabled",
+            self.btn_disabled,
+            self.disabled_fg,
+            self.hover_primary,
+            "white",
+        )
+
+    def save_bind_disabled(self) -> Tuple[str, str, str, str, str]:
+        return self.gen_bind_disabled()
+
+    def ttk_combobox_kwargs(self) -> Dict[str, Any]:
+        if self.is_dark:
+            return {
+                "fieldbackground": self.field,
+                "background": self.panel,
+                "foreground": self.text,
+                "bordercolor": self.border,
+                "lightcolor": self.panel,
+                "darkcolor": self.field,
+                "arrowcolor": self.muted,
+                "padding": 4,
+            }
+        return {
+            "fieldbackground": self.field,
+            "background": self.btn_secondary,
+            "foreground": self.text,
+        }
+
+
+JOURNAL_THEME_LIGHT = JournalWindowThemeSpec(
+    id="light",
+    toggle_label="Dark mode",
+    surface="#F2F2F7",
+    panel="#FFFFFF",
+    field="#FFFFFF",
+    text="#1D1D1F",
+    muted="#6E6E73",
+    accent="#0071E3",
+    border="#D2D2D7",
+    waveform="#0071E3",
+    btn_secondary="#E8E8ED",
+    btn_disabled="#E5E5EA",
+    disabled_fg="#AEAEB2",
+    hover_primary="#0077ED",
+    hover_save="#0077ED",
+    secondary_hover="#DCDCE0",
+    pad_outer=14,
+    pad_top_y=(14, 10),
+    pad_center_y=10,
+    pad_button_y=14,
+    date_label_font=("Segoe UI", 10, "bold"),
+    section_label_font=("Segoe UI", 10, "bold"),
+    is_dark=False,
+)
+
+JOURNAL_THEME_DARK = JournalWindowThemeSpec(
+    id="dark",
+    toggle_label="Light mode",
+    surface="#06060C",
+    panel="#14141E",
+    field="#0A0A12",
+    text="#F5F5F7",
+    muted="#98989D",
+    accent="#0A84FF",
+    border="#2C2C38",
+    waveform="#64D2FF",
+    btn_secondary="#24243A",
+    btn_disabled="#101018",
+    disabled_fg="#98989D",
+    hover_primary="#339CFF",
+    hover_save="#5CB0FF",
+    secondary_hover="#339CFF",
+    # Keep geometry/font metrics identical to light mode to avoid text reflow/shift
+    # when toggling themes; only colors should differ between modes.
+    pad_outer=14,
+    pad_top_y=(14, 10),
+    pad_center_y=10,
+    pad_button_y=14,
+    date_label_font=("Segoe UI", 10, "bold"),
+    section_label_font=("Segoe UI", 10, "bold"),
+    is_dark=True,
+)
+
+
+def normalize_journal_window_theme_key(raw: str) -> str:
+    k = (raw or "").strip().lower()
+    return "dark" if k == "dark" else "light"
+
+
+def load_journal_window_theme_spec() -> JournalWindowThemeSpec:
+    prefs = load_preferences()
+    return (
+        JOURNAL_THEME_DARK
+        if normalize_journal_window_theme_key(prefs.get(JOURNAL_PREF_THEME_KEY, "light"))
+        == "dark"
+        else JOURNAL_THEME_LIGHT
+    )
+
+
 OPENAI_MODEL = "gpt-4o-mini"
 OPENAI_THINKING_MODEL = "gpt-5.5"
 API_KEY_FILE = SETTINGS_DIR / "daily_logger_api_key.txt"
@@ -161,17 +366,37 @@ def ensure_runtime_dependencies() -> bool:
     ]
 
     missing_core = _missing_modules(core_specs)
-    if missing_core:
-        print("Daily Logger requires these Python packages:")
-        for pip_name in missing_core:
-            print(f"  - {pip_name}")
-        print("Install them now? (y/N): ", end="")
+    optional_missing = [
+        (pip_name, blurb)
+        for module_name, pip_name, blurb in optional_specs
+        if importlib.util.find_spec(module_name) is None
+    ]
+
+    if missing_core or optional_missing:
+        if missing_core:
+            print("Required packages:")
+            for pip_name in missing_core:
+                print(f"  - {pip_name}")
+        if optional_missing:
+            print("Optional packages for full journal window features:")
+            for pip_name, blurb in optional_missing:
+                print(f"  - {pip_name}: {blurb}")
+        print("Install missing packages now? (y/N): ", end="")
         answer = input().strip().lower()
         if answer in ("y", "yes"):
-            if not _pip_install_packages(missing_core):
-                return False
+            install_list = list(missing_core)
+            install_list.extend([pip_name for pip_name, _blurb in optional_missing])
+            if install_list and not _pip_install_packages(install_list):
+                print("You can install them later with:")
+                print(f"  {sys.executable} -m pip install {' '.join(install_list)}")
+                if missing_core:
+                    return False
         else:
-            print("Skipped installation of required packages.")
+            if missing_core:
+                print("Skipped installation of required packages.")
+            if optional_missing:
+                print("Skipped optional packages. Speech-to-text needs sounddevice and numpy.")
+
         missing_core = _missing_modules(core_specs)
         if missing_core:
             print(
@@ -184,25 +409,6 @@ def ensure_runtime_dependencies() -> bool:
     if not bind_openpyxl_symbols():
         print("openpyxl is required to run this app. Please install it and retry.")
         return False
-
-    optional_missing = [
-        (pip_name, blurb)
-        for module_name, pip_name, blurb in optional_specs
-        if importlib.util.find_spec(module_name) is None
-    ]
-    if optional_missing:
-        print("Optional packages for full journal window features:")
-        for pip_name, blurb in optional_missing:
-            print(f"  - {pip_name}: {blurb}")
-        print("Install these now? (y/N): ", end="")
-        answer = input().strip().lower()
-        if answer in ("y", "yes"):
-            pip_names = [item[0] for item in optional_missing]
-            if not _pip_install_packages(pip_names):
-                print("You can install them later with:")
-                print(f"  {sys.executable} -m pip install {' '.join(pip_names)}")
-        else:
-            print("Skipped optional packages. Speech-to-text needs sounddevice and numpy.")
 
     return True
 
@@ -1680,16 +1886,21 @@ def bind_hover_tooltip(widget: Any, text_callable: Callable[[], str]) -> None:
 def bind_button_hover_if_enabled(
     widget: Any,
     get_rest_style: Callable[[], Tuple[str, str, str, str, str]],
-    hover_bg: str,
-    hover_fg: str,
+    hover_bg: Union[str, Callable[[], str]],
+    hover_fg: Union[str, Callable[[], str]],
 ) -> None:
     """Apply hover colors on <Enter> only when state is normal; <Leave> restores idle look.
 
     get_rest_style returns (state, bg, fg, activebackground, activeforeground) for the
     non-hover appearance; state should match widget.cget('state') logic for that moment.
+    hover_bg / hover_fg may be callables (e.g. lambda: theme.hover_primary) so themes can
+    change without rebinding.
     """
     if tk is None:
         return
+
+    def _hover_color(spec: Union[str, Callable[[], str]]) -> str:
+        return spec() if callable(spec) else spec
 
     def on_leave(_evt: Optional[Any] = None) -> None:
         try:
@@ -1716,12 +1927,14 @@ def bind_button_hover_if_enabled(
             return
         if str(st) != "normal":
             return
+        hb = _hover_color(hover_bg)
+        hf = _hover_color(hover_fg)
         try:
             widget.config(
-                bg=hover_bg,
-                fg=hover_fg,
-                activebackground=hover_bg,
-                activeforeground=hover_fg,
+                bg=hb,
+                fg=hf,
+                activebackground=hb,
+                activeforeground=hf,
             )
         except tk.TclError:
             pass
@@ -1892,13 +2105,39 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     root.title("Journal Window")
     root.geometry("1360x720")
     root.minsize(1020, 620)
-    surface_color = "#0F0F0F"
-    panel_color = "#1A1A1A"
-    field_color = "#141414"
-    text_color = "#E6E6E6"
-    muted_text_color = "#B5B5B5"
-    accent_color = "#2E5A88"
-    root.configure(bg=surface_color)
+    theme_holder: List[JournalWindowThemeSpec] = [load_journal_window_theme_spec()]
+
+    def th() -> JournalWindowThemeSpec:
+        return theme_holder[0]
+
+    t_init = th()
+    root.configure(bg=t_init.surface)
+    _jw_style: Any = None
+    if ttk is not None:
+        _jw_style = ttk.Style(root)
+        try:
+            _jw_style.theme_use("clam")
+        except tk.TclError:
+            pass
+        _jw_style.configure("Journal.TCombobox", **t_init.ttk_combobox_kwargs())
+        if t_init.is_dark:
+            _jw_style.map(
+                "Journal.TCombobox",
+                fieldbackground=[
+                    ("readonly", t_init.field),
+                    ("disabled", t_init.btn_disabled),
+                ],
+                selectbackground=[("readonly", t_init.accent)],
+                selectforeground=[("readonly", "white")],
+            )
+        else:
+            _jw_style.map(
+                "Journal.TCombobox",
+                fieldbackground=[
+                    ("readonly", t_init.field),
+                    ("disabled", t_init.btn_disabled),
+                ],
+            )
     # Bring the journal window to front so it does not hide behind the console.
     root.lift()
     root.attributes("-topmost", True)
@@ -1906,16 +2145,17 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     root.focus_force()
     is_edit_mode = bool(edit_target_sheet and edit_target_row > 0)
 
-    top = tk.Frame(root, bg=panel_color, bd=0, highlightthickness=0)
-    top.pack(fill="x", padx=14, pady=(14, 10))
+    top = tk.Frame(root, bg=t_init.panel, bd=0, highlightthickness=0)
+    top.pack(fill="x", padx=t_init.pad_outer, pady=t_init.pad_top_y)
     top.grid_columnconfigure(5, weight=1)
-    tk.Label(
+    date_lbl = tk.Label(
         top,
         text="Date (mm/dd/yyyy):",
-        bg=panel_color,
-        fg=muted_text_color,
-        font=("Segoe UI", 10, "bold"),
-    ).grid(row=0, column=0, sticky="w", padx=(12, 0), pady=12)
+        bg=t_init.panel,
+        fg=t_init.muted,
+        font=t_init.date_label_font,
+    )
+    date_lbl.grid(row=0, column=0, sticky="w", padx=(12, 0), pady=12)
     date_entry: object
     if DateEntry is not None:
         date_entry = DateEntry(
@@ -1923,8 +2163,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             width=14,
             date_pattern="mm/dd/yyyy",
             state="normal",  # Keep typing enabled while allowing popup calendar selection.
-            background=accent_color,
-            foreground="white",
+            background=t_init.field,
+            foreground=t_init.text,
             borderwidth=1,
         )
         date_entry.grid(row=0, column=1, padx=(8, 20), pady=12, sticky="w")
@@ -1937,34 +2177,35 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         date_entry = tk.Entry(
             top,
             width=16,
-            bg=field_color,
-            fg=text_color,
-            insertbackground=text_color,
+            bg=t_init.field,
+            fg=t_init.text,
+            insertbackground=t_init.text,
             relief="flat",
             highlightthickness=1,
-            highlightbackground="#2B2B2B",
-            highlightcolor=accent_color,
+            highlightbackground=t_init.border,
+            highlightcolor=t_init.accent,
             font=("Segoe UI", 10),
         )
         date_entry.grid(row=0, column=1, padx=(8, 20), pady=12, sticky="w")
         date_entry.insert(0, draft_date)
-    tk.Label(
+    time_lbl = tk.Label(
         top,
         text="Time (hh:mmAM/PM or rn):",
-        bg=panel_color,
-        fg=muted_text_color,
-        font=("Segoe UI", 10, "bold"),
-    ).grid(row=0, column=2, sticky="w", pady=12)
+        bg=t_init.panel,
+        fg=t_init.muted,
+        font=t_init.date_label_font,
+    )
+    time_lbl.grid(row=0, column=2, sticky="w", pady=12)
     time_entry = tk.Entry(
         top,
         width=16,
-        bg=field_color,
-        fg=text_color,
-        insertbackground=text_color,
+        bg=t_init.field,
+        fg=t_init.text,
+        insertbackground=t_init.text,
         relief="flat",
         highlightthickness=1,
-        highlightbackground="#2B2B2B",
-        highlightcolor=accent_color,
+        highlightbackground=t_init.border,
+        highlightcolor=t_init.accent,
         font=("Segoe UI", 10),
     )
     time_entry.grid(row=0, column=3, padx=(8, 0), pady=12)
@@ -1976,14 +2217,16 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         time_entry.delete(0, "end")
         time_entry.insert(0, current_now.strftime("%I:%M%p").lstrip("0"))
         save_draft()
+    _ut_bg, _ut_fg, _ut_abg, _ut_afg = t_init.toolbar_btn_config()
+    _uth_bg, _uth_fg = t_init.toolbar_hover()
     update_time_btn = tk.Button(
         top,
         text="Update Time",
         command=update_date_time_to_now,
-        bg="#253F5A",
-        fg=text_color,
-        activebackground=accent_color,
-        activeforeground="white",
+        bg=_ut_bg,
+        fg=_ut_fg,
+        activebackground=_ut_abg,
+        activeforeground=_ut_afg,
         relief="flat",
         font=("Segoe UI", 9, "bold"),
         padx=12,
@@ -1993,29 +2236,35 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     update_time_btn.grid(row=0, column=4, padx=(12, 12), sticky="w")
     bind_button_hover_if_enabled(
         update_time_btn,
-        lambda: ("normal", "#253F5A", text_color, accent_color, "white"),
-        JOURNAL_BTN_HOVER_BG,
-        "white",
+        lambda: th().toolbar_bind_rest(),
+        lambda: th().toolbar_hover()[0],
+        lambda: th().toolbar_hover()[1],
     )
 
-    center = tk.Frame(root, bg=surface_color)
-    center.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+    center = tk.Frame(root, bg=t_init.surface)
+    center.pack(
+        fill="both",
+        expand=True,
+        padx=t_init.pad_outer,
+        pady=(0, t_init.pad_center_y),
+    )
     center.grid_columnconfigure(0, weight=2)
     center.grid_columnconfigure(1, weight=2)
     center.grid_rowconfigure(0, weight=1)
 
-    left_col = tk.Frame(center, bg=surface_color)
+    left_col = tk.Frame(center, bg=t_init.surface)
     left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
     left_col.grid_columnconfigure(0, weight=1)
     left_col.grid_rowconfigure(1, weight=1)
-    tk.Label(
+    journal_title_lbl = tk.Label(
         left_col,
         text="Journal Text",
-        bg=surface_color,
-        fg=muted_text_color,
-        font=("Segoe UI", 10, "bold"),
-    ).grid(row=0, column=0, sticky="w", pady=(0, 6))
-    editor_frame = tk.Frame(left_col, bg=panel_color, bd=0, highlightthickness=0)
+        bg=t_init.surface,
+        fg=t_init.muted,
+        font=t_init.section_label_font,
+    )
+    journal_title_lbl.grid(row=0, column=0, sticky="w", pady=(0, 6))
+    editor_frame = tk.Frame(left_col, bg=t_init.panel, bd=0, highlightthickness=0)
     editor_frame.grid(row=1, column=0, sticky="nsew")
     editor_frame.grid_rowconfigure(0, weight=1)
     editor_frame.grid_columnconfigure(0, weight=1)
@@ -2023,18 +2272,27 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         editor_frame,
         wrap="word",
         height=12,
-        bg=field_color,
-        fg=text_color,
-        insertbackground=text_color,
+        bg=t_init.field,
+        fg=t_init.text,
+        insertbackground=t_init.text,
         relief="flat",
         padx=12,
         pady=12,
-        font=("Consolas", 11),
+        font=("Segoe UI", 11),
         highlightthickness=1,
-        highlightbackground="#2B2B2B",
-        highlightcolor=accent_color,
+        highlightbackground=t_init.border,
+        highlightcolor=t_init.accent,
     )
-    scroll_bar = tk.Scrollbar(editor_frame, command=text_box.yview)
+    scroll_bar = tk.Scrollbar(
+        editor_frame,
+        command=text_box.yview,
+        bg=t_init.panel,
+        troughcolor=t_init.field,
+        activebackground=t_init.accent,
+        bd=0,
+        highlightthickness=0,
+        width=11,
+    )
     text_box.configure(yscrollcommand=scroll_bar.set)
     text_box.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=12)
     scroll_bar.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=12)
@@ -2042,41 +2300,42 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     text_box.focus_set()
     root.after(50, text_box.focus_set)
 
-    right_col = tk.Frame(center, bg=surface_color)
+    right_col = tk.Frame(center, bg=t_init.surface)
     right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
     right_col.grid_rowconfigure(0, weight=1)
     right_col.grid_rowconfigure(1, weight=1)
     right_col.grid_columnconfigure(0, weight=1)
 
-    stt_outer = tk.Frame(right_col, bg=surface_color)
+    stt_outer = tk.Frame(right_col, bg=t_init.surface)
     stt_outer.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
     stt_outer.grid_columnconfigure(0, weight=1)
-    stt_header = tk.Frame(stt_outer, bg=surface_color)
+    stt_header = tk.Frame(stt_outer, bg=t_init.surface)
     stt_header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
     stt_header.grid_columnconfigure(1, weight=1)
-    tk.Label(
+    stt_title_lbl = tk.Label(
         stt_header,
         text="Speech to text",
-        bg=surface_color,
-        fg=muted_text_color,
-        font=("Segoe UI", 10, "bold"),
-    ).grid(row=0, column=0, sticky="w")
+        bg=t_init.surface,
+        fg=t_init.muted,
+        font=t_init.section_label_font,
+    )
+    stt_title_lbl.grid(row=0, column=0, sticky="w")
     stt_saved_path_var = tk.StringVar(value="")
     stt_saved_path_entry = tk.Entry(
         stt_header,
         textvariable=stt_saved_path_var,
         state="readonly",
-        readonlybackground=surface_color,
-        fg=muted_text_color,
+        readonlybackground=t_init.surface,
+        fg=t_init.muted,
         font=("Segoe UI", 8),
         relief="flat",
         borderwidth=0,
         highlightthickness=0,
-        highlightbackground=surface_color,
+        highlightbackground=t_init.surface,
         insertwidth=0,
         justify="right",
         takefocus=1,
-        selectbackground=accent_color,
+        selectbackground=t_init.accent,
         selectforeground="white",
         cursor="xterm",
     )
@@ -2098,10 +2357,10 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         stt_header,
         text="Open",
         command=open_journal_recording_folder,
-        bg="#253F5A",
-        fg=text_color,
-        activebackground=accent_color,
-        activeforeground="white",
+        bg=_ut_bg,
+        fg=_ut_fg,
+        activebackground=_ut_abg,
+        activeforeground=_ut_afg,
         relief="flat",
         font=("Segoe UI", 8, "bold"),
         padx=6,
@@ -2116,12 +2375,12 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     bind_hover_tooltip(open_recording_btn, open_recording_tooltip_text)
     bind_button_hover_if_enabled(
         open_recording_btn,
-        lambda: ("normal", "#253F5A", text_color, accent_color, "white"),
-        JOURNAL_BTN_HOVER_BG,
-        "white",
+        lambda: th().toolbar_bind_rest(),
+        lambda: th().toolbar_hover()[0],
+        lambda: th().toolbar_hover()[1],
     )
 
-    stt_top = tk.Frame(stt_outer, bg=panel_color, bd=0, highlightthickness=0)
+    stt_top = tk.Frame(stt_outer, bg=t_init.panel, bd=0, highlightthickness=0)
     stt_top.grid(row=1, column=0, sticky="ew", pady=(0, 6))
     stt_top.grid_columnconfigure(5, weight=1)
     lang_var = tk.StringVar(value="Auto")
@@ -2129,8 +2388,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     stt_status = tk.Label(
         stt_top,
         text="",
-        bg=panel_color,
-        fg=muted_text_color,
+        bg=t_init.panel,
+        fg=t_init.muted,
         font=("Segoe UI", 9),
         anchor="w",
         justify="left",
@@ -2144,12 +2403,13 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             values=("Auto", "English", "简体中文"),
             state="readonly",
             width=11,
+            style="Journal.TCombobox",
         )
     else:
         lang_combo = tk.OptionMenu(stt_top, lang_var, "Auto", "English", "简体中文")
-        lang_combo.config(bg=panel_color, fg=text_color, highlightthickness=0)
+        lang_combo.config(bg=t_init.panel, fg=t_init.text, highlightthickness=0)
 
-    stt_frame = tk.Frame(stt_outer, bg=panel_color, bd=0, highlightthickness=0)
+    stt_frame = tk.Frame(stt_outer, bg=t_init.panel, bd=0, highlightthickness=0)
     stt_frame.grid(row=2, column=0, sticky="nsew")
     stt_frame.grid_rowconfigure(0, weight=0)
     stt_frame.grid_rowconfigure(1, weight=1)
@@ -2160,10 +2420,10 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     wave_canvas = tk.Canvas(
         stt_frame,
         height=52,
-        bg=field_color,
+        bg=t_init.field,
         highlightthickness=1,
-        highlightbackground="#2B2B2B",
-        highlightcolor=accent_color,
+        highlightbackground=t_init.border,
+        highlightcolor=t_init.accent,
     )
     wave_canvas.grid(row=0, column=0, columnspan=3, sticky="ew", padx=10, pady=(10, 4))
 
@@ -2171,33 +2431,43 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         stt_frame,
         wrap="word",
         height=8,
-        bg=field_color,
-        fg=text_color,
-        insertbackground=text_color,
+        bg=t_init.field,
+        fg=t_init.text,
+        insertbackground=t_init.text,
         relief="flat",
         padx=10,
         pady=10,
         font=("Segoe UI", 10),
         highlightthickness=1,
-        highlightbackground="#2B2B2B",
-        highlightcolor=accent_color,
+        highlightbackground=t_init.border,
+        highlightcolor=t_init.accent,
     )
-    stt_scroll = tk.Scrollbar(stt_frame, command=stt_box.yview)
+    stt_scroll = tk.Scrollbar(
+        stt_frame,
+        command=stt_box.yview,
+        bg=t_init.panel,
+        troughcolor=t_init.field,
+        activebackground=t_init.accent,
+        bd=0,
+        highlightthickness=0,
+        width=11,
+    )
     stt_box.configure(yscrollcommand=stt_scroll.set)
     stt_box.grid(row=1, column=0, sticky="nsew", padx=(10, 0), pady=(4, 10))
     stt_scroll.grid(row=1, column=1, sticky="ns", padx=(0, 2), pady=(4, 10))
-    transcribe_hover = tk.Frame(stt_frame, bg=panel_color)
+    transcribe_hover = tk.Frame(stt_frame, bg=t_init.panel)
     transcribe_hover.grid(row=1, column=2, sticky="ns", padx=(2, 10), pady=(4, 10))
+    _tid = t_init.transcribe_idle_disabled_config()
     transcribe_btn = tk.Button(
         transcribe_hover,
         text="Transcribe",
         state="disabled",
         width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
-        bg="#1a2d42",
-        fg=muted_text_color,
-        activebackground="#253F5A",
-        activeforeground=text_color,
-        disabledforeground=muted_text_color,
+        bg=_tid[0],
+        fg=_tid[1],
+        activebackground=_tid[2],
+        activeforeground=_tid[3],
+        disabledforeground=_tid[4],
         relief="flat",
         font=("Segoe UI", 9, "bold"),
         padx=10,
@@ -2207,31 +2477,32 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     transcribe_btn.pack()
     stt_box.insert("1.0", draft_speech)
 
-    report_outer = tk.Frame(right_col, bg=surface_color)
+    report_outer = tk.Frame(right_col, bg=t_init.surface)
     report_outer.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
     report_outer.grid_rowconfigure(1, weight=1)
     report_outer.grid_columnconfigure(0, weight=1)
-    report_header = tk.Frame(report_outer, bg=surface_color)
+    report_header = tk.Frame(report_outer, bg=t_init.surface)
     report_header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
     report_header.grid_columnconfigure(1, weight=1)
-    tk.Label(
+    report_title_lbl = tk.Label(
         report_header,
         text="AI report",
-        bg=surface_color,
-        fg=muted_text_color,
-        font=("Segoe UI", 10, "bold"),
-    ).grid(row=0, column=0, sticky="w")
+        bg=t_init.surface,
+        fg=t_init.muted,
+        font=t_init.section_label_font,
+    )
+    report_title_lbl.grid(row=0, column=0, sticky="w")
     report_status = tk.Label(
         report_header,
         text="",
-        bg=surface_color,
-        fg=muted_text_color,
+        bg=t_init.surface,
+        fg=t_init.muted,
         font=("Segoe UI", 9),
         anchor="e",
     )
     report_status.grid(row=0, column=1, sticky="e", padx=(8, 0))
 
-    report_frame = tk.Frame(report_outer, bg=panel_color, bd=0, highlightthickness=0)
+    report_frame = tk.Frame(report_outer, bg=t_init.panel, bd=0, highlightthickness=0)
     report_frame.grid(row=1, column=0, sticky="nsew")
     report_frame.grid_rowconfigure(0, weight=1)
     report_frame.grid_columnconfigure(0, weight=1)
@@ -2240,31 +2511,41 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         report_frame,
         wrap="word",
         height=8,
-        bg=field_color,
-        fg=text_color,
-        insertbackground=text_color,
+        bg=t_init.field,
+        fg=t_init.text,
+        insertbackground=t_init.text,
         relief="flat",
         padx=10,
         pady=10,
-        font=("Consolas", 10),
+        font=("Segoe UI", 10),
         highlightthickness=1,
-        highlightbackground="#2B2B2B",
-        highlightcolor=accent_color,
+        highlightbackground=t_init.border,
+        highlightcolor=t_init.accent,
     )
-    report_scroll = tk.Scrollbar(report_frame, command=report_box.yview)
+    report_scroll = tk.Scrollbar(
+        report_frame,
+        command=report_box.yview,
+        bg=t_init.panel,
+        troughcolor=t_init.field,
+        activebackground=t_init.accent,
+        bd=0,
+        highlightthickness=0,
+        width=11,
+    )
     report_box.configure(yscrollcommand=report_scroll.set)
     report_box.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=(4, 10))
     report_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 2), pady=(4, 10))
-    gen_report_hover = tk.Frame(report_frame, bg=panel_color)
+    gen_report_hover = tk.Frame(report_frame, bg=t_init.panel)
     gen_report_hover.grid(row=0, column=2, sticky="ns", padx=(2, 10), pady=(4, 10))
+    _, _gn, _gf, _gab, _gaf = t_init.gen_bind_rest()
     gen_button = tk.Button(
         gen_report_hover,
         text="Generate report",
         width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
-        bg="#253F5A",
-        fg=text_color,
-        activebackground=accent_color,
-        activeforeground="white",
+        bg=_gn,
+        fg=_gf,
+        activebackground=_gab,
+        activeforeground=_gaf,
         relief="flat",
         font=("Segoe UI", 9, "bold"),
         padx=10,
@@ -2276,14 +2557,14 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     def gen_rest_style() -> Tuple[str, str, str, str, str]:
         if str(gen_button.cget("state")) != "normal":
-            return ("disabled", "#1a2d42", muted_text_color, "#253F5A", text_color)
-        return ("normal", "#253F5A", text_color, accent_color, "white")
+            return th().gen_bind_disabled()
+        return th().gen_bind_rest()
 
     bind_button_hover_if_enabled(
         gen_button,
         gen_rest_style,
-        JOURNAL_BTN_HOVER_BG,
-        "white",
+        lambda: th().hover_primary,
+        lambda: "white",
     )
 
     save_entry_btn_holder: Dict[str, Any] = {"btn": None}
@@ -2297,21 +2578,22 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             or stt_box.get("1.0", "end-1c").strip()
             or report_box.get("1.0", "end-1c").strip()
         )
+        t = th()
         if has_any:
             btn.config(
                 state="normal",
-                bg=accent_color,
+                bg=t.accent,
                 fg="white",
-                activebackground="#3D6C9F",
+                activebackground=t.hover_save,
                 activeforeground="white",
                 cursor="hand2",
             )
         else:
             btn.config(
                 state="disabled",
-                bg="#1a2d42",
-                fg=muted_text_color,
-                disabledforeground=muted_text_color,
+                bg=t.btn_disabled,
+                fg=t.disabled_fg,
+                disabledforeground=t.disabled_fg,
                 cursor="arrow",
             )
 
@@ -2344,14 +2626,15 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         hpx = max(30, int(wave_canvas.winfo_height()))
         wave_canvas.delete("all")
         mid = hpx * 0.5
-        base_color = muted_text_color if isinstance(muted_text_color, str) else "#888888"
+        t = th()
+        base_color = t.muted if isinstance(t.muted, str) else "#888888"
         if len(pts) < 1:
             wave_canvas.create_line(4, mid, wpx - 4, mid, fill=base_color, width=1)
             return
         if len(pts) == 1:
             v = float(pts[0])
             y0 = mid - v * (hpx * 0.38)
-            wave_canvas.create_line(4, y0, wpx - 4, y0, fill=accent_color, width=1)
+            wave_canvas.create_line(4, y0, wpx - 4, y0, fill=t.waveform, width=1)
             return
         n = len(pts)
         coords: List[float] = []
@@ -2359,7 +2642,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             x = 4.0 + (wpx - 8.0) * (i / max(n - 1, 1))
             y = mid - float(v) * (hpx * 0.38)
             coords.extend([x, y])
-        wave_canvas.create_line(*coords, fill=accent_color, width=1)
+        wave_canvas.create_line(*coords, fill=t.waveform, width=1)
 
     def wave_tick() -> None:
         if not recording_ui_busy["v"]:
@@ -2401,35 +2684,40 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             pass
 
     def update_transcribe_ui() -> None:
+        t = th()
         if transcribing_busy["v"]:
+            tb = t.transcribe_busy_config()
             transcribe_btn.config(
                 state="disabled",
                 width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
-                bg="#1a2d42",
-                fg=muted_text_color,
-                activebackground="#253F5A",
-                activeforeground=text_color,
-                disabledforeground=muted_text_color,
+                bg=tb[0],
+                fg=tb[1],
+                activebackground=tb[2],
+                activeforeground=tb[3],
+                disabledforeground=tb[4],
             )
             return
         p = last_journal_wav.get("path")
         if p is not None and isinstance(p, Path) and p.exists():
+            bg, fg, abg, afg = t.side_action_config()
             transcribe_btn.config(
                 state="normal",
                 width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
-                bg="#253F5A",
-                fg=text_color,
-                activebackground=accent_color,
-                activeforeground="white",
+                bg=bg,
+                fg=fg,
+                activebackground=abg,
+                activeforeground=afg,
             )
         else:
+            tb = t.transcribe_idle_disabled_config()
             transcribe_btn.config(
                 state="disabled",
                 width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
-                bg="#1a2d42",
-                fg=muted_text_color,
-                activebackground="#253F5A",
-                activeforeground=text_color,
+                bg=tb[0],
+                fg=tb[1],
+                activebackground=tb[2],
+                activeforeground=tb[3],
+                disabledforeground=tb[4],
             )
 
     def transcribe_tooltip_text() -> str:
@@ -2486,18 +2774,21 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     bind_hover_tooltip(transcribe_btn, transcribe_tooltip_text)
 
     def transcribe_rest_style() -> Tuple[str, str, str, str, str]:
+        t = th()
         if transcribing_busy["v"]:
-            return ("disabled", "#1a2d42", muted_text_color, "#253F5A", text_color)
+            b0, b1, b2, b3, b4 = t.transcribe_busy_config()
+            return ("disabled", b0, b1, b2, b3)
         p = last_journal_wav.get("path")
         if p is not None and isinstance(p, Path) and p.exists():
-            return ("normal", "#253F5A", text_color, accent_color, "white")
-        return ("disabled", "#1a2d42", muted_text_color, "#253F5A", text_color)
+            return t.side_action_bind_rest()
+        b0, b1, b2, b3, b4 = t.transcribe_idle_disabled_config()
+        return ("disabled", b0, b1, b2, b3)
 
     bind_button_hover_if_enabled(
         transcribe_btn,
         transcribe_rest_style,
-        JOURNAL_BTN_HOVER_BG,
-        "white",
+        lambda: th().hover_primary,
+        lambda: "white",
     )
     wave_canvas.bind("<Configure>", lambda _e: redraw_waveform_canvas())
     wave_canvas.after(80, redraw_waveform_canvas)
@@ -2531,21 +2822,23 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         return any(t.startswith(p) for p in prefixes)
 
     def _journal_rec_btn_set(btn: Any, enabled: bool) -> None:
+        t = th()
         if enabled:
+            bg, fg, abg, afg = t.side_action_config()
             btn.config(
                 state="normal",
-                bg="#253F5A",
-                fg=text_color,
-                activebackground=accent_color,
-                activeforeground="white",
+                bg=bg,
+                fg=fg,
+                activebackground=abg,
+                activeforeground=afg,
                 cursor="hand2",
             )
         else:
             btn.config(
                 state="disabled",
-                bg="#1a2d42",
-                fg=muted_text_color,
-                disabledforeground=muted_text_color,
+                bg=t.btn_disabled,
+                fg=t.disabled_fg,
+                disabledforeground=t.disabled_fg,
                 cursor="arrow",
             )
 
@@ -2689,14 +2982,15 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             pause_rec_button.config(text="Resume recording")
             stt_status.config(text="Recording paused")
 
+    _sr_bg, _sr_fg, _sr_abg, _sr_afg = t_init.side_action_config()
     start_rec_button = tk.Button(
         stt_top,
         text="Start recording",
         command=start_recording,
-        bg="#253F5A",
-        fg=text_color,
-        activebackground=accent_color,
-        activeforeground="white",
+        bg=_sr_bg,
+        fg=_sr_fg,
+        activebackground=_sr_abg,
+        activeforeground=_sr_afg,
         relief="flat",
         font=("Segoe UI", 9, "bold"),
         padx=10,
@@ -2728,34 +3022,35 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     stop_rec_button.grid(row=0, column=2, sticky="w", padx=(0, 8), pady=8)
 
     def rec_primary_rest(btn: Any) -> Tuple[str, str, str, str, str]:
+        t = th()
         if str(btn.cget("state")) == "normal":
-            return ("normal", "#253F5A", text_color, accent_color, "white")
-        return ("disabled", "#1a2d42", muted_text_color, "#253F5A", text_color)
+            return t.side_action_bind_rest()
+        return t.side_action_disabled()
 
     bind_button_hover_if_enabled(
         start_rec_button,
         lambda b=start_rec_button: rec_primary_rest(b),
-        JOURNAL_BTN_HOVER_BG,
-        "white",
+        lambda: th().hover_primary,
+        lambda: "white",
     )
     bind_button_hover_if_enabled(
         pause_rec_button,
         lambda b=pause_rec_button: rec_primary_rest(b),
-        JOURNAL_BTN_HOVER_BG,
-        "white",
+        lambda: th().hover_primary,
+        lambda: "white",
     )
     bind_button_hover_if_enabled(
         stop_rec_button,
         lambda b=stop_rec_button: rec_primary_rest(b),
-        JOURNAL_BTN_HOVER_BG,
-        "white",
+        lambda: th().hover_primary,
+        lambda: "white",
     )
     stt_status.grid(row=0, column=3, sticky="ew", padx=(4, 12), pady=8)
     stt_lang_lbl = tk.Label(
         stt_top,
         text="Language:",
-        bg=panel_color,
-        fg=muted_text_color,
+        bg=t_init.panel,
+        fg=t_init.muted,
         font=("Segoe UI", 9),
     )
     stt_lang_lbl.grid(row=0, column=4, sticky="w", padx=(4, 0), pady=8)
@@ -2768,11 +3063,12 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 "No OpenAI API key. Use TOKEN ADD in the main menu or set OPENAI_API_KEY.",
             )
             return
+        t = th()
         gen_button.config(
             state="disabled",
-            bg="#1a2d42",
-            fg=muted_text_color,
-            disabledforeground=muted_text_color,
+            bg=t.btn_disabled,
+            fg=t.disabled_fg,
+            disabledforeground=t.disabled_fg,
             cursor="arrow",
         )
         report_status.config(text="Generating…")
@@ -2787,12 +3083,14 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         threading.Thread(target=work, daemon=True).start()
 
     def on_generate_report_done(body: str) -> None:
+        t = th()
+        bg, fg, abg, afg = t.side_action_config()
         gen_button.config(
             state="normal",
-            bg="#253F5A",
-            fg=text_color,
-            activebackground=accent_color,
-            activeforeground="white",
+            bg=bg,
+            fg=fg,
+            activebackground=abg,
+            activeforeground=afg,
             cursor="hand2",
         )
         report_status.config(text="")
@@ -2933,17 +3231,21 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             root.after_cancel(autosave_id["value"])
         root.destroy()
 
-    button_row = tk.Frame(root, bg=surface_color)
-    button_row.pack(fill="x", padx=14, pady=(0, 14))
+    button_row = tk.Frame(root, bg=t_init.surface)
+    button_row.pack(
+        fill="x",
+        padx=t_init.pad_outer,
+        pady=(0, t_init.pad_button_y),
+    )
     save_entry_btn = tk.Button(
         button_row,
         text="Save Entry",
         command=do_save,
-        bg="#1a2d42",
-        fg=muted_text_color,
-        activebackground="#3D6C9F",
+        bg=t_init.btn_disabled,
+        fg=t_init.disabled_fg,
+        activebackground=t_init.hover_save,
         activeforeground="white",
-        disabledforeground=muted_text_color,
+        disabledforeground=t_init.disabled_fg,
         relief="flat",
         font=("Segoe UI", 10, "bold"),
         padx=18,
@@ -2955,15 +3257,16 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     save_entry_btn_holder["btn"] = save_entry_btn
 
     def save_rest_style() -> Tuple[str, str, str, str, str]:
+        t = th()
         if str(save_entry_btn.cget("state")) != "normal":
-            return ("disabled", "#1a2d42", muted_text_color, "#253F5A", text_color)
-        return ("normal", accent_color, "white", "#3D6C9F", "white")
+            return t.save_bind_disabled()
+        return ("normal", t.accent, "white", t.hover_save, "white")
 
     bind_button_hover_if_enabled(
         save_entry_btn,
         save_rest_style,
-        JOURNAL_BTN_HOVER_SAVE_BG,
-        "white",
+        lambda: th().hover_save,
+        lambda: "white",
     )
 
     def _on_journal_text_changed(_evt: Optional[Any] = None) -> None:
@@ -2972,6 +3275,187 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     for _tb in (text_box, stt_box, report_box):
         _tb.bind("<KeyRelease>", _on_journal_text_changed, add="+")
         _tb.bind("<ButtonRelease-1>", _on_journal_text_changed, add="+")
+
+    def apply_journal_window_colors() -> None:
+        t = th()
+        root.configure(bg=t.surface)
+        top.configure(bg=t.panel)
+        top.pack_configure(padx=t.pad_outer, pady=t.pad_top_y)
+        date_lbl.configure(bg=t.panel, fg=t.muted, font=t.date_label_font)
+        time_lbl.configure(bg=t.panel, fg=t.muted, font=t.date_label_font)
+        try:
+            date_entry.config(background=t.field, foreground=t.text)
+        except tk.TclError:
+            try:
+                date_entry.config(
+                    bg=t.field,
+                    fg=t.text,
+                    insertbackground=t.text,
+                    highlightbackground=t.border,
+                    highlightcolor=t.accent,
+                )
+            except tk.TclError:
+                pass
+        time_entry.config(
+            bg=t.field,
+            fg=t.text,
+            insertbackground=t.text,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        tbg, tfg, tabg, tafg = t.toolbar_btn_config()
+        update_time_btn.config(
+            bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg
+        )
+        theme_toggle_btn.config(
+            text=t.toggle_label,
+            bg=tbg,
+            fg=tfg,
+            activebackground=tabg,
+            activeforeground=tafg,
+        )
+        center.configure(bg=t.surface)
+        center.pack_configure(padx=t.pad_outer, pady=(0, t.pad_center_y))
+        left_col.configure(bg=t.surface)
+        journal_title_lbl.configure(
+            bg=t.surface, fg=t.muted, font=t.section_label_font
+        )
+        editor_frame.configure(bg=t.panel)
+        text_box.config(
+            bg=t.field,
+            fg=t.text,
+            insertbackground=t.text,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        scroll_bar.config(bg=t.panel, troughcolor=t.field, activebackground=t.accent)
+        right_col.configure(bg=t.surface)
+        stt_outer.configure(bg=t.surface)
+        stt_header.configure(bg=t.surface)
+        stt_title_lbl.configure(
+            bg=t.surface, fg=t.muted, font=t.section_label_font
+        )
+        stt_saved_path_entry.config(
+            readonlybackground=t.surface,
+            fg=t.muted,
+            highlightbackground=t.surface,
+            selectbackground=t.accent,
+        )
+        open_recording_btn.config(
+            bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg
+        )
+        stt_top.configure(bg=t.panel)
+        stt_status.configure(bg=t.panel, fg=t.muted)
+        stt_frame.configure(bg=t.panel)
+        transcribe_hover.configure(bg=t.panel)
+        wave_canvas.config(
+            bg=t.field, highlightbackground=t.border, highlightcolor=t.accent
+        )
+        stt_box.config(
+            bg=t.field,
+            fg=t.text,
+            insertbackground=t.text,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        stt_scroll.config(bg=t.panel, troughcolor=t.field, activebackground=t.accent)
+        report_outer.configure(bg=t.surface)
+        report_header.configure(bg=t.surface)
+        report_title_lbl.configure(
+            bg=t.surface, fg=t.muted, font=t.section_label_font
+        )
+        report_status.configure(bg=t.surface, fg=t.muted)
+        report_frame.configure(bg=t.panel)
+        gen_report_hover.configure(bg=t.panel)
+        report_box.config(
+            bg=t.field,
+            fg=t.text,
+            insertbackground=t.text,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        report_scroll.config(bg=t.panel, troughcolor=t.field, activebackground=t.accent)
+        stt_lang_lbl.configure(bg=t.panel, fg=t.muted)
+        if ttk is not None and _jw_style is not None:
+            _jw_style.configure("Journal.TCombobox", **t.ttk_combobox_kwargs())
+            if t.is_dark:
+                _jw_style.map(
+                    "Journal.TCombobox",
+                    fieldbackground=[
+                        ("readonly", t.field),
+                        ("disabled", t.btn_disabled),
+                    ],
+                    selectbackground=[("readonly", t.accent)],
+                    selectforeground=[("readonly", "white")],
+                )
+            else:
+                _jw_style.map(
+                    "Journal.TCombobox",
+                    fieldbackground=[
+                        ("readonly", t.field),
+                        ("disabled", t.btn_disabled),
+                    ],
+                )
+        else:
+            try:
+                lang_combo.config(bg=t.panel, fg=t.text)
+            except tk.TclError:
+                pass
+        if str(gen_button.cget("state")) == "normal":
+            _gs, gb, gf, gab, gaf = t.gen_bind_rest()
+            gen_button.config(
+                bg=gb,
+                fg=gf,
+                activebackground=gab,
+                activeforeground=gaf,
+                cursor="hand2",
+            )
+        else:
+            _ds, gb, gf, _dab, _daf = t.gen_bind_disabled()
+            gen_button.config(
+                bg=gb,
+                fg=gf,
+                disabledforeground=gf,
+                cursor="arrow",
+            )
+        update_transcribe_ui()
+        for _b in (start_rec_button, pause_rec_button, stop_rec_button):
+            _journal_rec_btn_set(_b, str(_b.cget("state")) == "normal")
+        button_row.configure(bg=t.surface)
+        button_row.pack_configure(padx=t.pad_outer, pady=(0, t.pad_button_y))
+        refresh_save_entry_state()
+        redraw_waveform_canvas()
+
+    def toggle_journal_window_theme() -> None:
+        prefs = load_preferences()
+        cur = normalize_journal_window_theme_key(th().id)
+        nxt = "dark" if cur == "light" else "light"
+        prefs[JOURNAL_PREF_THEME_KEY] = nxt
+        save_preferences(prefs)
+        theme_holder[0] = JOURNAL_THEME_DARK if nxt == "dark" else JOURNAL_THEME_LIGHT
+        apply_journal_window_colors()
+
+    theme_toggle_btn = tk.Button(
+        top,
+        text=t_init.toggle_label,
+        command=toggle_journal_window_theme,
+        bg=_ut_bg,
+        fg=_ut_fg,
+        activebackground=_ut_abg,
+        activeforeground=_ut_afg,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=6,
+        cursor="hand2",
+    )
+    theme_toggle_btn.grid(row=0, column=5, sticky="e", padx=(0, 12), pady=12)
+    bind_button_hover_if_enabled(
+        theme_toggle_btn,
+        lambda: th().toolbar_bind_rest(),
+        lambda: th().toolbar_hover()[0],
+        lambda: th().toolbar_hover()[1],
+    )
 
     root.bind("<Escape>", on_close)
     root.protocol("WM_DELETE_WINDOW", on_close)
