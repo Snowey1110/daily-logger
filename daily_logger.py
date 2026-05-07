@@ -82,6 +82,8 @@ WHISPER_PRE_EDGE_PAD_MS = 120
 WHISPER_PRE_MIN_SPEECH_MS = 50
 WHISPER_PRE_MAX_INTERNAL_SILENCE_SEC = 1.25
 WHISPER_PRE_KEEP_INTERNAL_SILENCE_SEC = 0.35
+WHISPER_TRANSCRIBE_CHUNK_SEC = 8 * 60
+WHISPER_TRANSCRIBE_PROMPT_CHAR_LIMIT = 600
 # Hover tooltips: narrow wrap → shorter line length, more lines (taller block).
 TOOLTIP_WRAP_PX = 220
 TOOLTIP_WRAP_PX_MAX = 280
@@ -1663,22 +1665,14 @@ def prepare_wav_path_for_whisper(source: Path) -> Tuple[Path, Optional[str], Opt
     return tmp, None, tmp
 
 
-def transcribe_audio_openai(
+def _transcribe_audio_openai_single(
     file_path: Path,
     language: Optional[str],
     *,
     prompt: Optional[str] = None,
     temperature: float = 0.0,
 ) -> str:
-    """Send a local audio file to OpenAI Whisper. Returns transcript text or an error message."""
-    api_key = get_openai_api_key()
-    if not api_key:
-        return "OPENAI_API_KEY is not set. Use TOKEN ADD in the main menu or set the environment variable."
-
-    upload_path, prep_err, temp_upload = prepare_wav_path_for_whisper(file_path)
-    if prep_err is not None:
-        return prep_err
-
+    """Single-request Whisper upload. Caller handles retries/fallback strategy."""
     boundary = uuid.uuid4().hex.encode("ascii")
     crlf = b"\r\n"
     body_chunks: List[bytes] = []
@@ -1690,11 +1684,15 @@ def transcribe_audio_openai(
         )
         body_chunks.append(value.encode("utf-8") + crlf)
 
+    api_key = get_openai_api_key()
+    if not api_key:
+        return "OPENAI_API_KEY is not set. Use TOKEN ADD in the main menu or set the environment variable."
+
     add_field("model", "whisper-1")
     if language:
         add_field("language", language)
     if prompt and prompt.strip():
-        add_field("prompt", prompt.strip()[:1500])
+        add_field("prompt", prompt.strip()[:WHISPER_TRANSCRIBE_PROMPT_CHAR_LIMIT])
     add_field("temperature", str(temperature))
 
     filename = upload_path.name
@@ -1750,12 +1748,102 @@ def transcribe_audio_openai(
         except json.JSONDecodeError:
             result = "Whisper returned invalid JSON."
 
-    if temp_upload is not None:
-        try:
-            temp_upload.unlink(missing_ok=True)
-        except OSError:
-            pass
     return result
+
+
+def _whisper_context_too_long_error(text: str) -> bool:
+    needle = text.strip().lower()
+    if not needle:
+        return False
+    markers = (
+        "maximum context length",
+        "context length exceeded",
+        "prompt is too long",
+        "too many tokens",
+        "reduce the length",
+        "request too large",
+        "payload too large",
+    )
+    return any(m in needle for m in markers)
+
+
+def _transcribe_audio_openai_chunked(
+    file_path: Path,
+    language: Optional[str],
+    *,
+    prompt: Optional[str] = None,
+    temperature: float = 0.0,
+) -> str:
+    """Fallback for oversized uploads/context: split WAV and merge partial transcripts."""
+    mono, rate, read_err = _read_wav_mono_int16(file_path)
+    if read_err is not None or mono is None:
+        return _transcribe_audio_openai_single(
+            file_path, language, prompt=prompt, temperature=temperature
+        )
+    chunk_samples = max(int(rate * WHISPER_TRANSCRIBE_CHUNK_SEC), 1)
+    if int(mono.shape[0]) <= chunk_samples:
+        return _transcribe_audio_openai_single(
+            file_path, language, prompt=prompt, temperature=temperature
+        )
+
+    transcripts: List[str] = []
+    sample_count = int(mono.shape[0])
+    for start in range(0, sample_count, chunk_samples):
+        end = min(start + chunk_samples, sample_count)
+        part = mono[start:end]
+        if int(part.shape[0]) < 1:
+            continue
+        fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="whisper_chunk_")
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            werr = write_mono_int16_wav(tmp, part, rate)
+            if werr is not None:
+                return f"Could not write chunked audio: {werr}"
+            chunk_result = _transcribe_audio_openai_single(
+                tmp, language, prompt=prompt, temperature=temperature
+            ).strip()
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if _is_likely_api_error_message(chunk_result):
+            return chunk_result
+        if chunk_result:
+            transcripts.append(chunk_result)
+    merged = " ".join(t for t in transcripts if t.strip()).strip()
+    if merged:
+        return merged
+    return "Whisper returned empty text."
+
+
+def transcribe_audio_openai(
+    file_path: Path,
+    language: Optional[str],
+    *,
+    prompt: Optional[str] = None,
+    temperature: float = 0.0,
+) -> str:
+    """Send local audio to Whisper with fallback for long context/uploads."""
+    upload_path, prep_err, temp_upload = prepare_wav_path_for_whisper(file_path)
+    if prep_err is not None:
+        return prep_err
+    try:
+        first_try = _transcribe_audio_openai_single(
+            upload_path, language, prompt=prompt, temperature=temperature
+        )
+        if _whisper_context_too_long_error(first_try):
+            return _transcribe_audio_openai_chunked(
+                upload_path, language, prompt=prompt, temperature=temperature
+            )
+        return first_try
+    finally:
+        if temp_upload is not None:
+            try:
+                temp_upload.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def archive_journal_recording(wav_path: Path) -> Optional[Path]:
@@ -3272,9 +3360,22 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     def _on_journal_text_changed(_evt: Optional[Any] = None) -> None:
         refresh_save_entry_state()
 
+    def _journal_delete_prev_word(_evt: Optional[Any] = None) -> str:
+        w = root.focus_get()
+        if not isinstance(w, tk.Text):
+            return "break"
+        try:
+            w.delete("insert-1c wordstart", "insert")
+        except tk.TclError:
+            pass
+        refresh_save_entry_state()
+        return "break"
+
     for _tb in (text_box, stt_box, report_box):
         _tb.bind("<KeyRelease>", _on_journal_text_changed, add="+")
         _tb.bind("<ButtonRelease-1>", _on_journal_text_changed, add="+")
+        _tb.bind("<Control-BackSpace>", _journal_delete_prev_word, add="+")
+        _tb.bind("<Control-w>", _journal_delete_prev_word, add="+")
 
     def apply_journal_window_colors() -> None:
         t = th()
@@ -4516,6 +4617,7 @@ def _lcp_length_case_insensitive(strings: List[str]) -> int:
 
 
 CHAT_LINE_COMPLETIONS: Tuple[str, ...] = ("help", "rs", "ts")
+WINDOWS_CONSOLE_LINE_HISTORY: List[str] = []
 
 
 def _apply_typing_casing(user_line: str, completed_canonical: str) -> str:
@@ -4641,24 +4743,136 @@ def input_line_with_tab_completions(
         sys.stdout.write(prompt)
         sys.stdout.flush()
         buf: List[str] = []
+        cursor = 0
+        history = WINDOWS_CONSOLE_LINE_HISTORY
+        hist_index = len(history)
+
+        def _move_left(count: int = 1) -> None:
+            nonlocal cursor
+            n = max(0, min(count, cursor))
+            if n:
+                sys.stdout.write("\b" * n)
+                sys.stdout.flush()
+                cursor -= n
+
+        def _move_right(count: int = 1) -> None:
+            nonlocal cursor
+            n = max(0, min(count, len(buf) - cursor))
+            if n:
+                sys.stdout.write("".join(buf[cursor : cursor + n]))
+                sys.stdout.flush()
+                cursor += n
+
+        def _replace_tail_after_cursor(old_tail_len: int) -> None:
+            tail = "".join(buf[cursor:])
+            sys.stdout.write(tail)
+            if old_tail_len > len(tail):
+                sys.stdout.write(" " * (old_tail_len - len(tail)))
+            back = max(len(tail), old_tail_len)
+            if back:
+                sys.stdout.write("\b" * back)
+            sys.stdout.flush()
+
+        def _insert_text(text: str) -> None:
+            nonlocal cursor
+            if not text:
+                return
+            old_tail_len = len(buf) - cursor
+            buf[cursor:cursor] = list(text)
+            cursor += len(text)
+            sys.stdout.write(text)
+            _replace_tail_after_cursor(old_tail_len)
+
+        def _delete_left(count: int = 1) -> None:
+            nonlocal cursor
+            n = max(0, min(count, cursor))
+            if n == 0:
+                return
+            _move_left(n)
+            del buf[cursor : cursor + n]
+            _replace_tail_after_cursor((len(buf) - cursor) + n)
+
+        def _delete_right(count: int = 1) -> None:
+            n = max(0, min(count, len(buf) - cursor))
+            if n == 0:
+                return
+            del buf[cursor : cursor + n]
+            _replace_tail_after_cursor((len(buf) - cursor) + n)
+
+        def _erase_previous_word() -> None:
+            # Match common text-box behavior: delete spaces first, then one word.
+            n = 0
+            i = cursor - 1
+            while i >= 0 and buf[i].isspace():
+                n += 1
+                i -= 1
+            while i >= 0 and not buf[i].isspace():
+                n += 1
+                i -= 1
+            _delete_left(n)
+
+        def _replace_line(new_line: str) -> None:
+            nonlocal cursor
+            _move_right(len(buf) - cursor)
+            if buf:
+                _move_left(len(buf))
+                sys.stdout.write(" " * len(buf))
+                _move_left(len(buf))
+            buf.clear()
+            cursor = 0
+            if new_line:
+                _insert_text(new_line)
+                _move_right(len(new_line))
+
         while True:
             ch = msvcrt.getwch()
             if ch in ("\x00", "\xe0"):
-                # Consume second byte for arrow/function keys and ignore them.
-                msvcrt.getwch()
+                code = msvcrt.getwch()
+                if code == "H":  # Up
+                    if history and hist_index > 0:
+                        hist_index -= 1
+                        _replace_line(history[hist_index])
+                    else:
+                        sys.stdout.write("\a")
+                        sys.stdout.flush()
+                elif code == "P":  # Down
+                    if hist_index < len(history):
+                        hist_index += 1
+                        line = history[hist_index] if hist_index < len(history) else ""
+                        _replace_line(line)
+                    else:
+                        sys.stdout.write("\a")
+                        sys.stdout.flush()
+                elif code == "K":  # Left
+                    _move_left(1)
+                elif code == "M":  # Right
+                    _move_right(1)
+                elif code == "G":  # Home
+                    _move_left(cursor)
+                elif code == "O":  # End
+                    _move_right(len(buf) - cursor)
+                elif code == "S":  # Delete
+                    _delete_right(1)
+                # Ignore remaining arrows/function keys.
                 continue
             if ch in "\r\n":
+                line = "".join(buf).strip()
+                if line:
+                    if not history or history[-1] != line:
+                        history.append(line)
+                hist_index = len(history)
                 sys.stdout.write("\n")
                 sys.stdout.flush()
-                return "".join(buf).strip()
+                return line
             if ch == "\x03":
                 sys.stdout.write("\n")
                 raise KeyboardInterrupt
-            if ch in ("\x08", "\x7f"):
-                if buf:
-                    buf.pop()
-                    sys.stdout.write("\b \b")
-                    sys.stdout.flush()
+            if ch == "\x08":
+                _delete_left(1)
+                continue
+            if ch in ("\x7f", "\x17"):
+                # Ctrl+Backspace often arrives as DEL (\x7f); Ctrl+W as ETB (\x17).
+                _erase_previous_word()
                 continue
             if ch == "\t":
                 line = "".join(buf)
@@ -4670,11 +4884,7 @@ def input_line_with_tab_completions(
                     continue
                 new_line, extended = _line_tab_extend(line, completions)
                 if extended:
-                    for _ in range(len(line)):
-                        sys.stdout.write("\b \b")
-                    sys.stdout.write(new_line)
-                    buf = list(new_line)
-                    sys.stdout.flush()
+                    _replace_line(new_line)
                 else:
                     matches = [
                         c for c in completions if c.upper().startswith(line.upper())
@@ -4682,15 +4892,14 @@ def input_line_with_tab_completions(
                     if len(matches) > 1:
                         sys.stdout.write("\n  " + "\n  ".join(matches) + "\n")
                         sys.stdout.write(prompt + "".join(buf))
+                        _move_left(len(buf) - cursor)
                         sys.stdout.flush()
                     else:
                         sys.stdout.write("\a")
                         sys.stdout.flush()
                 continue
             if ord(ch) >= 32:
-                buf.append(ch)
-                sys.stdout.write(ch)
-                sys.stdout.flush()
+                _insert_text(ch)
 
     return input(prompt).strip()
 
