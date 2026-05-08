@@ -54,10 +54,22 @@ if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).resolve().parent
 else:
     BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "daily_logs"
+
+def get_user_data_root() -> Path:
+    """Return a stable per-user storage root shared across EXE and source runs."""
+    appdata = os.getenv("APPDATA", "").strip()
+    if appdata:
+        return Path(appdata) / "DailyLogger"
+    return BASE_DIR
+
+
+USER_DATA_ROOT = get_user_data_root()
+DATA_DIR = USER_DATA_ROOT / "daily_logs"
 RECORDING_DIR = DATA_DIR / "Recording"
 BACKUP_DIR = DATA_DIR / "backup"
-SETTINGS_DIR = BASE_DIR / "settings"
+SETTINGS_DIR = USER_DATA_ROOT / "settings"
+LEGACY_DATA_DIR = BASE_DIR / "daily_logs"
+LEGACY_SETTINGS_DIR = BASE_DIR / "settings"
 MASTER_JOURNAL_SHEET = "Master Journal"
 JOURNAL_HEADERS_LEGACY = ["Date", "Time", "Journal"]
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
@@ -90,6 +102,72 @@ WHISPER_TRANSCRIBE_PROMPT_CHAR_LIMIT = 600
 TOOLTIP_WRAP_PX = 220
 TOOLTIP_WRAP_PX_MAX = 280
 JOURNAL_PREF_THEME_KEY = "journal_window_theme"
+
+
+def migrate_legacy_storage_if_needed() -> None:
+    """One-time best-effort migration from legacy BASE_DIR storage to USER_DATA_ROOT."""
+    if USER_DATA_ROOT.resolve() == BASE_DIR.resolve():
+        return
+    try:
+        USER_DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    def _journal_has_entries(path: Path) -> bool:
+        if not path.exists():
+            return False
+        if load_workbook is None:
+            # Fallback heuristic when openpyxl is unavailable.
+            return path.stat().st_size > 16 * 1024
+        try:
+            wb = load_workbook(path, read_only=True, data_only=True)
+            ws = wb[MASTER_JOURNAL_SHEET] if MASTER_JOURNAL_SHEET in wb.sheetnames else wb.active
+            max_row = int(ws.max_row or 0)
+            if max_row <= 1:
+                wb.close()
+                return False
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if any((str(cell).strip() if cell is not None else "") for cell in row):
+                    wb.close()
+                    return True
+            wb.close()
+            return False
+        except Exception:
+            return path.stat().st_size > 16 * 1024
+
+    # Migrate daily logs. If new journal exists but is empty, replace it with legacy journal.
+    try:
+        legacy_journal = LEGACY_DATA_DIR / "Journal.xlsx"
+        new_journal = DATA_DIR / "Journal.xlsx"
+        if legacy_journal.exists() and (
+            not new_journal.exists()
+            or (not _journal_has_entries(new_journal) and _journal_has_entries(legacy_journal))
+        ):
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(legacy_journal, new_journal)
+        legacy_backup = LEGACY_DATA_DIR / "backup"
+        new_backup = DATA_DIR / "backup"
+        if legacy_backup.exists() and not new_backup.exists():
+            shutil.copytree(legacy_backup, new_backup)
+        legacy_recording = LEGACY_DATA_DIR / "Recording"
+        new_recording = DATA_DIR / "Recording"
+        if legacy_recording.exists() and not new_recording.exists():
+            shutil.copytree(legacy_recording, new_recording)
+    except OSError:
+        pass
+
+    # Migrate settings files only when target files are missing.
+    try:
+        if LEGACY_SETTINGS_DIR.exists():
+            SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+            for src in LEGACY_SETTINGS_DIR.glob("*"):
+                if not src.is_file():
+                    continue
+                dst = SETTINGS_DIR / src.name
+                if not dst.exists():
+                    shutil.copy2(src, dst)
+    except OSError:
+        pass
 
 
 @dataclass(frozen=True)
@@ -1258,7 +1336,7 @@ def is_startup_enabled() -> bool:
 
 
 def open_current_directory_in_explorer() -> bool:
-    return open_path_with_default_app(BASE_DIR)
+    return open_path_with_default_app(USER_DATA_ROOT)
 
 
 def open_path_with_default_app(path: Path) -> bool:
@@ -2202,8 +2280,88 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     def th() -> JournalWindowThemeSpec:
         return theme_holder[0]
 
+    # region agent log
+    def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
+        try:
+            payload = {
+                "sessionId": "8dd4b6",
+                "runId": run_id,
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "message": message,
+                "data": data,
+                "timestamp": int(time.time() * 1000),
+            }
+            with open("debug-8dd4b6.log", "a", encoding="utf-8") as _f:
+                _f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+    # endregion
+
     t_init = th()
     root.configure(bg=t_init.surface)
+    startup_total_steps = 6
+    startup_progress = {"value": 0}
+    startup_overlay = tk.Frame(root, bg=t_init.surface, bd=0, highlightthickness=0)
+    startup_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+    startup_box = tk.Frame(startup_overlay, bg=t_init.surface, bd=0, highlightthickness=0)
+    startup_box.place(relx=0.5, rely=0.5, anchor="center")
+    splash_w = 460
+    splash_title = tk.Label(
+        startup_box,
+        text=f"Loading {window_app_name}...",
+        bg=t_init.surface,
+        fg=t_init.text,
+        font=("Segoe UI", 11, "bold"),
+        anchor="w",
+    )
+    splash_title.pack(fill="x", padx=16, pady=(14, 6))
+    splash_detail = tk.Label(
+        startup_box,
+        text="Loading modules...",
+        bg=t_init.surface,
+        fg=t_init.muted,
+        font=("Segoe UI", 9),
+        anchor="w",
+    )
+    splash_detail.pack(fill="x", padx=16, pady=(0, 10))
+    startup_bar: Any
+    startup_canvas: Optional[Any] = None
+    startup_fill: Optional[Any] = None
+    if ttk is not None:
+        startup_bar = ttk.Progressbar(
+            startup_box,
+            orient="horizontal",
+            mode="determinate",
+            maximum=float(startup_total_steps),
+            length=splash_w - 32,
+        )
+        startup_bar.pack(padx=16, pady=(0, 14))
+    else:
+        startup_canvas = tk.Canvas(
+            startup_box,
+            width=splash_w - 32,
+            height=16,
+            bg=t_init.field,
+            highlightthickness=1,
+            highlightbackground=t_init.border,
+        )
+        startup_canvas.pack(padx=16, pady=(0, 14))
+        startup_fill = startup_canvas.create_rectangle(0, 0, 0, 16, fill=t_init.accent, width=0)
+        startup_bar = None
+
+    def _startup_step(detail: str) -> None:
+        startup_progress["value"] = min(startup_total_steps, startup_progress["value"] + 1)
+        splash_detail.config(text=detail)
+        if startup_bar is not None:
+            startup_bar["value"] = float(startup_progress["value"])
+        elif startup_canvas is not None and startup_fill is not None:
+            bar_w = int((splash_w - 32) * (startup_progress["value"] / startup_total_steps))
+            startup_canvas.coords(startup_fill, 0, 0, bar_w, 16)
+        startup_overlay.lift()
+        root.update_idletasks()
+
+    _startup_step("Loading theme...")
     _jw_style: Any = None
     if ttk is not None:
         _jw_style = ttk.Style(root)
@@ -2263,6 +2421,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     settings_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
     for _p in (journal_page, ai_recap_page, chatbot_page, console_page, settings_page):
         _p.grid(row=0, column=0, sticky="nsew")
+    # Ensure first paint shows Journal instead of last-created stacked page.
+    journal_page.tkraise()
 
     nav_collapsed = {"value": False}
     nav_animating = {"value": False}
@@ -2313,6 +2473,19 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             "console": console_page,
             "settings": settings_page,
         }
+        # region agent log
+        _debug_log(
+            "pre-fix",
+            "H1",
+            "daily_logger.py:show_page",
+            "show_page invoked",
+            {
+                "page_key": page_key,
+                "active_before": active_page["key"],
+                "overlay_exists": bool(startup_overlay.winfo_exists()),
+            },
+        )
+        # endregion
         if page_key == "console":
             _clear_console_hint()
         frame = page_map.get(page_key, journal_page)
@@ -2448,6 +2621,18 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 for btn in page_toggle_buttons:
                     _place_page_toggle(btn)
                 restore_key = nav_restore_page.get("key", "journal")
+                # region agent log
+                _debug_log(
+                    "pre-fix",
+                    "H2",
+                    "daily_logger.py:set_nav_visible._on_expand_done",
+                    "nav expand done restore key",
+                    {
+                        "restore_key": restore_key,
+                        "active_before_restore": active_page["key"],
+                    },
+                )
+                # endregion
                 if restore_key in ("journal", "ai_recap", "chatbot", "console", "settings"):
                     show_page(restore_key)
 
@@ -4535,6 +4720,30 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             show_page("chatbot")
             console_append("Switched to Chatbot page.")
             return
+        if cmd == "CONSOLE":
+            if sys.platform != "win32":
+                console_append("Native console show is supported on Windows only.")
+                return
+            try:
+                console_hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+                if console_hwnd:
+                    ctypes.windll.user32.ShowWindow(console_hwnd, 5)  # SW_SHOW
+                    console_append("Native console window shown.")
+                else:
+                    launch_cmd = (
+                        f'Set-Location -LiteralPath "{str(BASE_DIR)}"; '
+                        "Write-Host \"Daily Logger on-demand console\"; "
+                        "Write-Host \"You can run commands here.\"; "
+                        "Write-Host \"Close this window when finished.\""
+                    )
+                    subprocess.Popen(
+                        ["powershell", "-NoExit", "-Command", launch_cmd],
+                        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+                    )
+                    console_append("Opened a new on-demand console window.")
+            except Exception:
+                console_append("Could not show native console window.")
+            return
         capture = io.StringIO()
         keep_running = True
         try:
@@ -5046,6 +5255,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         refresh_save_entry_state()
         redraw_waveform_canvas()
 
+    _startup_step("Building pages...")
+
     def toggle_journal_window_theme() -> None:
         prefs = load_preferences()
         cur = normalize_journal_window_theme_key(th().id)
@@ -5186,8 +5397,20 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             root.focus_set()
 
     root.bind_all("<Button-1>", _unfocus_console_on_button_click, add="+")
+    _startup_step("Finalizing UI...")
+    # region agent log
+    _debug_log(
+        "pre-fix",
+        "H3",
+        "daily_logger.py:startup",
+        "before initial journal show",
+        {
+            "active_before": active_page["key"],
+            "overlay_exists": bool(startup_overlay.winfo_exists()),
+        },
+    )
+    # endregion
     show_page("journal")
-    set_nav_visible(True)
 
     def _on_escape(event=None) -> None:
         if str(find_row.winfo_manager()) == "pack":
@@ -5197,8 +5420,87 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     root.bind("<Escape>", _on_escape)
     root.protocol("WM_DELETE_WINDOW", on_close)
-    autosave()
-    refresh_save_entry_state()
+    _startup_step("Journal ready")
+    # region agent log
+    _debug_log(
+        "pre-fix",
+        "H4",
+        "daily_logger.py:startup",
+        "before overlay destroy",
+        {
+            "active_page": active_page["key"],
+            "overlay_exists": bool(startup_overlay.winfo_exists()),
+        },
+    )
+    # endregion
+    startup_overlay.destroy()
+    root.lift()
+
+    def _background_post_init() -> None:
+        # region agent log
+        _debug_log(
+            "pre-fix",
+            "H5",
+            "daily_logger.py:_background_post_init",
+            "background init start",
+            {
+                "active_page": active_page["key"],
+                "text_box_y": int(text_box.winfo_y()),
+                "center_y": int(center.winfo_y()),
+                "top_h": int(top.winfo_height()),
+            },
+        )
+        # endregion
+        _startup_step("Loading other pages...")
+        set_nav_visible(True)
+        # region agent log
+        _debug_log(
+            "pre-fix",
+            "H6",
+            "daily_logger.py:_background_post_init",
+            "after set_nav_visible",
+            {
+                "active_page": active_page["key"],
+                "text_box_y": int(text_box.winfo_y()),
+                "center_y": int(center.winfo_y()),
+                "top_h": int(top.winfo_height()),
+            },
+        )
+        # endregion
+        _startup_step("Starting autosave...")
+        autosave()
+        refresh_save_entry_state()
+        _startup_step("Ready")
+        # region agent log
+        _debug_log(
+            "pre-fix",
+            "H7",
+            "daily_logger.py:_background_post_init",
+            "background init complete",
+            {
+                "active_page": active_page["key"],
+                "text_box_y": int(text_box.winfo_y()),
+                "center_y": int(center.winfo_y()),
+                "top_h": int(top.winfo_height()),
+            },
+        )
+        # endregion
+
+    root.after(1, _background_post_init)
+    # region agent log
+    _debug_log(
+        "pre-fix",
+        "H8",
+        "daily_logger.py:startup",
+        "after overlay destroy before background init",
+        {
+            "active_page": active_page["key"],
+            "text_box_y": int(text_box.winfo_y()),
+            "center_y": int(center.winfo_y()),
+            "top_h": int(top.winfo_height()),
+        },
+    )
+    # endregion
     root.mainloop()
     return saved["value"]
 
@@ -5208,7 +5510,14 @@ def maybe_prompt_startup_on_first_run() -> None:
     if prefs.get("startup_prompt_done", "").lower() == "true":
         return
     print("Open logger automatically when computer starts? (y/N): ", end="")
-    answer = input().strip().lower()
+    try:
+        answer = input().strip().lower()
+    except (EOFError, RuntimeError):
+        # Windowed launches (pythonw / console=False EXE) may not provide stdin.
+        prefs["startup_enabled"] = "true" if is_startup_enabled() else "false"
+        prefs["startup_prompt_done"] = "true"
+        save_preferences(prefs)
+        return
     if answer in ("y", "yes"):
         if create_startup_shortcut():
             print("Startup enabled.")
@@ -5233,7 +5542,18 @@ def setup_first_time_preferences() -> str:
         return get_or_create_app_name()
 
     print("First time setup: use default settings? (y/N): ", end="")
-    answer = input().strip().lower()
+    try:
+        answer = input().strip().lower()
+    except (EOFError, RuntimeError):
+        # Non-interactive/windowed launch: apply safe defaults without prompting.
+        app_name = prefs.get("app_name", "").strip() or "Daily Logger"
+        prefs["app_name"] = app_name
+        prefs["startup_enabled"] = "true" if is_startup_enabled() else "false"
+        prefs["startup_prompt_done"] = "true"
+        prefs["initial_setup_done"] = "true"
+        if not save_preferences(prefs):
+            print("Warning: could not save initial preferences.")
+        return app_name
     use_default = answer in ("y", "yes")
 
     if use_default:
@@ -5248,7 +5568,10 @@ def setup_first_time_preferences() -> str:
     else:
         prefs["app_name"] = prompt_for_app_name()
         print("Open logger automatically when computer starts? (y/N): ", end="")
-        startup_answer = input().strip().lower()
+        try:
+            startup_answer = input().strip().lower()
+        except (EOFError, RuntimeError):
+            startup_answer = ""
         if startup_answer in ("y", "yes"):
             if create_startup_shortcut():
                 prefs["startup_enabled"] = "true"
@@ -5879,10 +6202,10 @@ def print_main_help() -> None:
     print("  STARTUP FALSE - disable startup shortcut")
     print("  DEFAULT WINDOWS - typing J opens journal window directly")
     print("  DEFAULT CONSOLE - typing J shows journal command choices")
-    print("  OPEN DIRECTORY   - open current app folder")
+    print("  OPEN DIRECTORY   - open app data folder")
     print("  OPEN JOURNAL     - open Journal.xlsx")
     print("  OPEN SCREENSHOTS - open chat_screenshots folder")
-    print("  DIRECTOR OPEN - open current app folder in File Explorer")
+    print("  DIRECTOR OPEN - open app data folder in File Explorer")
     print("  BACKUP START   - create backup zip in daily_logs/backup")
     print("  BACKUP TRUE    - auto backup once on each new day (default)")
     print("  BACKUP FALSE   - disable auto backup")
@@ -6048,7 +6371,7 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
         return True, app_name
     if key == "DIRECTOR OPEN":
         if open_current_directory_in_explorer():
-            print(f"Opened folder: {BASE_DIR}")
+            print(f"Opened folder: {USER_DATA_ROOT}")
         else:
             print("Could not open current folder in File Explorer.")
         return True, app_name
@@ -6056,7 +6379,7 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
         open_target = raw[5:].strip().upper()
         if open_target == "DIRECTORY":
             if open_current_directory_in_explorer():
-                print(f"Opened folder: {BASE_DIR}")
+                print(f"Opened folder: {USER_DATA_ROOT}")
             else:
                 print("Could not open current folder in File Explorer.")
             return True, app_name
@@ -6554,6 +6877,7 @@ def input_menu_choice(prompt: str) -> str:
 def run() -> None:
     if not ensure_runtime_dependencies():
         return
+    migrate_legacy_storage_if_needed()
     setup_first_time_preferences()
     ensure_backup_folder()
     maybe_run_daily_auto_backup()
