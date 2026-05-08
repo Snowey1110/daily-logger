@@ -2328,6 +2328,164 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         lambda: th().toolbar_hover()[0],
         lambda: th().toolbar_hover()[1],
     )
+    find_row = tk.Frame(root, bg=t_init.panel, bd=0, highlightthickness=0)
+    find_row.pack(fill="x", padx=t_init.pad_outer, pady=(0, 6))
+    find_row.grid_columnconfigure(8, weight=1)
+    find_lbl = tk.Label(
+        find_row,
+        text="Find:",
+        bg=t_init.panel,
+        fg=t_init.muted,
+        font=("Segoe UI", 9, "bold"),
+    )
+    find_lbl.grid(row=0, column=0, sticky="w", padx=(12, 6), pady=8)
+    find_scope_var = tk.StringVar(value="all")
+    find_scope_all_rb = tk.Radiobutton(
+        find_row,
+        text="All",
+        value="all",
+        variable=find_scope_var,
+        bg=t_init.panel,
+        fg=t_init.muted,
+        activebackground=t_init.panel,
+        activeforeground=t_init.text,
+        selectcolor=t_init.panel,
+        font=("Segoe UI", 9),
+        highlightthickness=0,
+        bd=0,
+        padx=4,
+    )
+    find_scope_all_rb.grid(row=0, column=1, sticky="w", padx=(2, 4), pady=8)
+    find_scope_one_rb = tk.Radiobutton(
+        find_row,
+        text="Current box",
+        value="one",
+        variable=find_scope_var,
+        bg=t_init.panel,
+        fg=t_init.muted,
+        activebackground=t_init.panel,
+        activeforeground=t_init.text,
+        selectcolor=t_init.panel,
+        font=("Segoe UI", 9),
+        highlightthickness=0,
+        bd=0,
+        padx=4,
+    )
+    find_scope_one_rb.grid(row=0, column=2, sticky="w", padx=(0, 8), pady=8)
+    find_var = tk.StringVar(value="")
+    find_entry = tk.Entry(
+        find_row,
+        textvariable=find_var,
+        width=28,
+        bg=t_init.field,
+        fg=t_init.text,
+        insertbackground=t_init.text,
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground=t_init.border,
+        highlightcolor=t_init.accent,
+        font=("Segoe UI", 10),
+    )
+    find_entry.grid(row=0, column=3, sticky="w", pady=8)
+    find_case_var = tk.BooleanVar(value=False)
+    find_case_chk = tk.Checkbutton(
+        find_row,
+        text="Case",
+        variable=find_case_var,
+        bg=t_init.panel,
+        fg=t_init.muted,
+        activebackground=t_init.panel,
+        activeforeground=t_init.text,
+        selectcolor=t_init.panel,
+        font=("Segoe UI", 9),
+        highlightthickness=0,
+        bd=0,
+        padx=4,
+    )
+    find_case_chk.grid(row=0, column=4, sticky="w", padx=(8, 0), pady=8)
+    find_word_var = tk.BooleanVar(value=False)
+    find_word_chk = tk.Checkbutton(
+        find_row,
+        text="Word",
+        variable=find_word_var,
+        bg=t_init.panel,
+        fg=t_init.muted,
+        activebackground=t_init.panel,
+        activeforeground=t_init.text,
+        selectcolor=t_init.panel,
+        font=("Segoe UI", 9),
+        highlightthickness=0,
+        bd=0,
+        padx=4,
+    )
+    find_word_chk.grid(row=0, column=5, sticky="w", padx=(4, 0), pady=8)
+    bind_hover_tooltip(
+        find_scope_all_rb,
+        lambda: "Search across Journal Text, Speech to text, and AI report.",
+    )
+    bind_hover_tooltip(
+        find_scope_one_rb,
+        lambda: "Search only in the currently active text box.",
+    )
+    bind_hover_tooltip(
+        find_case_chk,
+        lambda: "Match uppercase/lowercase exactly when enabled.",
+    )
+    bind_hover_tooltip(
+        find_word_chk,
+        lambda: "Match whole words only when enabled.",
+    )
+    find_status = tk.Label(
+        find_row,
+        text="",
+        bg=t_init.panel,
+        fg=t_init.muted,
+        font=("Segoe UI", 9),
+    )
+    find_status.grid(row=0, column=6, sticky="w", padx=(8, 0), pady=8)
+    find_prev_btn = tk.Button(
+        find_row,
+        text="Prev",
+        bg=_ut_bg,
+        fg=_ut_fg,
+        activebackground=_ut_abg,
+        activeforeground=_ut_afg,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=4,
+        cursor="hand2",
+    )
+    find_prev_btn.grid(row=0, column=7, sticky="e", padx=(10, 6), pady=8)
+    find_next_btn = tk.Button(
+        find_row,
+        text="Next",
+        bg=_ut_bg,
+        fg=_ut_fg,
+        activebackground=_ut_abg,
+        activeforeground=_ut_afg,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=4,
+        cursor="hand2",
+    )
+    find_next_btn.grid(row=0, column=8, sticky="e", padx=6, pady=8)
+    find_close_btn = tk.Button(
+        find_row,
+        text="Close",
+        bg=_ut_bg,
+        fg=_ut_fg,
+        activebackground=_ut_abg,
+        activeforeground=_ut_afg,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=4,
+        cursor="hand2",
+    )
+    find_close_btn.grid(row=0, column=9, sticky="e", padx=(6, 12), pady=8)
+    find_row.pack_forget()
 
     center = tk.Frame(root, bg=t_init.surface)
     center.pack(
@@ -2360,6 +2518,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         editor_frame,
         wrap="word",
         height=12,
+        undo=True,
+        autoseparators=True,
+        maxundo=-1,
         bg=t_init.field,
         fg=t_init.text,
         insertbackground=t_init.text,
@@ -2519,6 +2680,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         stt_frame,
         wrap="word",
         height=8,
+        undo=True,
+        autoseparators=True,
+        maxundo=-1,
         bg=t_init.field,
         fg=t_init.text,
         insertbackground=t_init.text,
@@ -2599,6 +2763,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         report_frame,
         wrap="word",
         height=8,
+        undo=True,
+        autoseparators=True,
+        maxundo=-1,
         bg=t_init.field,
         fg=t_init.text,
         insertbackground=t_init.text,
@@ -2642,6 +2809,232 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     )
     gen_button.pack()
     report_box.insert("1.0", draft_report)
+    _journal_find_state: Dict[str, Any] = {"widget": text_box}
+
+    def _active_journal_text_widget() -> tk.Text:
+        w = root.focus_get()
+        if isinstance(w, tk.Text) and w in (text_box, stt_box, report_box):
+            _journal_find_state["widget"] = w
+            return w
+        saved = _journal_find_state.get("widget")
+        if isinstance(saved, tk.Text):
+            return saved
+        return text_box
+
+    def _search_scope_widgets() -> Tuple[tk.Text, ...]:
+        if find_scope_var.get() == "one":
+            return (_active_journal_text_widget(),)
+        return (text_box, stt_box, report_box)
+
+    def _journal_select_all(_evt: Optional[Any] = None) -> str:
+        w = _active_journal_text_widget()
+        try:
+            w.tag_add("sel", "1.0", "end-1c")
+            w.mark_set("insert", "end-1c")
+            w.see("insert")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _find_close() -> None:
+        find_row.pack_forget()
+        find_status.config(text="")
+        _active_journal_text_widget().focus_set()
+
+    def _find_all_ranges(w: tk.Text, query: str, case_sensitive: bool, whole_word: bool) -> List[Tuple[str, str]]:
+        pattern = query if not whole_word else rf"\m{re.escape(query)}\M"
+        ranges: List[Tuple[str, str]] = []
+        idx = "1.0"
+        while True:
+            pos = w.search(
+                pattern,
+                idx,
+                stopindex="end-1c",
+                nocase=not case_sensitive,
+                regexp=whole_word,
+            )
+            if not pos:
+                break
+            end = f"{pos}+{len(query)}c"
+            ranges.append((pos, end))
+            idx = end
+        return ranges
+
+    def _find_update_status_for_selection(
+        w: tk.Text, query: str, sel_start: str, sel_widget: Optional[tk.Text] = None
+    ) -> None:
+        if not query:
+            find_status.config(text="")
+            return
+        widgets = _search_scope_widgets()
+        all_ranges: List[Tuple[tk.Text, str, str]] = []
+        for _w in widgets:
+            _ranges = _find_all_ranges(
+                _w,
+                query,
+                case_sensitive=find_case_var.get(),
+                whole_word=find_word_var.get(),
+            )
+            all_ranges.extend([(_w, _s, _e) for _s, _e in _ranges])
+        if not all_ranges:
+            find_status.config(text="No matches")
+            return
+        current = 1
+        sw = sel_widget or w
+        for i, (rw, s, _e) in enumerate(all_ranges, start=1):
+            if rw is sw and s == sel_start:
+                current = i
+                break
+        find_status.config(text=f"{current}/{len(all_ranges)}")
+
+    def _find_next(direction: int = 1) -> str:
+        query = find_var.get()
+        if not query:
+            find_status.config(text="Type text to find")
+            return "break"
+        widgets = _search_scope_widgets()
+        ranges_by_widget: Dict[tk.Text, List[Tuple[str, str]]] = {}
+        total_matches = 0
+        for _w in widgets:
+            _ranges = _find_all_ranges(
+                _w,
+                query,
+                case_sensitive=find_case_var.get(),
+                whole_word=find_word_var.get(),
+            )
+            ranges_by_widget[_w] = _ranges
+            total_matches += len(_ranges)
+        if total_matches == 0:
+            find_status.config(text="No matches")
+            return "break"
+        w = _active_journal_text_widget()
+        if w not in widgets:
+            w = widgets[0]
+        start = w.index("insert")
+        if w.tag_ranges("sel"):
+            start = w.index("sel.last") if direction > 0 else w.index("sel.first")
+        start_widget_idx = widgets.index(w)
+
+        def _pick_forward() -> Optional[Tuple[tk.Text, str, str]]:
+            for wi in range(start_widget_idx, len(widgets)):
+                _w = widgets[wi]
+                _ranges = ranges_by_widget.get(_w, [])
+                if not _ranges:
+                    continue
+                if wi == start_widget_idx:
+                    for s, e in _ranges:
+                        if _w.compare(s, ">", start):
+                            return (_w, s, e)
+                else:
+                    return (_w, _ranges[0][0], _ranges[0][1])
+            for wi in range(0, start_widget_idx + 1):
+                _w = widgets[wi]
+                _ranges = ranges_by_widget.get(_w, [])
+                if not _ranges:
+                    continue
+                if wi == start_widget_idx:
+                    return (_w, _ranges[0][0], _ranges[0][1])
+                return (_w, _ranges[0][0], _ranges[0][1])
+            return None
+
+        def _pick_backward() -> Optional[Tuple[tk.Text, str, str]]:
+            for wi in range(start_widget_idx, -1, -1):
+                _w = widgets[wi]
+                _ranges = ranges_by_widget.get(_w, [])
+                if not _ranges:
+                    continue
+                if wi == start_widget_idx:
+                    for s, e in reversed(_ranges):
+                        if _w.compare(s, "<", start):
+                            return (_w, s, e)
+                else:
+                    s, e = _ranges[-1]
+                    return (_w, s, e)
+            for wi in range(len(widgets) - 1, start_widget_idx - 1, -1):
+                _w = widgets[wi]
+                _ranges = ranges_by_widget.get(_w, [])
+                if not _ranges:
+                    continue
+                if wi == start_widget_idx:
+                    s, e = _ranges[-1]
+                    return (_w, s, e)
+                s, e = _ranges[-1]
+                return (_w, s, e)
+            return None
+
+        picked = _pick_forward() if direction > 0 else _pick_backward()
+        if not picked:
+            find_status.config(text="No matches")
+            return "break"
+        pw, pos, end = picked
+        for _w in (text_box, stt_box, report_box):
+            _w.tag_remove("sel", "1.0", "end")
+        pw.tag_add("sel", pos, end)
+        pw.mark_set("insert", end if direction > 0 else pos)
+        pw.see(pos)
+        pw.focus_set()
+        _journal_find_state["widget"] = pw
+        _find_update_status_for_selection(pw, query, pos, sel_widget=pw)
+        return "break"
+
+    def _find_prev(_evt: Optional[Any] = None) -> str:
+        return _find_next(-1)
+
+    def _find_open(_evt: Optional[Any] = None) -> str:
+        if str(find_row.winfo_manager()) == "pack":
+            _find_close()
+            return "break"
+        w = _active_journal_text_widget()
+        find_row.pack(fill="x", padx=t_init.pad_outer, pady=(0, 6), before=center)
+        selected = ""
+        try:
+            selected = w.get("sel.first", "sel.last")
+        except tk.TclError:
+            selected = ""
+        if selected.strip():
+            find_var.set(selected)
+        _find_update_status_for_selection(w, find_var.get(), "", sel_widget=w)
+        find_entry.focus_set()
+        find_entry.selection_range(0, "end")
+        return "break"
+
+    find_next_btn.config(command=lambda: _find_next(1))
+    find_prev_btn.config(command=lambda: _find_next(-1))
+    find_close_btn.config(command=_find_close)
+    find_scope_all_rb.config(
+        command=lambda: _find_update_status_for_selection(
+            _active_journal_text_widget(), find_var.get(), "", sel_widget=_active_journal_text_widget()
+        )
+    )
+    find_scope_one_rb.config(
+        command=lambda: _find_update_status_for_selection(
+            _active_journal_text_widget(), find_var.get(), "", sel_widget=_active_journal_text_widget()
+        )
+    )
+    find_case_chk.config(
+        command=lambda: _find_update_status_for_selection(
+            _active_journal_text_widget(), find_var.get(), "", sel_widget=_active_journal_text_widget()
+        )
+    )
+    find_word_chk.config(
+        command=lambda: _find_update_status_for_selection(
+            _active_journal_text_widget(), find_var.get(), "", sel_widget=_active_journal_text_widget()
+        )
+    )
+    find_entry.bind("<Return>", lambda _e: _find_next(1), add="+")
+    find_entry.bind("<Shift-Return>", _find_prev, add="+")
+    find_entry.bind(
+        "<KeyRelease>",
+        lambda _e: _find_update_status_for_selection(_active_journal_text_widget(), find_var.get(), ""),
+        add="+",
+    )
+    for _b in (find_prev_btn, find_next_btn, find_close_btn):
+        bind_button_hover_if_enabled(
+            _b,
+            lambda: th().toolbar_bind_rest(),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
 
     def gen_rest_style() -> Tuple[str, str, str, str, str]:
         if str(gen_button.cget("state")) != "normal":
@@ -3365,7 +3758,69 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         if not isinstance(w, tk.Text):
             return "break"
         try:
-            w.delete("insert-1c wordstart", "insert")
+            if w.tag_ranges("sel"):
+                w.delete("sel.first", "sel.last")
+                refresh_save_entry_state()
+                return "break"
+            left = w.get("1.0", "insert")
+            if not left:
+                return "break"
+            end_non_ws = len(left)
+            while end_non_ws > 0 and left[end_non_ws - 1].isspace():
+                end_non_ws -= 1
+            start = end_non_ws
+            while start > 0 and not left[start - 1].isspace():
+                start -= 1
+            delete_chars = len(left) - start
+            if delete_chars > 0:
+                w.delete(f"insert-{delete_chars}c", "insert")
+        except tk.TclError:
+            pass
+        refresh_save_entry_state()
+        return "break"
+
+    def _journal_delete_next_word(_evt: Optional[Any] = None) -> str:
+        w = root.focus_get()
+        if not isinstance(w, tk.Text):
+            return "break"
+        try:
+            if w.tag_ranges("sel"):
+                w.delete("sel.first", "sel.last")
+                refresh_save_entry_state()
+                return "break"
+            right = w.get("insert", "end-1c")
+            if not right:
+                return "break"
+            i = 0
+            n = len(right)
+            while i < n and right[i].isspace():
+                i += 1
+            while i < n and not right[i].isspace():
+                i += 1
+            if i > 0:
+                w.delete("insert", f"insert+{i}c")
+        except tk.TclError:
+            pass
+        refresh_save_entry_state()
+        return "break"
+
+    def _journal_undo(_evt: Optional[Any] = None) -> str:
+        w = root.focus_get()
+        if not isinstance(w, tk.Text):
+            return "break"
+        try:
+            w.edit_undo()
+        except tk.TclError:
+            pass
+        refresh_save_entry_state()
+        return "break"
+
+    def _journal_redo(_evt: Optional[Any] = None) -> str:
+        w = root.focus_get()
+        if not isinstance(w, tk.Text):
+            return "break"
+        try:
+            w.edit_redo()
         except tk.TclError:
             pass
         refresh_save_entry_state()
@@ -3373,15 +3828,62 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     for _tb in (text_box, stt_box, report_box):
         _tb.bind("<KeyRelease>", _on_journal_text_changed, add="+")
+        _tb.bind("<FocusIn>", lambda _e, _w=_tb: _journal_find_state.__setitem__("widget", _w), add="+")
         _tb.bind("<ButtonRelease-1>", _on_journal_text_changed, add="+")
         _tb.bind("<Control-BackSpace>", _journal_delete_prev_word, add="+")
         _tb.bind("<Control-w>", _journal_delete_prev_word, add="+")
+        _tb.bind("<Control-Delete>", _journal_delete_next_word, add="+")
+        _tb.bind("<Control-z>", _journal_undo, add="+")
+        _tb.bind("<Control-y>", _journal_redo, add="+")
+        _tb.bind("<Control-Z>", _journal_redo, add="+")
+        _tb.bind("<Control-a>", _journal_select_all, add="+")
+        _tb.bind("<Control-f>", _find_open, add="+")
+    root.bind("<Control-f>", _find_open, add="+")
 
     def apply_journal_window_colors() -> None:
         t = th()
         root.configure(bg=t.surface)
         top.configure(bg=t.panel)
         top.pack_configure(padx=t.pad_outer, pady=t.pad_top_y)
+        find_row.configure(bg=t.panel)
+        find_row.pack_configure(padx=t.pad_outer, pady=(0, 6))
+        find_lbl.configure(bg=t.panel, fg=t.muted)
+        find_entry.config(
+            bg=t.field,
+            fg=t.text,
+            insertbackground=t.text,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        find_status.configure(bg=t.panel, fg=t.muted)
+        find_scope_all_rb.configure(
+            bg=t.panel,
+            fg=t.muted,
+            activebackground=t.panel,
+            activeforeground=t.text,
+            selectcolor=t.panel,
+        )
+        find_scope_one_rb.configure(
+            bg=t.panel,
+            fg=t.muted,
+            activebackground=t.panel,
+            activeforeground=t.text,
+            selectcolor=t.panel,
+        )
+        find_case_chk.configure(
+            bg=t.panel,
+            fg=t.muted,
+            activebackground=t.panel,
+            activeforeground=t.text,
+            selectcolor=t.panel,
+        )
+        find_word_chk.configure(
+            bg=t.panel,
+            fg=t.muted,
+            activebackground=t.panel,
+            activeforeground=t.text,
+            selectcolor=t.panel,
+        )
         date_lbl.configure(bg=t.panel, fg=t.muted, font=t.date_label_font)
         time_lbl.configure(bg=t.panel, fg=t.muted, font=t.date_label_font)
         try:
@@ -3408,6 +3910,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         update_time_btn.config(
             bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg
         )
+        for _b in (find_prev_btn, find_next_btn, find_close_btn):
+            _b.config(bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg)
         theme_toggle_btn.config(
             text=t.toggle_label,
             bg=tbg,
@@ -3558,7 +4062,13 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         lambda: th().toolbar_hover()[1],
     )
 
-    root.bind("<Escape>", on_close)
+    def _on_escape(event=None) -> None:
+        if str(find_row.winfo_manager()) == "pack":
+            _find_close()
+            return
+        on_close(event)
+
+    root.bind("<Escape>", _on_escape)
     root.protocol("WM_DELETE_WINDOW", on_close)
     autosave()
     refresh_save_entry_state()
@@ -4712,7 +5222,8 @@ def _build_readline_line_completer(
             m = matches[state]
             before = line0[:beg0]
             cased_full = _apply_typing_casing(line0, m)
-            return _readline_completion_suffix(before, cased_full, m)
+            suffix = _readline_completion_suffix(before, cased_full, m)
+            return suffix
         except (IndexError, AttributeError):
             return None
 
@@ -4813,16 +5324,18 @@ def input_line_with_tab_completions(
 
         def _replace_line(new_line: str) -> None:
             nonlocal cursor
-            _move_right(len(buf) - cursor)
-            if buf:
-                _move_left(len(buf))
-                sys.stdout.write(" " * len(buf))
-                _move_left(len(buf))
+            old_len = len(buf)
             buf.clear()
-            cursor = 0
-            if new_line:
-                _insert_text(new_line)
-                _move_right(len(new_line))
+            buf.extend(list(new_line))
+            cursor = len(buf)
+            # Carriage-return redraw is more stable in PowerShell/Windows Terminal
+            # than backspace-based in-place erasing for tab-completion replacement.
+            sys.stdout.write("\r" + prompt + new_line)
+            if old_len > len(new_line):
+                sys.stdout.write(" " * (old_len - len(new_line)))
+            # Put visual cursor at logical cursor location (always end after replace).
+            sys.stdout.write("\r" + prompt + "".join(buf))
+            sys.stdout.flush()
 
         while True:
             ch = msvcrt.getwch()
