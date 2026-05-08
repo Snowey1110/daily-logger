@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import base64
+import contextlib
 import ctypes
+import io
 import importlib
 import importlib.util
 import json
@@ -2190,7 +2192,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             edit_target_row = 0
 
     root = tk.Tk()
-    root.title("Journal Window")
+    root_prefs = load_preferences()
+    window_app_name = root_prefs.get("app_name", "Daily Logger").strip() or "Daily Logger"
+    root.title(window_app_name)
     root.geometry("1360x720")
     root.minsize(1020, 620)
     theme_holder: List[JournalWindowThemeSpec] = [load_journal_window_theme_spec()]
@@ -2233,9 +2237,239 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     root.focus_force()
     is_edit_mode = bool(edit_target_sheet and edit_target_row > 0)
 
-    top = tk.Frame(root, bg=t_init.panel, bd=0, highlightthickness=0)
+    shell = tk.Frame(root, bg=t_init.surface, bd=0, highlightthickness=0)
+    shell.pack(fill="both", expand=True)
+    shell.grid_rowconfigure(0, weight=1)
+    shell.grid_columnconfigure(1, weight=1)
+    shell.grid_columnconfigure(0, minsize=170)
+
+    nav_rail = tk.Frame(shell, bg=t_init.panel, width=170, bd=0, highlightthickness=0)
+    nav_rail.grid(row=0, column=0, sticky="nsw")
+    nav_rail.grid_rowconfigure(100, weight=1)
+    nav_rail.grid_columnconfigure(0, weight=1)
+    nav_rail.grid_propagate(False)
+
+    content_host = tk.Frame(shell, bg=t_init.surface, bd=0, highlightthickness=0)
+    content_host.grid(row=0, column=1, sticky="nsew")
+    content_host.grid_rowconfigure(0, weight=1)
+    content_host.grid_rowconfigure(1, weight=0)
+    content_host.grid_columnconfigure(0, weight=1)
+    console_input_holder: Dict[str, Any] = {"row": None}
+
+    journal_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
+    ai_recap_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
+    chatbot_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
+    console_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
+    settings_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
+    for _p in (journal_page, ai_recap_page, chatbot_page, console_page, settings_page):
+        _p.grid(row=0, column=0, sticky="nsew")
+
+    nav_collapsed = {"value": False}
+    nav_animating = {"value": False}
+    nav_full_width = 170
+    nav_restore_page = {"key": "journal"}
+    nav_title = tk.Label(
+        nav_rail,
+        text=window_app_name,
+        bg=t_init.panel,
+        fg=t_init.muted,
+        font=("Segoe UI", 10, "bold"),
+    )
+    nav_title.grid(row=0, column=0, sticky="w", padx=(12, 0), pady=(14, 10))
+
+    nav_buttons: Dict[str, Any] = {}
+    active_page = {"key": "journal"}
+    active_page_frame: Dict[str, Any] = {"frame": None}
+
+    def _layout_console_row(frame: Any) -> None:
+        frame.update_idletasks()
+        fw = frame.winfo_width()
+        reveal_width = nav_summon_btn.winfo_width() if nav_collapsed["value"] else 0
+        left_margin = 20 + (reveal_width + 8 if nav_collapsed["value"] else 0)
+        right_margin = 20
+        if save_entry_btn_holder.get("btn") is not None and frame is journal_page:
+            save_x = save_entry_btn.winfo_x()
+            save_w = save_entry_btn.winfo_width()
+            if save_x > 0 and save_w > 0:
+                right_margin = max(right_margin, fw - save_x + 8)
+        row_w = max(280, fw - left_margin - right_margin)
+        console_row = console_input_holder.get("row")
+        if console_row is not None:
+            console_row.place(
+                in_=frame,
+                x=left_margin,
+                rely=1.0,
+                y=-12,
+                anchor="sw",
+                width=row_w,
+            )
+            console_row.lift()
+
+    def show_page(page_key: str) -> None:
+        page_map = {
+            "journal": journal_page,
+            "ai_recap": ai_recap_page,
+            "chatbot": chatbot_page,
+            "console": console_page,
+            "settings": settings_page,
+        }
+        if page_key == "console":
+            _clear_console_hint()
+        frame = page_map.get(page_key, journal_page)
+        frame.tkraise()
+        active_page["key"] = page_key
+        active_page_frame["frame"] = frame
+        console_row = console_input_holder.get("row")
+        if console_row is not None:
+            _layout_console_row(frame)
+        for key, btn in nav_buttons.items():
+            if key == page_key:
+                btn.config(bg=th().accent, fg="white")
+            else:
+                btn.config(bg=th().btn_secondary, fg=th().text)
+
+    page_toggle_buttons: List[Any] = []
+    nav_summon_btn = tk.Button(
+        content_host,
+        text="▶",
+        bg=t_init.toolbar_btn_config()[0],
+        fg=t_init.toolbar_btn_config()[1],
+        activebackground=t_init.toolbar_btn_config()[2],
+        activeforeground=t_init.toolbar_btn_config()[3],
+        relief="flat",
+        font=("Segoe UI", 10, "bold"),
+        padx=2,
+        pady=12,
+        cursor="hand2",
+        bd=0,
+        highlightthickness=0,
+        width=1,
+    )
+
+    def _place_page_toggle(btn: Any) -> None:
+        if nav_animating["value"]:
+            return
+        if nav_collapsed["value"]:
+            btn.place_forget()
+        else:
+            nav_rail.update_idletasks()
+            ph = nav_rail.winfo_height()
+            y = max(56, (ph // 2) - 14)
+            # Place on the right seam of the Pages rail.
+            x = max(0, nav_rail.winfo_width() - 12)
+            btn.place(x=x, y=y)
+
+    def _place_nav_summon() -> None:
+        if nav_animating["value"]:
+            return
+        content_host.update_idletasks()
+        jh = content_host.winfo_height()
+        y = max(56, (jh // 2) - 14)
+        nav_summon_btn.place(x=0, y=y)
+        nav_summon_btn.lift()
+
+    def _register_page_toggle(parent: Any) -> Any:
+        if page_toggle_buttons:
+            return page_toggle_buttons[0]
+        btn = tk.Button(
+            nav_rail,
+            text="◀",
+            bg=t_init.toolbar_btn_config()[0],
+            fg=t_init.toolbar_btn_config()[1],
+            activebackground=t_init.toolbar_btn_config()[2],
+            activeforeground=t_init.toolbar_btn_config()[3],
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=2,
+            pady=12,
+            cursor="hand2",
+            bd=0,
+            highlightthickness=0,
+            width=1,
+        )
+        btn.config(command=lambda b=btn: set_nav_visible(False))
+        bind_button_hover_if_enabled(
+            btn,
+            lambda: (
+                "normal",
+                th().toolbar_btn_config()[0],
+                th().toolbar_btn_config()[1],
+                th().toolbar_btn_config()[2],
+                th().toolbar_btn_config()[3],
+            ),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
+        page_toggle_buttons.append(btn)
+        _place_page_toggle(btn)
+        nav_rail.bind(
+            "<Configure>",
+            lambda _e, b=btn: _place_page_toggle(b) if not nav_animating["value"] else None,
+            add="+",
+        )
+        return btn
+
+    def set_nav_visible(visible: bool) -> None:
+        if nav_animating["value"]:
+            return
+        target_collapsed = not visible
+        if nav_collapsed["value"] == target_collapsed:
+            return
+
+        nav_animating["value"] = True
+        nav_collapsed["value"] = not visible
+
+        def _animate_width(start: int, target: int, done: Callable[[], None]) -> None:
+            duration_ms = 220.0
+            t0 = time.perf_counter()
+
+            def _tick() -> None:
+                elapsed = (time.perf_counter() - t0) * 1000.0
+                p = min(1.0, elapsed / duration_ms)
+                eased = 1.0 - ((1.0 - p) ** 3)
+                nxt = int(round(start + (target - start) * eased))
+                shell.grid_columnconfigure(0, minsize=nxt)
+                nav_rail.config(width=nxt)
+                if p >= 1.0:
+                    done()
+                else:
+                    root.after(16, _tick)
+
+            _tick()
+
+        if visible:
+            nav_rail.grid()
+            nav_summon_btn.place_forget()
+            shell.grid_columnconfigure(0, minsize=0)
+            nav_rail.config(width=0)
+
+            def _on_expand_done() -> None:
+                nav_animating["value"] = False
+                for btn in page_toggle_buttons:
+                    _place_page_toggle(btn)
+                restore_key = nav_restore_page.get("key", "journal")
+                if restore_key in ("journal", "ai_recap", "chatbot", "console", "settings"):
+                    show_page(restore_key)
+
+            _animate_width(0, nav_full_width, _on_expand_done)
+        else:
+            for btn in page_toggle_buttons:
+                btn.place_forget()
+            nav_restore_page["key"] = active_page["key"]
+
+            def _on_collapse_done() -> None:
+                nav_animating["value"] = False
+                shell.grid_columnconfigure(0, minsize=0)
+                nav_rail.config(width=0)
+                nav_rail.grid_remove()
+                _place_nav_summon()
+
+            _animate_width(nav_full_width, 0, _on_collapse_done)
+
+    top = tk.Frame(journal_page, bg=t_init.panel, bd=0, highlightthickness=0)
     top.pack(fill="x", padx=t_init.pad_outer, pady=t_init.pad_top_y)
     top.grid_columnconfigure(5, weight=1)
+    _register_page_toggle(journal_page)
     date_lbl = tk.Label(
         top,
         text="Date (mm/dd/yyyy):",
@@ -2328,7 +2562,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         lambda: th().toolbar_hover()[0],
         lambda: th().toolbar_hover()[1],
     )
-    find_row = tk.Frame(root, bg=t_init.panel, bd=0, highlightthickness=0)
+    find_row = tk.Frame(journal_page, bg=t_init.panel, bd=0, highlightthickness=0)
     find_row.pack(fill="x", padx=t_init.pad_outer, pady=(0, 6))
     find_row.grid_columnconfigure(8, weight=1)
     find_lbl = tk.Label(
@@ -2487,7 +2721,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     find_close_btn.grid(row=0, column=9, sticky="e", padx=(6, 12), pady=8)
     find_row.pack_forget()
 
-    center = tk.Frame(root, bg=t_init.surface)
+    center = tk.Frame(journal_page, bg=t_init.surface)
     center.pack(
         fill="both",
         expand=True,
@@ -2809,6 +3043,556 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     )
     gen_button.pack()
     report_box.insert("1.0", draft_report)
+
+    placeholder_frames: List[Any] = []
+    placeholder_title_labels: List[Any] = []
+    placeholder_body_labels: List[Any] = []
+
+    def _build_placeholder_page(parent: Any, title: str) -> None:
+        _register_page_toggle(parent)
+        wrap = tk.Frame(parent, bg=t_init.surface)
+        wrap.pack(fill="both", expand=True, padx=28, pady=24)
+        title_lbl = tk.Label(
+            wrap,
+            text=title,
+            bg=t_init.surface,
+            fg=t_init.text,
+            font=("Segoe UI", 16, "bold"),
+            anchor="w",
+        )
+        title_lbl.pack(anchor="w", pady=(0, 10))
+        body_lbl = tk.Label(
+            wrap,
+            text="Coming soon - this page is ready for future UI features.",
+            bg=t_init.surface,
+            fg=t_init.muted,
+            font=("Segoe UI", 11),
+            anchor="w",
+            justify="left",
+        )
+        body_lbl.pack(anchor="w")
+        placeholder_frames.append(wrap)
+        placeholder_title_labels.append(title_lbl)
+        placeholder_body_labels.append(body_lbl)
+
+    _build_placeholder_page(ai_recap_page, "AI Recap")
+    _build_placeholder_page(chatbot_page, "Chatbot")
+
+    settings_wrap = tk.Frame(settings_page, bg=t_init.surface)
+    settings_wrap.pack(fill="both", expand=True, padx=20, pady=20)
+    _register_page_toggle(settings_page)
+    settings_title = tk.Label(
+        settings_wrap,
+        text="Settings",
+        bg=t_init.surface,
+        fg=t_init.text,
+        font=("Segoe UI", 16, "bold"),
+        anchor="w",
+    )
+    settings_title.pack(anchor="w", pady=(0, 12))
+    settings_status_var = tk.StringVar(value="")
+    settings_status_lbl = tk.Label(
+        settings_wrap,
+        textvariable=settings_status_var,
+        bg=t_init.surface,
+        fg=t_init.muted,
+        font=("Segoe UI", 9),
+        anchor="w",
+        justify="left",
+    )
+    settings_status_lbl.pack(fill="x", pady=(0, 10))
+
+    settings_rows: List[Any] = []
+    settings_labels: List[Any] = []
+
+    def _make_settings_row(label_text: str) -> Tuple[Any, Any]:
+        row = tk.Frame(settings_wrap, bg=t_init.surface)
+        row.pack(fill="x", pady=(0, 10))
+        lbl = tk.Label(
+            row,
+            text=label_text,
+            bg=t_init.surface,
+            fg=t_init.muted,
+            font=("Segoe UI", 10, "bold"),
+            width=18,
+            anchor="w",
+        )
+        lbl.pack(side="left")
+        settings_rows.append(row)
+        settings_labels.append(lbl)
+        return row, lbl
+
+    settings_prefs = load_preferences()
+    settings_app_name = {"value": settings_prefs.get("app_name", "Daily Logger") or "Daily Logger"}
+    console_hint_state: Dict[str, Any] = {"text": "", "apply": None, "reset_after_id": None}
+
+    def _clear_console_hint() -> None:
+        console_hint_state["text"] = ""
+        _id = console_hint_state.get("reset_after_id")
+        if _id is not None:
+            try:
+                root.after_cancel(_id)
+            except Exception:
+                pass
+            console_hint_state["reset_after_id"] = None
+        apply_hint = console_hint_state.get("apply")
+        if callable(apply_hint):
+            apply_hint()
+
+    def _set_settings_status(msg: str) -> None:
+        settings_status_var.set("")
+        console_hint_state["text"] = msg.strip()
+        _id = console_hint_state.get("reset_after_id")
+        if _id is not None:
+            try:
+                root.after_cancel(_id)
+            except Exception:
+                pass
+        console_hint_state["reset_after_id"] = root.after(10000, _clear_console_hint)
+        apply_hint = console_hint_state.get("apply")
+        if callable(apply_hint):
+            apply_hint()
+
+    rename_row, _ = _make_settings_row("Rename")
+    rename_entry = tk.Entry(
+        rename_row,
+        bg=t_init.field,
+        fg=t_init.text,
+        insertbackground=t_init.text,
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground=t_init.border,
+        highlightcolor=t_init.accent,
+        font=("Segoe UI", 10),
+    )
+    rename_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+    rename_entry.insert(0, settings_app_name["value"])
+    rename_btn = tk.Button(
+        rename_row,
+        text="Rename",
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=6,
+        cursor="hand2",
+    )
+    rename_btn.pack(side="left")
+
+    startup_row, _ = _make_settings_row("Start Up Launch")
+    startup_state = {"enabled": is_startup_enabled()}
+    startup_toggle_btn = tk.Button(
+        startup_row,
+        text="On" if startup_state["enabled"] else "Off",
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+        width=7,
+    )
+    startup_toggle_btn.pack(side="left")
+
+    theme_row, _ = _make_settings_row("Window Theme")
+    settings_theme_btn = tk.Button(
+        theme_row,
+        text=t_init.toggle_label,
+        command=lambda: toggle_journal_window_theme(),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+    )
+    settings_theme_btn.pack(side="left")
+
+    backup_row, _ = _make_settings_row("Back Up")
+    backup_mode = {"value": "On"}
+    if _is_pref_true(settings_prefs.get("backup_limited", "false")):
+        backup_mode["value"] = "Limited"
+    elif not _is_pref_true(settings_prefs.get("backup_enabled", "true")):
+        backup_mode["value"] = "Off"
+    backup_mode_btn = tk.Button(
+        backup_row,
+        text=backup_mode["value"],
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+        width=9,
+    )
+    backup_mode_btn.pack(side="left", padx=(0, 8))
+    backup_manual_btn = tk.Button(
+        backup_row,
+        text="Manual",
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+        width=9,
+    )
+    backup_manual_btn.pack(side="left")
+    bind_hover_tooltip(
+        backup_mode_btn,
+        lambda: "Backup mode cycles: On (daily), Off (disabled), Limited (daily + keep max 3 backups).",
+    )
+    bind_hover_tooltip(
+        backup_manual_btn,
+        lambda: "Run one backup now immediately.",
+    )
+
+    token_row, _ = _make_settings_row("Token")
+    token_saved = {"value": get_openai_api_key() or ""}
+    token_entry = tk.Entry(
+        token_row,
+        bg=t_init.field,
+        fg=t_init.text,
+        insertbackground=t_init.text,
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground=t_init.border,
+        highlightcolor=t_init.accent,
+        font=("Consolas", 10),
+    )
+    token_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+    if token_saved["value"]:
+        token_entry.insert(0, "*" * max(32, len(token_saved["value"])))
+    token_save_btn = tk.Button(
+        token_row,
+        text="Save",
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=6,
+        cursor="hand2",
+        width=7,
+    )
+    token_save_btn.pack(side="left", padx=(0, 8))
+    token_copy_btn = tk.Button(
+        token_row,
+        text="Copy",
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=6,
+        cursor="hand2",
+        width=7,
+    )
+    token_copy_btn.pack(side="left")
+
+    start_menu_row, _ = _make_settings_row("Start Menu Shortcut")
+    start_menu_app_btn = tk.Button(
+        start_menu_row,
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        text="App",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+    )
+    start_menu_app_btn.pack(side="left", padx=(0, 8))
+    start_menu_journal_btn = tk.Button(
+        start_menu_row,
+        text="Journal",
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+    )
+    start_menu_journal_btn.pack(side="left")
+    bind_hover_tooltip(
+        start_menu_app_btn,
+        lambda: "Create a Start Menu shortcut for the Daily Logger app launcher (.bat).",
+    )
+    bind_hover_tooltip(
+        start_menu_journal_btn,
+        lambda: "Create a Start Menu shortcut for Journal.xlsx so it appears in Windows search.",
+    )
+
+    def _refresh_token_entry_mask() -> None:
+        token_entry.delete(0, "end")
+        if token_saved["value"]:
+            token_entry.insert(0, "*" * max(32, len(token_saved["value"])))
+
+    def _is_token_mask(value: str) -> bool:
+        return bool(value) and all(ch == "*" for ch in value)
+
+    def _on_rename_apply() -> None:
+        new_name = rename_entry.get().strip() or "Daily Logger"
+        updated = rename_app_name_to(new_name)
+        settings_app_name["value"] = updated
+        console_app_name["value"] = updated
+        root.title(updated)
+        nav_title.config(text=updated)
+        rename_entry.delete(0, "end")
+        rename_entry.insert(0, updated)
+        _set_settings_status(f'App renamed to "{updated}".')
+
+    def _on_toggle_startup() -> None:
+        should_enable = not startup_state["enabled"]
+        ok = create_startup_shortcut() if should_enable else remove_startup_shortcut()
+        if not ok:
+            _set_settings_status("Could not update startup launch setting.")
+            return
+        startup_state["enabled"] = should_enable
+        startup_toggle_btn.config(text="On" if should_enable else "Off")
+        prefs = load_preferences()
+        prefs["startup_enabled"] = "true" if should_enable else "false"
+        save_preferences(prefs)
+        _set_settings_status("Startup launch enabled." if should_enable else "Startup launch disabled.")
+
+    def _persist_backup_mode(mode: str) -> None:
+        prefs = load_preferences()
+        if mode == "On":
+            prefs["backup_enabled"] = "true"
+            prefs["backup_limited"] = "false"
+        elif mode == "Off":
+            prefs["backup_enabled"] = "false"
+            prefs["backup_limited"] = "false"
+        else:
+            prefs["backup_enabled"] = "true"
+            prefs["backup_limited"] = "true"
+        if save_preferences(prefs):
+            _set_settings_status(f"Backup mode set to {mode}.")
+        else:
+            _set_settings_status("Could not save backup mode setting.")
+
+    def _on_cycle_backup_mode() -> None:
+        order = ("On", "Off", "Limited")
+        idx = order.index(backup_mode["value"])
+        next_mode = order[(idx + 1) % len(order)]
+        backup_mode["value"] = next_mode
+        backup_mode_btn.config(text=next_mode)
+        _persist_backup_mode(next_mode)
+
+    def _on_manual_backup() -> None:
+        prefs = load_preferences()
+        evict_oldest_backup_if_limited_full(prefs)
+        backup_path = run_backup_now()
+        if backup_path is None:
+            _set_settings_status("Manual backup skipped: nothing in daily_logs to back up.")
+            return
+        trim_backups_if_limited(prefs)
+        _set_settings_status(f"Manual backup created: {backup_path.name}")
+
+    def _on_token_focus_in(_evt: Optional[Any] = None) -> None:
+        if _is_token_mask(token_entry.get()):
+            token_entry.delete(0, "end")
+
+    def _on_token_save() -> None:
+        typed = token_entry.get().strip()
+        if _is_token_mask(typed):
+            _set_settings_status("Token unchanged.")
+            return
+        if not typed:
+            if delete_openai_api_key():
+                token_saved["value"] = ""
+                _refresh_token_entry_mask()
+                _set_settings_status("Token removed.")
+            else:
+                _set_settings_status("Could not remove token.")
+            return
+        if save_openai_api_key(typed):
+            token_saved["value"] = typed
+            _refresh_token_entry_mask()
+            _set_settings_status("Token saved.")
+        else:
+            _set_settings_status("Could not save token.")
+
+    def _on_token_copy() -> None:
+        current = get_openai_api_key() or ""
+        if not current:
+            _set_settings_status("No saved token to copy.")
+            return
+        if copy_text_to_clipboard(current):
+            _set_settings_status("Current token copied to clipboard.")
+        else:
+            _set_settings_status("Could not copy token to clipboard.")
+
+    def _on_start_menu_button(selected: str) -> None:
+        if selected == "journal":
+            ok = sb_create_journal_search_shortcut()
+        else:
+            ok = sb_create_bat_search_shortcut()
+        if ok:
+            _set_settings_status(f'Start Menu "{selected}" shortcut enabled.')
+        else:
+            _set_settings_status(f'Could not enable Start Menu "{selected}" shortcut.')
+
+    rename_btn.config(command=_on_rename_apply)
+    startup_toggle_btn.config(command=_on_toggle_startup)
+    backup_mode_btn.config(command=_on_cycle_backup_mode)
+    backup_manual_btn.config(command=_on_manual_backup)
+    token_save_btn.config(command=_on_token_save)
+    token_copy_btn.config(command=_on_token_copy)
+    start_menu_app_btn.config(command=lambda: _on_start_menu_button("app"))
+    start_menu_journal_btn.config(command=lambda: _on_start_menu_button("journal"))
+    token_entry.bind("<FocusIn>", _on_token_focus_in, add="+")
+    for _btn in (
+        rename_btn,
+        startup_toggle_btn,
+        settings_theme_btn,
+        backup_mode_btn,
+        backup_manual_btn,
+        token_save_btn,
+        token_copy_btn,
+        start_menu_app_btn,
+        start_menu_journal_btn,
+    ):
+        bind_button_hover_if_enabled(
+            _btn,
+            lambda b=_btn: (
+                str(b.cget("state")),
+                th().btn_secondary,
+                th().text,
+                th().secondary_hover,
+                th().text,
+            ),
+            lambda: th().secondary_hover,
+            lambda: th().text,
+        )
+
+    console_wrap = tk.Frame(console_page, bg=t_init.surface)
+    console_wrap.pack(fill="both", expand=True, padx=20, pady=20)
+    _register_page_toggle(console_page)
+    console_title = tk.Label(
+        console_wrap,
+        text="Console",
+        bg=t_init.surface,
+        fg=t_init.text,
+        font=("Segoe UI", 16, "bold"),
+        anchor="w",
+    )
+    console_title.pack(anchor="w", pady=(0, 8))
+    console_output = tk.Text(
+        console_wrap,
+        wrap="word",
+        height=20,
+        bg=t_init.field,
+        fg=t_init.text,
+        insertbackground=t_init.text,
+        relief="flat",
+        padx=12,
+        pady=12,
+        font=("Consolas", 10),
+        state="disabled",
+        highlightthickness=1,
+        highlightbackground=t_init.border,
+        highlightcolor=t_init.accent,
+    )
+    console_output.pack(fill="both", expand=True, side="left")
+    console_scroll = tk.Scrollbar(
+        console_wrap,
+        command=console_output.yview,
+        bg=t_init.panel,
+        troughcolor=t_init.field,
+        activebackground=t_init.accent,
+        bd=0,
+        highlightthickness=0,
+        width=11,
+    )
+    console_scroll.pack(fill="y", side="right")
+    console_output.configure(yscrollcommand=console_scroll.set)
+
+    console_input_row = tk.Frame(content_host, bg=t_init.surface)
+    console_input_row.place_forget()
+    console_input_holder["row"] = console_input_row
+    console_prompt = tk.Label(
+        console_input_row,
+        text="> ",
+        bg=t_init.surface,
+        fg=t_init.muted,
+        font=("Consolas", 11, "bold"),
+        cursor="hand2",
+    )
+    console_prompt.pack(side="left")
+    console_entry = tk.Entry(
+        console_input_row,
+        bg=t_init.field,
+        fg=t_init.text,
+        insertbackground=t_init.text,
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground=t_init.border,
+        highlightcolor=t_init.accent,
+        font=("Consolas", 10),
+        width=1,
+    )
+    console_entry.pack(side="left", fill="x", expand=True, padx=(0, 0))
+    console_insertwidth_normal = int(console_entry.cget("insertwidth") or 1)
+    console_placeholder = "Type console messages"
+    console_entry_state: Dict[str, bool] = {"placeholder": False}
+
+    def _set_console_placeholder() -> None:
+        if console_entry.get():
+            return
+        console_entry_state["placeholder"] = True
+        console_entry.config(
+            fg=t_init.muted,
+            font=("Consolas", 10, "italic"),
+            insertwidth=0,
+        )
+        hint = str(console_hint_state.get("text", "")).strip()
+        console_entry.insert(0, hint or console_placeholder)
+
+    def _clear_console_placeholder() -> None:
+        if not console_entry_state["placeholder"]:
+            return
+        console_entry.delete(0, "end")
+        console_entry_state["placeholder"] = False
+        console_entry.config(
+            fg=th().text,
+            font=("Consolas", 10),
+            insertwidth=console_insertwidth_normal,
+        )
+        console_hint_state["text"] = ""
+
+    def _show_console_hint_placeholder() -> None:
+        if console_entry_state["placeholder"] or not console_entry.get().strip():
+            console_entry.delete(0, "end")
+            console_entry_state["placeholder"] = False
+            _set_console_placeholder()
+
+    console_hint_state["apply"] = _show_console_hint_placeholder
+    _set_console_placeholder()
     _journal_find_state: Dict[str, Any] = {"widget": text_box}
 
     def _active_journal_text_widget() -> tk.Text:
@@ -2984,6 +3768,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         if str(find_row.winfo_manager()) == "pack":
             _find_close()
             return "break"
+        if active_page["key"] != "journal":
+            show_page("journal")
         w = _active_journal_text_widget()
         find_row.pack(fill="x", padx=t_init.pad_outer, pady=(0, 6), before=center)
         selected = ""
@@ -3712,7 +4498,121 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             root.after_cancel(autosave_id["value"])
         root.destroy()
 
-    button_row = tk.Frame(root, bg=t_init.surface)
+    console_history: List[str] = []
+    console_hist_index = {"value": 0}
+    prefs_for_console = load_preferences()
+    console_app_name = {"value": prefs_for_console.get("app_name", "Daily Logger") or "Daily Logger"}
+
+    def console_append(text: str) -> None:
+        if not text:
+            return
+        console_output.config(state="normal")
+        console_output.insert("end", text.rstrip("\n") + "\n")
+        console_output.see("end")
+        console_output.config(state="disabled")
+
+    def run_console_command() -> None:
+        if console_entry_state["placeholder"]:
+            return
+        raw = console_entry.get().strip()
+        console_entry.delete(0, "end")
+        if not raw:
+            return
+        console_append(f"> {raw}")
+        if not console_history or console_history[-1] != raw:
+            console_history.append(raw)
+        console_hist_index["value"] = len(console_history)
+        cmd = raw.upper()
+        if cmd in {"J", "JOURNAL", "WINDOW"}:
+            show_page("journal")
+            console_append("Switched to Journal page.")
+            return
+        if cmd in {"R", "RT"}:
+            show_page("ai_recap")
+            console_append("Switched to AI Recap page.")
+            return
+        if cmd in {"C", "CT"}:
+            show_page("chatbot")
+            console_append("Switched to Chatbot page.")
+            return
+        capture = io.StringIO()
+        keep_running = True
+        try:
+            with contextlib.redirect_stdout(capture):
+                keep_running, next_name = handle_choice(raw, console_app_name["value"])
+            console_app_name["value"] = next_name
+        except Exception as exc:
+            console_append(f"Error: {exc}")
+            return
+        output = capture.getvalue().strip()
+        if output:
+            console_append(output)
+        if not keep_running:
+            on_close()
+
+    def _console_history_up(_evt: Optional[Any] = None) -> str:
+        if not console_history:
+            return "break"
+        _clear_console_placeholder()
+        console_hist_index["value"] = max(0, console_hist_index["value"] - 1)
+        console_entry.delete(0, "end")
+        console_entry.insert(0, console_history[console_hist_index["value"]])
+        return "break"
+
+    def _console_history_down(_evt: Optional[Any] = None) -> str:
+        if not console_history:
+            return "break"
+        _clear_console_placeholder()
+        console_hist_index["value"] = min(len(console_history), console_hist_index["value"] + 1)
+        console_entry.delete(0, "end")
+        if console_hist_index["value"] < len(console_history):
+            console_entry.insert(0, console_history[console_hist_index["value"]])
+        else:
+            _set_console_placeholder()
+        return "break"
+
+    def _console_entry_focus_in(_evt: Optional[Any] = None) -> None:
+        _clear_console_placeholder()
+
+    def _console_entry_focus_out(_evt: Optional[Any] = None) -> None:
+        if not console_entry.get().strip():
+            console_entry.delete(0, "end")
+            _set_console_placeholder()
+
+    def _console_entry_keypress(evt: Optional[Any] = None) -> Optional[str]:
+        if evt is None or not console_entry_state["placeholder"]:
+            return None
+        if evt.keysym in {"Left", "Right", "Home", "End"}:
+            return "break"
+        if evt.keysym in {"BackSpace", "Delete"}:
+            _clear_console_placeholder()
+            return "break"
+        if evt.char and evt.char >= " ":
+            _clear_console_placeholder()
+        return None
+
+    def _console_tab_complete(_evt: Optional[Any] = None) -> str:
+        current = "" if console_entry_state["placeholder"] else console_entry.get()
+        if not current.strip():
+            capture = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(capture):
+                    print_main_help()
+            except Exception:
+                capture = io.StringIO()
+            output = capture.getvalue().strip()
+            if output:
+                console_append(output)
+            return "break"
+        completed, extended = _line_tab_extend(current, MAIN_MENU_COMPLETIONS)
+        if extended:
+            _clear_console_placeholder()
+            console_entry.delete(0, "end")
+            console_entry.insert(0, completed)
+            console_entry.icursor("end")
+        return "break"
+
+    button_row = tk.Frame(journal_page, bg=t_init.surface)
     button_row.pack(
         fill="x",
         padx=t_init.pad_outer,
@@ -3843,6 +4743,93 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     def apply_journal_window_colors() -> None:
         t = th()
         root.configure(bg=t.surface)
+        shell.configure(bg=t.surface)
+        nav_rail.configure(bg=t.panel)
+        nav_title.configure(bg=t.panel, fg=t.muted)
+        nav_summon_btn.configure(
+            bg=t.toolbar_btn_config()[0],
+            fg=t.toolbar_btn_config()[1],
+            activebackground=t.toolbar_btn_config()[2],
+            activeforeground=t.toolbar_btn_config()[3],
+        )
+        nav_settings_btn.configure(
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+        )
+        content_host.configure(bg=t.surface)
+        journal_page.configure(bg=t.surface)
+        ai_recap_page.configure(bg=t.surface)
+        chatbot_page.configure(bg=t.surface)
+        console_page.configure(bg=t.surface)
+        settings_page.configure(bg=t.surface)
+        for _w in placeholder_frames:
+            _w.configure(bg=t.surface)
+        for _w in placeholder_title_labels:
+            _w.configure(bg=t.surface, fg=t.text)
+        for _w in placeholder_body_labels:
+            _w.configure(bg=t.surface, fg=t.muted)
+        settings_wrap.configure(bg=t.surface)
+        settings_title.configure(bg=t.surface, fg=t.text)
+        settings_status_lbl.configure(bg=t.surface, fg=t.muted)
+        for _w in settings_rows:
+            _w.configure(bg=t.surface)
+        for _w in settings_labels:
+            _w.configure(bg=t.surface, fg=t.muted)
+        rename_entry.config(
+            bg=t.field,
+            fg=t.text,
+            insertbackground=t.text,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        token_entry.config(
+            bg=t.field,
+            fg=t.text,
+            insertbackground=t.text,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        for _btn in (
+            rename_btn,
+            startup_toggle_btn,
+            settings_theme_btn,
+            backup_mode_btn,
+            backup_manual_btn,
+            token_save_btn,
+            token_copy_btn,
+            start_menu_app_btn,
+            start_menu_journal_btn,
+        ):
+            _btn.configure(
+                bg=t.btn_secondary,
+                fg=t.text,
+                activebackground=t.secondary_hover,
+                activeforeground=t.text,
+            )
+        for _btn in page_toggle_buttons:
+            _btn.configure(
+                bg=t.toolbar_btn_config()[0],
+                fg=t.toolbar_btn_config()[1],
+                activebackground=t.toolbar_btn_config()[2],
+                activeforeground=t.toolbar_btn_config()[3],
+            )
+        for key, btn in nav_buttons.items():
+            if active_page["key"] == key:
+                btn.config(
+                    bg=t.accent,
+                    fg="white",
+                    activebackground=t.hover_primary,
+                    activeforeground="white",
+                )
+            else:
+                btn.config(
+                    bg=t.btn_secondary,
+                    fg=t.text,
+                    activebackground=t.secondary_hover,
+                    activeforeground=t.text,
+                )
         top.configure(bg=t.panel)
         top.pack_configure(padx=t.pad_outer, pady=t.pad_top_y)
         find_row.configure(bg=t.panel)
@@ -3884,6 +4871,27 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             activeforeground=t.text,
             selectcolor=t.panel,
         )
+        console_wrap.configure(bg=t.surface)
+        console_title.configure(bg=t.surface, fg=t.text)
+        console_output.config(
+            bg=t.field,
+            fg=t.text,
+            insertbackground=t.text,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        console_scroll.config(bg=t.panel, troughcolor=t.field, activebackground=t.accent)
+        console_input_row.configure(bg=t.surface)
+        console_prompt.configure(bg=t.surface, fg=t.muted)
+        console_entry.config(
+            bg=t.field,
+            fg=(t.muted if console_entry_state["placeholder"] else t.text),
+            insertbackground=t.text,
+            insertwidth=(0 if console_entry_state["placeholder"] else console_insertwidth_normal),
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+            font=("Consolas", 10, "italic") if console_entry_state["placeholder"] else ("Consolas", 10),
+        )
         date_lbl.configure(bg=t.panel, fg=t.muted, font=t.date_label_font)
         time_lbl.configure(bg=t.panel, fg=t.muted, font=t.date_label_font)
         try:
@@ -3914,10 +4922,17 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             _b.config(bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg)
         theme_toggle_btn.config(
             text=t.toggle_label,
-            bg=tbg,
-            fg=tfg,
-            activebackground=tabg,
-            activeforeground=tafg,
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+        )
+        settings_theme_btn.config(
+            text=t.toggle_label,
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
         )
         center.configure(bg=t.surface)
         center.pack_configure(padx=t.pad_outer, pady=(0, t.pad_center_y))
@@ -4057,10 +5072,122 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     theme_toggle_btn.grid(row=0, column=5, sticky="e", padx=(0, 12), pady=12)
     bind_button_hover_if_enabled(
         theme_toggle_btn,
-        lambda: th().toolbar_bind_rest(),
+        lambda: (
+            "normal",
+            th().btn_secondary,
+            th().text,
+            th().secondary_hover,
+            th().text,
+        ),
+        lambda: th().secondary_hover,
+        lambda: th().text,
+    )
+
+    nav_specs: List[Tuple[str, str]] = [
+        ("journal", "Journal"),
+        ("ai_recap", "AI Recap"),
+        ("chatbot", "Chatbot"),
+        ("console", "Console"),
+    ]
+    for _idx, (_key, _label) in enumerate(nav_specs, start=1):
+        _btn = tk.Button(
+            nav_rail,
+            text=_label,
+            command=lambda k=_key: show_page(k),
+            relief="flat",
+            font=("Segoe UI", 10, "bold"),
+            padx=10,
+            pady=8,
+            anchor="w",
+            cursor="hand2",
+        )
+        _btn.grid(row=_idx, column=0, sticky="ew", padx=10, pady=(0, 8))
+        nav_buttons[_key] = _btn
+        bind_button_hover_if_enabled(
+            _btn,
+            lambda b=_btn, k=_key: (
+                "normal",
+                th().accent if active_page["key"] == k else th().btn_secondary,
+                "white" if active_page["key"] == k else th().text,
+                th().hover_primary if active_page["key"] == k else th().secondary_hover,
+                "white" if active_page["key"] == k else th().text,
+            ),
+            lambda k=_key: th().hover_primary if active_page["key"] == k else th().secondary_hover,
+            lambda k=_key: "white" if active_page["key"] == k else th().text,
+        )
+
+    nav_settings_btn = tk.Button(
+        nav_rail,
+        text="Settings",
+        command=lambda: show_page("settings"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=8,
+        cursor="hand2",
+        bd=0,
+        highlightthickness=0,
+    )
+    nav_settings_btn.grid(row=101, column=0, sticky="e", padx=10, pady=(0, 10))
+    nav_buttons["settings"] = nav_settings_btn
+    bind_button_hover_if_enabled(
+        nav_settings_btn,
+        lambda: (
+            "normal",
+            th().btn_secondary,
+            th().text,
+            th().secondary_hover,
+            th().text,
+        ),
+        lambda: th().secondary_hover,
+        lambda: th().text,
+    )
+
+    nav_summon_btn.config(command=lambda: set_nav_visible(True))
+    def _on_content_host_configure(_e: Optional[Any] = None) -> None:
+        if nav_collapsed["value"] and not nav_animating["value"]:
+            _place_nav_summon()
+        frame = active_page_frame.get("frame")
+        if frame is not None:
+            _layout_console_row(frame)
+
+    content_host.bind("<Configure>", _on_content_host_configure, add="+")
+    bind_button_hover_if_enabled(
+        nav_summon_btn,
+        lambda: (
+            "normal",
+            th().toolbar_btn_config()[0],
+            th().toolbar_btn_config()[1],
+            th().toolbar_btn_config()[2],
+            th().toolbar_btn_config()[3],
+        ),
         lambda: th().toolbar_hover()[0],
         lambda: th().toolbar_hover()[1],
     )
+
+    console_entry.bind("<Return>", lambda _e: (run_console_command(), "break")[1], add="+")
+    console_entry.bind("<Up>", _console_history_up, add="+")
+    console_entry.bind("<Down>", _console_history_down, add="+")
+    console_entry.bind("<Tab>", _console_tab_complete, add="+")
+    console_entry.bind("<KeyPress>", _console_entry_keypress, add="+")
+    console_entry.bind("<FocusIn>", _console_entry_focus_in, add="+")
+    console_entry.bind("<FocusOut>", _console_entry_focus_out, add="+")
+    console_prompt.bind("<Button-1>", lambda _e: run_console_command(), add="+")
+
+    def _unfocus_console_on_button_click(evt: Optional[Any] = None) -> None:
+        if evt is None:
+            return
+        w = getattr(evt, "widget", None)
+        if isinstance(w, tk.Button) and w is not console_entry:
+            root.focus_set()
+
+    root.bind_all("<Button-1>", _unfocus_console_on_button_click, add="+")
+    show_page("journal")
+    set_nav_visible(True)
 
     def _on_escape(event=None) -> None:
         if str(find_row.winfo_manager()) == "pack":
@@ -5427,18 +6554,18 @@ def input_menu_choice(prompt: str) -> str:
 def run() -> None:
     if not ensure_runtime_dependencies():
         return
-    app_name = setup_first_time_preferences()
+    setup_first_time_preferences()
     ensure_backup_folder()
     maybe_run_daily_auto_backup()
-    print(f"{app_name} started.")
-    while True:
-        print_menu(app_name)
-        choice = input_menu_choice("Your choice: ")
-        keep_running, app_name = handle_choice(choice, app_name)
-        if not keep_running:
-            break
-
-    print("Goodbye.")
+    if sys.platform == "win32":
+        try:
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+        except Exception:
+            pass
+    draft = load_journal_window_draft()
+    open_journal_window_editor(draft if isinstance(draft, dict) else None)
 
 
 if __name__ == "__main__":
