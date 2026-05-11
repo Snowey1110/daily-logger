@@ -3381,6 +3381,19 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             font=("Segoe UI", 9),
         )
         recap_to_chk.pack(side="left")
+        recap_all_journal_chk = tk.Checkbutton(
+            recap_top,
+            text=tr("recap.all_journal"),
+            variable=recap_all_journal_var,
+            bg=t0.panel,
+            fg=t0.muted,
+            activebackground=t0.panel,
+            activeforeground=t0.text,
+            selectcolor=t0.field,
+            font=("Segoe UI", 9),
+        )
+        recap_all_journal_chk.grid(row=1, column=0, columnspan=8, sticky="w", padx=(10, 0), pady=(0, 6))
+        bind_hover_tooltip(recap_all_journal_chk, lambda: tr("tip.recap_all_journal"))
         recap_through_fr = tk.Frame(recap_top, bg=t0.panel)
         recap_through_lbl = tk.Label(
             recap_through_fr,
@@ -3417,6 +3430,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         recap_cal_row = tk.Frame(recap_wrap, bg=t0.surface)
         recap_cal_row.grid_columnconfigure(1, weight=1)
         recap_selected_dates: set = set()
+        recap_all_journal_var = tk.BooleanVar(value=False)
         recap_calendar: Any = None
         if Calendar is not None:
             recap_calendar = Calendar(
@@ -3476,6 +3490,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 pass
 
         def recap_update_sel_label() -> None:
+            if recap_all_journal_var.get():
+                recap_sel_lbl.config(text=tr("recap.all_journal_active"))
+                return
             if not recap_selected_dates:
                 recap_sel_lbl.config(text=tr("recap.selected.none"))
                 return
@@ -3484,6 +3501,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             recap_sel_lbl.config(text=tr("recap.selected.prefix") + ", ".join(parts))
 
         def recap_sync_to_checkbox() -> None:
+            if recap_all_journal_var.get():
+                recap_to_chk.config(state="disabled")
+                return
             if recap_to_var.get():
                 return
             if len(recap_selected_dates) > 1:
@@ -3499,7 +3519,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         bind_hover_tooltip(recap_to_wrap, recap_to_tooltip)
 
         def on_recap_calendar_toggle(_evt: Optional[Any] = None) -> None:
-            if recap_to_var.get() or recap_calendar is None:
+            if recap_all_journal_var.get() or recap_to_var.get() or recap_calendar is None:
                 return
             try:
                 picked = recap_calendar.selection_get()
@@ -3515,6 +3535,58 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
         if recap_calendar is not None:
             recap_calendar.bind("<<CalendarSelected>>", on_recap_calendar_toggle)
+
+        recap_session: Dict[str, Any] = {"messages": [], "bootstrapped": False, "busy": False}
+        recap_pending_images: List[Path] = []
+        recap_pending_files: List[Path] = []
+
+        def recap_refresh_date_controls() -> None:
+            busy = bool(recap_session.get("busy"))
+            if recap_all_journal_var.get():
+                if recap_from_de is not None:
+                    try:
+                        recap_from_de.config(state="disabled")
+                    except tk.TclError:
+                        pass
+                if recap_to_de is not None:
+                    try:
+                        recap_to_de.config(state="disabled")
+                    except tk.TclError:
+                        pass
+                recap_to_chk.config(state="disabled")
+                if recap_calendar is not None:
+                    try:
+                        recap_calendar.config(state="disabled")
+                    except tk.TclError:
+                        pass
+                recap_all_journal_chk.config(state=("disabled" if busy else "normal"))
+                recap_update_sel_label()
+                return
+            if recap_from_de is not None:
+                try:
+                    recap_from_de.config(state=("disabled" if busy else "normal"))
+                except tk.TclError:
+                    pass
+            if recap_to_de is not None:
+                try:
+                    recap_to_de.config(state=("disabled" if busy else "normal"))
+                except tk.TclError:
+                    pass
+            if recap_calendar is not None:
+                try:
+                    recap_calendar.config(state=("disabled" if busy else "normal"))
+                except tk.TclError:
+                    pass
+            recap_all_journal_chk.config(state=("disabled" if busy else "normal"))
+            recap_sync_to_checkbox()
+            recap_update_sel_label()
+
+        def on_recap_all_journal_toggle(*_a: Any) -> None:
+            if recap_all_journal_var.get():
+                recap_to_var.set(False)
+            recap_refresh_date_controls()
+
+        recap_all_journal_var.trace_add("write", on_recap_all_journal_toggle)
 
         def on_recap_to_mode(*_a: Any) -> None:
             if recap_to_var.get():
@@ -3534,14 +3606,12 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 recap_refresh_cal_marks()
                 recap_update_sel_label()
                 recap_sync_to_checkbox()
+            recap_refresh_date_controls()
 
         recap_to_var.trace_add("write", lambda *_: on_recap_to_mode())
         recap_through_fr.grid_remove()
         recap_cal_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-
-        recap_session: Dict[str, Any] = {"messages": [], "bootstrapped": False, "busy": False}
-        recap_pending_images: List[Path] = []
-        recap_pending_files: List[Path] = []
+        recap_refresh_date_controls()
 
         recap_mid = tk.Frame(recap_wrap, bg=t0.surface)
         recap_mid.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
@@ -3741,20 +3811,14 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             recap_img_btn.config(state=st)
             recap_file_btn.config(state=st)
             recap_input.config(state=st)
-            if sending:
-                recap_thinking_chk.config(state="disabled")
-                recap_to_chk.config(state="disabled")
-            else:
-                recap_thinking_chk.config(state="normal")
-                if recap_to_var.get():
-                    recap_to_chk.config(state="normal")
-                else:
-                    recap_sync_to_checkbox()
+            recap_thinking_chk.config(state=st)
+            recap_refresh_date_controls()
 
         def reset_recap_session(*_a: Any) -> None:
             recap_session["messages"].clear()
             recap_session["bootstrapped"] = False
             recap_session["busy"] = False
+            recap_all_journal_var.set(False)
             recap_pending_images.clear()
             recap_pending_files.clear()
             recap_refresh_pending_lbl()
@@ -3791,6 +3855,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         recap_new_btn.config(command=recap_new_chat)
 
         def recap_build_context() -> Optional[str]:
+            if recap_all_journal_var.get():
+                return build_journal_context()
             if recap_to_var.get():
                 if DateEntry is None or recap_from_de is None or recap_to_de is None:
                     messagebox.showerror(tr("msg.ai_recap"), tr("recap.err.tkcal_range"))
@@ -4228,6 +4294,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 recap_title,
                 recap_top,
                 recap_thinking_chk,
+                recap_all_journal_chk,
                 recap_from_fr,
                 recap_to_wrap,
                 recap_to_chk,
@@ -4256,6 +4323,13 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             recap_title.configure(bg=t.surface, fg=t.text)
             recap_top.configure(bg=t.panel, highlightbackground=t.border)
             recap_thinking_chk.configure(
+                bg=t.panel,
+                fg=t.muted,
+                activebackground=t.panel,
+                activeforeground=t.text,
+                selectcolor=t.field,
+            )
+            recap_all_journal_chk.configure(
                 bg=t.panel,
                 fg=t.muted,
                 activebackground=t.panel,
@@ -4370,6 +4444,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         def refresh_recap_chat_i18n() -> None:
             recap_title.config(text=tr("recap.title"))
             recap_thinking_chk.config(text=tr("recap.thinking"))
+            recap_all_journal_chk.config(text=tr("recap.all_journal"))
             recap_from_lbl.config(text=tr("recap.from"))
             recap_to_chk.config(text=tr("recap.to_chk"))
             recap_through_lbl.config(text=tr("recap.through"))

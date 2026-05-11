@@ -115,6 +115,8 @@ _EN: Dict[str, str] = {
     "recap.err.from_tkcal": "Date entry requires tkcalendar.",
     "recap.err.read_from": "Could not read From date: {err}",
     "recap.warn.no_days": "Select one or more days on the calendar, or use From only.",
+    "recap.all_journal": "Entire journal",
+    "recap.all_journal_active": "Using all journal entries (any date).",
     "recap.image": "Image",
     "recap.file": "File",
     "recap.send": "Send",
@@ -124,7 +126,6 @@ _EN: Dict[str, str] = {
     "chat.you": "You",
     "chat.assistant": "Assistant",
     "chat.attachment_only": "(attachment only)",
-    "chatbot.thinking": "Thinking model",
     "msg.close_title": "Close Journal Window",
     "msg.close_save": "Do you want to save this journal entry before closing?",
     "msg.discard_title": "Discard Changes",
@@ -141,6 +142,9 @@ _EN: Dict[str, str] = {
     "tip.find_word": "Match whole words only when enabled.",
     "tip.recap_to": "When enabled, pick Through for an inclusive date range (From → Through).",
     "tip.recap_to_disabled": 'The "To" range option is only available when at most one day is selected on the calendar. Remove extra days or use From only.',
+    "tip.recap_all_journal": (
+        "Use every journal entry as context, ignoring the date picker and calendar."
+    ),
     "tip.open_recordings": "Opens the recording directory.",
     "tip.generate_report": (
         "Uses the AI report feature (ChatGPT) to build a summary from your journal text "
@@ -271,6 +275,8 @@ _ZH: Dict[str, str] = {
     "recap.err.from_tkcal": "日期输入需要安装 tkcalendar。",
     "recap.err.read_from": "无法读取「从」日期：{err}",
     "recap.warn.no_days": "请在日历上选择一天或多天，或仅使用「从」日期。",
+    "recap.all_journal": "全部日记",
+    "recap.all_journal_active": "正在使用全部日记条目（所有日期）。",
     "recap.image": "图片",
     "recap.file": "文件",
     "recap.send": "发送",
@@ -280,7 +286,6 @@ _ZH: Dict[str, str] = {
     "chat.you": "您",
     "chat.assistant": "助手",
     "chat.attachment_only": "（仅附件）",
-    "chatbot.thinking": "思考模型",
     "msg.close_title": "关闭日记窗口",
     "msg.close_save": "关闭前是否保存此日记条目？",
     "msg.discard_title": "放弃更改",
@@ -297,6 +302,7 @@ _ZH: Dict[str, str] = {
     "tip.find_word": "开启时仅匹配完整单词。",
     "tip.recap_to": "开启后选择「到」日期，日记范围包含从「从」到「到」（含端点）。",
     "tip.recap_to_disabled": "「至」范围仅在日历上至多选择一天时可用。请减少已选日期或仅使用「从」。",
+    "tip.recap_all_journal": "使用所有日记条目作为上下文，忽略日期与日历选择。",
     "tip.open_recordings": "打开录音文件所在文件夹。",
     "tip.generate_report": (
         "使用 AI（ChatGPT）根据日记正文与语音转写生成摘要。"
