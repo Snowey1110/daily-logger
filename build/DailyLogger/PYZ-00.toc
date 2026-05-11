@@ -747,6 +747,10 @@
   ('ipaddress',
    'C:\\Users\\LixiaoKuang\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\ipaddress.py',
    'PYMODULE'),
+  ('journal_i18n',
+   'c:\\Users\\LixiaoKuang\\OneDrive - VisionNav Robotics USA '
+   'inc\\Desktop\\Code\\journal_i18n.py',
+   'PYMODULE'),
   ('json',
    'C:\\Users\\LixiaoKuang\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\json\\__init__.py',
    'PYMODULE'),

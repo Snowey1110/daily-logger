@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 import base64
 import contextlib
 import ctypes
@@ -23,6 +23,16 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib import error, request
 import zipfile
 
+from journal_i18n import UI_LANGUAGE_PREF_KEY, normalize_ui_language, ui_translate
+
+_journal_ui_language_changed_hook: Optional[Callable[[str], None]] = None
+
+
+def set_journal_ui_language_changed_hook(hook: Optional[Callable[[str], None]]) -> None:
+    global _journal_ui_language_changed_hook
+    _journal_ui_language_changed_hook = hook
+
+
 try:
     from openpyxl import Workbook, load_workbook
 except Exception:
@@ -37,8 +47,9 @@ except Exception:
     messagebox = None
     ttk = None
 try:
-    from tkcalendar import DateEntry
+    from tkcalendar import Calendar, DateEntry
 except Exception:
+    Calendar = None  # type: ignore[assignment, misc]
     DateEntry = None  # type: ignore[assignment]
 try:
     import msvcrt
@@ -384,6 +395,7 @@ API_KEY_FILE = SETTINGS_DIR / "daily_logger_api_key.txt"
 PREFS_FILE = SETTINGS_DIR / "daily_logger_prefs.json"
 WIFI_WARN_FILE = SETTINGS_DIR / "wifi_warn_list.json"
 JOURNAL_WINDOW_DRAFT_FILE = SETTINGS_DIR / "journal_window_draft.json"
+JOURNAL_WINDOW_CONSOLE_RESERVE_BOTTOM = 56
 SCREENSHOT_DIR = DATA_DIR / "chat_screenshots"
 STARTUP_SHORTCUT_NAME = "Daily Logger.lnk"
 
@@ -914,6 +926,19 @@ def load_all_journal_entries() -> List[Tuple[datetime, str, str]]:
     return entries
 
 
+def _journal_entry_calendar_day(entry: Tuple[datetime, str, str]) -> date:
+    """Day used for recap filters: prefer the entry row date column, else the sheet tab date."""
+    sheet_dt, when_value, _text = entry
+    default_year = sheet_dt.year
+    raw = (when_value or "").strip()
+    if raw:
+        first = raw.split(None, 1)[0]
+        parsed = parse_flexible_date(first, default_year)
+        if parsed is not None:
+            return parsed.date()
+    return sheet_dt.date()
+
+
 def build_journal_context() -> str:
     return build_journal_context_for_range(None)
 
@@ -926,16 +951,40 @@ def build_journal_context_for_range(
         return "No journal entries available."
     if date_range is not None:
         start_date, end_date = date_range
+        lo = start_date.date()
+        hi = end_date.date()
         entries = [
             item
             for item in entries
-            if start_date.date() <= item[0].date() <= end_date.date()
+            if lo <= _journal_entry_calendar_day(item) <= hi
         ]
         if not entries:
             return "No journal entries available in the selected date range."
     lines = []
     for _, when_value, text in entries:
         lines.append(f"- [{when_value}] {text}")
+    return "\n".join(lines)
+
+
+def build_journal_context_for_date_set(dates: Any) -> str:
+    """Build journal context for sheet-days that match any calendar date in ``dates``."""
+    if not dates:
+        return "No dates selected."
+    day_set: set[date] = set()
+    for d in dates:
+        if isinstance(d, datetime):
+            day_set.add(d.date())
+        elif isinstance(d, date):
+            day_set.add(d)
+    if not day_set:
+        return "No dates selected."
+    entries = load_all_journal_entries()
+    if not entries:
+        return "No journal entries available."
+    filtered = [item for item in entries if _journal_entry_calendar_day(item) in day_set]
+    if not filtered:
+        return "No journal entries available for the selected day(s)."
+    lines = [f"- [{when_value}] {text}" for _, when_value, text in filtered]
     return "\n".join(lines)
 
 
@@ -975,11 +1024,13 @@ def parse_recap_date_range(raw_range: str, default_year: int) -> Optional[Tuple[
 
 def list_journal_dates_in_range(date_range: Tuple[datetime, datetime]) -> List[str]:
     start_date, end_date = date_range
-    matched_dates = {
-        entry_date.strftime("%m/%d/%Y")
-        for entry_date, _, _ in load_all_journal_entries()
-        if start_date.date() <= entry_date.date() <= end_date.date()
-    }
+    lo = start_date.date()
+    hi = end_date.date()
+    matched_dates: set[str] = set()
+    for entry in load_all_journal_entries():
+        d = _journal_entry_calendar_day(entry)
+        if lo <= d <= hi:
+            matched_dates.add(d.strftime("%m/%d/%Y"))
     return sorted(
         matched_dates,
         key=lambda value: datetime.strptime(value, "%m/%d/%Y"),
@@ -2420,6 +2471,13 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     root = tk.Tk()
     root_prefs = load_preferences()
+    ui_lang_holder: List[str] = [
+        normalize_ui_language(str(root_prefs.get(UI_LANGUAGE_PREF_KEY, "en")))
+    ]
+
+    def tr(key: str, **kwargs: object) -> str:
+        return ui_translate(ui_lang_holder[0], key, **kwargs)
+
     window_app_name = root_prefs.get("app_name", "Daily Logger").strip() or "Daily Logger"
     root.title(window_app_name)
     root.geometry("1360x720")
@@ -2441,7 +2499,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     splash_w = 460
     splash_title = tk.Label(
         startup_box,
-        text=f"Loading {window_app_name}...",
+        text=tr("splash.title", app=window_app_name),
         bg=t_init.surface,
         fg=t_init.text,
         font=("Segoe UI", 11, "bold"),
@@ -2450,7 +2508,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     splash_title.pack(fill="x", padx=16, pady=(14, 6))
     splash_detail = tk.Label(
         startup_box,
-        text="Loading modules...",
+        text=tr("splash.detail.theme"),
         bg=t_init.surface,
         fg=t_init.muted,
         font=("Segoe UI", 9),
@@ -2482,9 +2540,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         startup_fill = startup_canvas.create_rectangle(0, 0, 0, 16, fill=t_init.accent, width=0)
         startup_bar = None
 
-    def _startup_step(detail: str) -> None:
+    def _startup_step(detail_key: str) -> None:
         startup_progress["value"] = min(startup_total_steps, startup_progress["value"] + 1)
-        splash_detail.config(text=detail)
+        splash_detail.config(text=tr(detail_key))
         if startup_bar is not None:
             startup_bar["value"] = float(startup_progress["value"])
         elif startup_canvas is not None and startup_fill is not None:
@@ -2493,7 +2551,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         startup_overlay.lift()
         root.update_idletasks()
 
-    _startup_step("Loading theme...")
+    _startup_step("splash.detail.theme")
     _jw_style: Any = None
     if ttk is not None:
         _jw_style = ttk.Style(root)
@@ -2573,6 +2631,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     nav_buttons: Dict[str, Any] = {}
     active_page = {"key": "journal"}
     active_page_frame: Dict[str, Any] = {"frame": None}
+    page_leave_reset_handlers: Dict[str, Callable[[], None]] = {}
 
     def _layout_console_row(frame: Any) -> None:
         frame.update_idletasks()
@@ -2606,11 +2665,16 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             "console": console_page,
             "settings": settings_page,
         }
+        prev_key = active_page["key"]
         if page_key == "console":
             _clear_console_hint()
         frame = page_map.get(page_key, journal_page)
         frame.tkraise()
         active_page["key"] = page_key
+        if prev_key != page_key:
+            reset_fn = page_leave_reset_handlers.get(prev_key)
+            if reset_fn is not None:
+                reset_fn()
         active_page_frame["frame"] = frame
         console_row = console_input_holder.get("row")
         if console_row is not None:
@@ -2762,6 +2826,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     top = tk.Frame(journal_page, bg=t_init.panel, bd=0, highlightthickness=0)
     top.pack(fill="x", padx=t_init.pad_outer, pady=t_init.pad_top_y)
     top.grid_columnconfigure(5, weight=1)
+    top.grid_columnconfigure(6, weight=0)
     _register_page_toggle(journal_page)
     date_lbl = tk.Label(
         top,
@@ -2947,19 +3012,19 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     find_word_chk.grid(row=0, column=5, sticky="w", padx=(4, 0), pady=8)
     bind_hover_tooltip(
         find_scope_all_rb,
-        lambda: "Search across Journal Text, Speech to text, and AI report.",
+        lambda: tr("tip.find_all"),
     )
     bind_hover_tooltip(
         find_scope_one_rb,
-        lambda: "Search only in the currently active text box.",
+        lambda: tr("tip.find_one"),
     )
     bind_hover_tooltip(
         find_case_chk,
-        lambda: "Match uppercase/lowercase exactly when enabled.",
+        lambda: tr("tip.find_case"),
     )
     bind_hover_tooltip(
         find_word_chk,
-        lambda: "Match whole words only when enabled.",
+        lambda: tr("tip.find_word"),
     )
     find_status = tk.Label(
         find_row,
@@ -3145,7 +3210,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     open_recording_btn.grid(row=0, column=2, sticky="e")
 
     def open_recording_tooltip_text() -> str:
-        return "Opens the recording directory."
+        return tr("tip.open_recordings")
 
     bind_hover_tooltip(open_recording_btn, open_recording_tooltip_text)
     bind_button_hover_if_enabled(
@@ -3340,42 +3405,1341 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     placeholder_title_labels: List[Any] = []
     placeholder_body_labels: List[Any] = []
 
-    def _build_placeholder_page(parent: Any, title: str) -> None:
-        _register_page_toggle(parent)
-        wrap = tk.Frame(parent, bg=t_init.surface)
-        wrap.pack(fill="both", expand=True, padx=28, pady=24)
-        title_lbl = tk.Label(
-            wrap,
-            text=title,
-            bg=t_init.surface,
-            fg=t_init.text,
-            font=("Segoe UI", 16, "bold"),
+    placeholder_frames: List[Any] = []
+    placeholder_title_labels: List[Any] = []
+    placeholder_body_labels: List[Any] = []
+
+    api_key_prompt_hooks: Dict[str, Callable[[], None]] = {}
+
+    def build_ai_recap_and_chatbot_pages() -> None:
+        _register_page_toggle(ai_recap_page)
+        _register_page_toggle(chatbot_page)
+
+        t0 = t_init
+        _tb, _tf, _tab, _taf = t0.toolbar_btn_config()
+
+        # --- Shared: append styled lines to a read-only transcript ---
+        def _append_transcript(box: Any, role: str, body: str) -> None:
+            box.config(state="normal")
+            if role == "user":
+                box.insert("end", tr("chat.you") + "\n", ("t_meta",))
+                box.insert("end", (body or "").strip() + "\n\n", ("t_user",))
+            else:
+                box.insert("end", tr("chat.assistant") + "\n", ("t_meta",))
+                box.insert("end", (body or "").strip() + "\n\n", ("t_bot",))
+            box.config(state="disabled")
+            box.see("end")
+
+        # ========== AI Recap ==========
+        recap_wrap = tk.Frame(ai_recap_page, bg=t0.surface)
+        recap_wrap.pack(
+            fill="both",
+            expand=True,
+            padx=t0.pad_outer,
+            pady=(0, t0.pad_center_y + JOURNAL_WINDOW_CONSOLE_RESERVE_BOTTOM),
+        )
+        recap_wrap.grid_columnconfigure(0, weight=1)
+        recap_wrap.grid_rowconfigure(3, weight=1)
+
+        recap_title = tk.Label(
+            recap_wrap,
+            text=tr("recap.title"),
+            bg=t0.surface,
+            fg=t0.text,
+            font=("Segoe UI", 15, "bold"),
             anchor="w",
         )
-        title_lbl.pack(anchor="w", pady=(0, 10))
-        body_lbl = tk.Label(
-            wrap,
-            text="Coming soon - this page is ready for future UI features.",
-            bg=t_init.surface,
-            fg=t_init.muted,
-            font=("Segoe UI", 11),
+        recap_title.grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        recap_top = tk.Frame(recap_wrap, bg=t0.panel, highlightthickness=1, highlightbackground=t0.border)
+        recap_top.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        recap_top.grid_columnconfigure(4, weight=1)
+
+        recap_thinking_var = tk.BooleanVar(value=False)
+        recap_thinking_chk = tk.Checkbutton(
+            recap_top,
+            text=tr("recap.thinking"),
+            variable=recap_thinking_var,
+            bg=t0.panel,
+            fg=t0.muted,
+            activebackground=t0.panel,
+            activeforeground=t0.text,
+            selectcolor=t0.field,
+            font=("Segoe UI", 9),
+        )
+        recap_thinking_chk.grid(row=0, column=0, padx=(10, 8), pady=8, sticky="w")
+
+        recap_from_fr = tk.Frame(recap_top, bg=t0.panel)
+        recap_from_fr.grid(row=0, column=1, padx=(0, 10), pady=8, sticky="w")
+        recap_from_lbl = tk.Label(
+            recap_from_fr,
+            text=tr("recap.from"),
+            bg=t0.panel,
+            fg=t0.muted,
+            font=t0.date_label_font,
+        )
+        recap_from_lbl.pack(side="left", padx=(0, 8))
+        recap_from_de: Any = None
+        recap_to_de: Any = None
+        _today = datetime.now().date()
+        if DateEntry is not None:
+            recap_from_de = DateEntry(
+                recap_from_fr,
+                width=14,
+                date_pattern="mm/dd/yyyy",
+                state="normal",
+                background=t0.field,
+                foreground=t0.text,
+                borderwidth=1,
+            )
+            recap_from_de.pack(side="left")
+            try:
+                recap_from_de.set_date(_today)
+            except Exception:
+                pass
+        else:
+            tk.Label(
+                recap_from_fr,
+                text=tr("recap.install_dates"),
+                bg=t0.panel,
+                fg=t0.muted,
+                font=("Segoe UI", 9),
+            ).pack(side="left")
+
+        recap_to_var = tk.BooleanVar(value=False)
+        recap_all_journal_var = tk.BooleanVar(value=False)
+        recap_to_wrap = tk.Frame(recap_top, bg=t0.panel)
+        recap_to_wrap.grid(row=0, column=2, padx=(0, 8), pady=8, sticky="w")
+        recap_to_chk = tk.Checkbutton(
+            recap_to_wrap,
+            text=tr("recap.to_chk"),
+            variable=recap_to_var,
+            bg=t0.panel,
+            fg=t0.muted,
+            activebackground=t0.panel,
+            activeforeground=t0.text,
+            selectcolor=t0.field,
+            font=("Segoe UI", 9),
+        )
+        recap_to_chk.pack(side="left")
+        recap_all_journal_chk = tk.Checkbutton(
+            recap_top,
+            text=tr("recap.all_journal"),
+            variable=recap_all_journal_var,
+            bg=t0.panel,
+            fg=t0.muted,
+            activebackground=t0.panel,
+            activeforeground=t0.text,
+            selectcolor=t0.field,
+            font=("Segoe UI", 9),
+        )
+        recap_all_journal_chk.grid(row=1, column=0, columnspan=8, sticky="w", padx=(10, 0), pady=(0, 6))
+        bind_hover_tooltip(recap_all_journal_chk, lambda: tr("tip.recap_all_journal"))
+        recap_through_fr = tk.Frame(recap_top, bg=t0.panel)
+        recap_through_lbl = tk.Label(
+            recap_through_fr,
+            text=tr("recap.through"),
+            bg=t0.panel,
+            fg=t0.muted,
+            font=t0.date_label_font,
+        )
+        recap_through_lbl.pack(side="left", padx=(0, 8))
+        if DateEntry is not None:
+            recap_to_de = DateEntry(
+                recap_through_fr,
+                width=14,
+                date_pattern="mm/dd/yyyy",
+                state="normal",
+                background=t0.field,
+                foreground=t0.text,
+                borderwidth=1,
+            )
+            recap_to_de.pack(side="left")
+            try:
+                recap_to_de.set_date(_today)
+            except Exception:
+                pass
+        else:
+            tk.Label(
+                recap_through_fr,
+                text=tr("recap.through_placeholder"),
+                bg=t0.panel,
+                fg=t0.muted,
+                font=("Segoe UI", 9),
+            ).pack(side="left")
+
+        recap_cal_row = tk.Frame(recap_wrap, bg=t0.surface)
+        recap_cal_row.grid_columnconfigure(1, weight=1)
+        recap_selected_dates: set = set()
+        recap_calendar: Any = None
+        if Calendar is not None:
+            recap_calendar = Calendar(
+                recap_cal_row,
+                selectmode="day",
+                showweeknumbers=False,
+                background=t0.field,
+                foreground=t0.text,
+                headersbackground=t0.panel,
+                headersforeground=t0.text,
+                weekendbackground=t0.field,
+                weekendforeground=t0.muted,
+                normalbackground=t0.field,
+                normalforeground=t0.text,
+                othermonthbackground=t0.field,
+                othermonthforeground=t0.muted,
+                selectbackground=t0.accent,
+                selectforeground="white",
+                bordercolor=t0.border,
+                font=("Segoe UI", 9),
+            )
+            recap_calendar.grid(row=0, column=0, sticky="nw", padx=(0, 12), pady=(0, 4))
+        else:
+            tk.Label(
+                recap_cal_row,
+                text=tr("recap.install_calendar"),
+                bg=t0.surface,
+                fg=t0.muted,
+                font=("Segoe UI", 9),
+                wraplength=400,
+                justify="left",
+            ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+
+        recap_sel_lbl = tk.Label(
+            recap_cal_row,
+            text=tr("recap.selected.none"),
+            bg=t0.surface,
+            fg=t0.muted,
+            font=("Segoe UI", 9),
             anchor="w",
             justify="left",
         )
-        body_lbl.pack(anchor="w")
-        placeholder_frames.append(wrap)
-        placeholder_title_labels.append(title_lbl)
-        placeholder_body_labels.append(body_lbl)
+        recap_sel_lbl.grid(row=0, column=1, sticky="nw", pady=(0, 4))
 
-    _build_placeholder_page(ai_recap_page, "AI Recap")
-    _build_placeholder_page(chatbot_page, "Chatbot")
+        recap_cal_marks_tag = "recap_sel"
 
+        def recap_refresh_cal_marks() -> None:
+            if recap_calendar is None:
+                return
+            try:
+                recap_calendar.calevent_remove("all")
+            except Exception:
+                pass
+            t = th()
+            for d in recap_selected_dates:
+                try:
+                    recap_calendar.calevent_create(d, "", recap_cal_marks_tag)
+                except Exception:
+                    pass
+            try:
+                recap_calendar.tag_config(recap_cal_marks_tag, background=t.accent, foreground="white")
+            except Exception:
+                pass
+
+        def recap_update_sel_label() -> None:
+            if recap_all_journal_var.get():
+                recap_sel_lbl.config(text=tr("recap.all_journal_active"))
+                return
+            if not recap_selected_dates:
+                recap_sel_lbl.config(text=tr("recap.selected.none"))
+                return
+            ordered = sorted(recap_selected_dates)
+            parts = [x.strftime("%m/%d/%Y") for x in ordered]
+            recap_sel_lbl.config(text=tr("recap.selected.prefix") + ", ".join(parts))
+
+        def recap_sync_to_checkbox() -> None:
+            if recap_all_journal_var.get():
+                recap_to_chk.config(state="disabled")
+                return
+            if recap_to_var.get():
+                return
+            if len(recap_selected_dates) > 1:
+                recap_to_chk.config(state="disabled")
+            else:
+                recap_to_chk.config(state="normal")
+
+        def recap_to_tooltip() -> str:
+            if str(recap_to_chk.cget("state")) == "disabled":
+                return tr("tip.recap_to_disabled")
+            return tr("tip.recap_to")
+
+        bind_hover_tooltip(recap_to_wrap, recap_to_tooltip)
+
+        def on_recap_calendar_toggle(_evt: Optional[Any] = None) -> None:
+            if recap_all_journal_var.get() or recap_to_var.get() or recap_calendar is None:
+                return
+            try:
+                picked = recap_calendar.selection_get()
+            except Exception:
+                return
+            if picked in recap_selected_dates:
+                recap_selected_dates.remove(picked)
+            else:
+                recap_selected_dates.add(picked)
+            recap_refresh_cal_marks()
+            recap_update_sel_label()
+            recap_sync_to_checkbox()
+
+        if recap_calendar is not None:
+            recap_calendar.bind("<<CalendarSelected>>", on_recap_calendar_toggle)
+
+        recap_session: Dict[str, Any] = {"messages": [], "bootstrapped": False, "busy": False}
+        recap_pending_images: List[Path] = []
+        recap_pending_files: List[Path] = []
+
+        def recap_refresh_date_controls() -> None:
+            busy = bool(recap_session.get("busy"))
+            if recap_all_journal_var.get():
+                try:
+                    recap_cal_row.grid_remove()
+                except tk.TclError:
+                    pass
+                if recap_from_de is not None:
+                    try:
+                        recap_from_de.config(state="disabled")
+                    except tk.TclError:
+                        pass
+                if recap_to_de is not None:
+                    try:
+                        recap_to_de.config(state="disabled")
+                    except tk.TclError:
+                        pass
+                recap_to_chk.config(state="disabled")
+                if recap_calendar is not None:
+                    try:
+                        recap_calendar.config(state="disabled")
+                    except tk.TclError:
+                        pass
+                recap_all_journal_chk.config(state=("disabled" if busy else "normal"))
+                recap_update_sel_label()
+                return
+            if recap_from_de is not None:
+                try:
+                    recap_from_de.config(state=("disabled" if busy else "normal"))
+                except tk.TclError:
+                    pass
+            if recap_to_de is not None:
+                try:
+                    recap_to_de.config(state=("disabled" if busy else "normal"))
+                except tk.TclError:
+                    pass
+            if recap_calendar is not None:
+                try:
+                    recap_calendar.config(state=("disabled" if busy else "normal"))
+                except tk.TclError:
+                    pass
+            recap_all_journal_chk.config(state=("disabled" if busy else "normal"))
+            if not recap_to_var.get():
+                try:
+                    recap_cal_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+                except tk.TclError:
+                    pass
+            else:
+                try:
+                    recap_cal_row.grid_remove()
+                except tk.TclError:
+                    pass
+            recap_sync_to_checkbox()
+            recap_update_sel_label()
+
+        def on_recap_all_journal_toggle(*_a: Any) -> None:
+            if recap_all_journal_var.get():
+                recap_to_var.set(False)
+            recap_refresh_date_controls()
+
+        recap_all_journal_var.trace_add("write", on_recap_all_journal_toggle)
+
+        def on_recap_to_mode(*_a: Any) -> None:
+            if recap_to_var.get():
+                recap_through_fr.grid(row=0, column=3, padx=(0, 8), pady=8, sticky="w")
+                recap_cal_row.grid_remove()
+                if len(recap_selected_dates) == 1 and DateEntry is not None:
+                    only = next(iter(recap_selected_dates))
+                    if recap_from_de is not None and recap_to_de is not None:
+                        try:
+                            recap_from_de.set_date(only)
+                            recap_to_de.set_date(only)
+                        except Exception:
+                            pass
+            else:
+                recap_through_fr.grid_remove()
+                recap_cal_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+                recap_refresh_cal_marks()
+                recap_update_sel_label()
+                recap_sync_to_checkbox()
+            recap_refresh_date_controls()
+
+        recap_to_var.trace_add("write", lambda *_: on_recap_to_mode())
+        recap_through_fr.grid_remove()
+        recap_cal_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        recap_refresh_date_controls()
+
+        recap_mid = tk.Frame(recap_wrap, bg=t0.surface)
+        recap_mid.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
+        recap_mid.grid_rowconfigure(0, weight=1)
+        recap_mid.grid_columnconfigure(0, weight=1)
+
+        recap_transcript = tk.Text(
+            recap_mid,
+            wrap="word",
+            state="disabled",
+            font=("Segoe UI", 10),
+            bg=t0.field,
+            fg=t0.text,
+            insertbackground=t0.text,
+            relief="flat",
+            padx=12,
+            pady=12,
+            highlightthickness=1,
+            highlightbackground=t0.border,
+            highlightcolor=t0.accent,
+        )
+        recap_ts = tk.Scrollbar(
+            recap_mid,
+            command=recap_transcript.yview,
+            bg=t0.panel,
+            troughcolor=t0.field,
+            activebackground=t0.accent,
+            bd=0,
+            highlightthickness=0,
+            width=11,
+        )
+        recap_transcript.configure(yscrollcommand=recap_ts.set)
+        recap_transcript.grid(row=0, column=0, sticky="nsew")
+        recap_ts.grid(row=0, column=1, sticky="ns")
+        recap_transcript.tag_configure("t_meta", foreground=t0.muted, font=("Segoe UI", 9, "bold"))
+        recap_transcript.tag_configure("t_user", foreground=t0.text, font=("Segoe UI", 10))
+        recap_transcript.tag_configure("t_bot", foreground=t0.text, font=("Segoe UI", 10))
+
+        recap_attach_row = tk.Frame(recap_wrap, bg=t0.surface)
+        recap_attach_row.grid(row=4, column=0, sticky="ew", pady=(0, 4))
+        recap_pending_lbl = tk.Label(
+            recap_attach_row,
+            text=tr("recap.attachments", what=tr("recap.attachments_none")),
+            bg=t0.surface,
+            fg=t0.muted,
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        recap_pending_lbl.pack(side="left", fill="x", expand=True)
+
+        def recap_refresh_pending_lbl() -> None:
+            bits = []
+            if recap_pending_images:
+                bits.append(tr("recap.n_images", n=len(recap_pending_images)))
+            if recap_pending_files:
+                bits.append(tr("recap.n_files", n=len(recap_pending_files)))
+            what = ", ".join(bits) if bits else tr("recap.attachments_none")
+            recap_pending_lbl.config(text=tr("recap.attachments", what=what))
+
+        def recap_pick_image() -> None:
+            p = filedialog.askopenfilename(
+                title="Attach image",
+                filetypes=[
+                    ("Images", "*.png *.jpg *.jpeg *.gif *.webp"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if p:
+                recap_pending_images.append(Path(p))
+                recap_refresh_pending_lbl()
+
+        def recap_pick_file() -> None:
+            p = filedialog.askopenfilename(title="Attach file", filetypes=[("Text / data", "*.*")])
+            if p:
+                recap_pending_files.append(Path(p))
+                recap_refresh_pending_lbl()
+
+        recap_img_btn = tk.Button(
+            recap_attach_row,
+            text=tr("recap.image"),
+            command=recap_pick_image,
+            bg=_tb,
+            fg=_tf,
+            activebackground=_tab,
+            activeforeground=_taf,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        recap_img_btn.pack(side="right", padx=(6, 0))
+        recap_file_btn = tk.Button(
+            recap_attach_row,
+            text=tr("recap.file"),
+            command=recap_pick_file,
+            bg=_tb,
+            fg=_tf,
+            activebackground=_tab,
+            activeforeground=_taf,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        recap_file_btn.pack(side="right", padx=(6, 0))
+
+        recap_bottom = tk.Frame(recap_wrap, bg=t0.panel, highlightthickness=1, highlightbackground=t0.border)
+        recap_bottom.grid(row=5, column=0, sticky="ew", pady=(0, 0))
+        recap_bottom.grid_columnconfigure(0, weight=1)
+
+        recap_input = tk.Text(
+            recap_bottom,
+            height=3,
+            wrap="word",
+            font=("Segoe UI", 10),
+            bg=t0.field,
+            fg=t0.text,
+            insertbackground=t0.text,
+            relief="flat",
+            padx=10,
+            pady=8,
+            highlightthickness=0,
+        )
+        recap_input.grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=8)
+
+        recap_btn_fr = tk.Frame(recap_bottom, bg=t0.panel)
+        recap_btn_fr.grid(row=0, column=1, sticky="ns", padx=(4, 8), pady=8)
+
+        recap_send_btn = tk.Button(
+            recap_btn_fr,
+            text=tr("recap.send"),
+            bg=t0.accent,
+            fg="white",
+            activebackground=t0.hover_primary,
+            activeforeground="white",
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=14,
+            pady=8,
+            cursor="hand2",
+        )
+        recap_send_btn.pack(fill="x", pady=(0, 6))
+        recap_new_btn = tk.Button(
+            recap_btn_fr,
+            text=tr("recap.new_chat"),
+            bg=_tb,
+            fg=_tf,
+            activebackground=_tab,
+            activeforeground=_taf,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=6,
+            cursor="hand2",
+        )
+        recap_new_btn.pack(fill="x")
+
+        def _recap_send_rest_style() -> Tuple[str, str, str, str, str]:
+            t = th()
+            if str(recap_send_btn.cget("state")) != "normal":
+                ds, gb, gf, dab, daf = t.gen_bind_disabled()
+                return ds, gb, gf, dab, daf
+            return ("normal", t.accent, "white", t.hover_primary, "white")
+
+        bind_button_hover_if_enabled(
+            recap_img_btn,
+            lambda: th().toolbar_bind_rest(),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
+        bind_button_hover_if_enabled(
+            recap_file_btn,
+            lambda: th().toolbar_bind_rest(),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
+        bind_button_hover_if_enabled(
+            recap_new_btn,
+            lambda: th().toolbar_bind_rest(),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
+        bind_button_hover_if_enabled(
+            recap_send_btn,
+            _recap_send_rest_style,
+            lambda: th().hover_primary,
+            lambda: "white",
+        )
+
+        _AI_SEND_SPIN = ("-", "/", "|", "\\")
+        recap_send_spin: Dict[str, Any] = {"after_id": None, "i": 0}
+
+        def _stop_recap_send_spinner() -> None:
+            aid = recap_send_spin.get("after_id")
+            if aid is not None:
+                try:
+                    root.after_cancel(aid)
+                except (tk.TclError, ValueError):
+                    pass
+                recap_send_spin["after_id"] = None
+
+        def _start_recap_send_spinner() -> None:
+            _stop_recap_send_spinner()
+
+            def _tick() -> None:
+                if not recap_session.get("busy"):
+                    recap_send_spin["after_id"] = None
+                    return
+                try:
+                    i = recap_send_spin["i"] % len(_AI_SEND_SPIN)
+                    recap_send_btn.config(text=tr("ai.send_busy_prefix") + _AI_SEND_SPIN[i])
+                    recap_send_spin["i"] = recap_send_spin["i"] + 1
+                    recap_send_spin["after_id"] = root.after(130, _tick)
+                except tk.TclError:
+                    recap_send_spin["after_id"] = None
+
+            recap_send_spin["i"] = 0
+            _tick()
+
+        def recap_set_sending(sending: bool) -> None:
+            recap_session["busy"] = sending
+            st = "disabled" if sending else "normal"
+            recap_send_btn.config(state=st)
+            recap_new_btn.config(state=st)
+            recap_img_btn.config(state=st)
+            recap_file_btn.config(state=st)
+            recap_input.config(state=st)
+            recap_thinking_chk.config(state=st)
+            if sending:
+                _start_recap_send_spinner()
+            else:
+                _stop_recap_send_spinner()
+                try:
+                    recap_send_btn.config(text=tr("recap.send"))
+                except tk.TclError:
+                    pass
+            recap_refresh_date_controls()
+
+        def reset_recap_session(*_a: Any) -> None:
+            recap_session["messages"].clear()
+            recap_session["bootstrapped"] = False
+            recap_session["busy"] = False
+            recap_all_journal_var.set(False)
+            recap_pending_images.clear()
+            recap_pending_files.clear()
+            recap_refresh_pending_lbl()
+            recap_transcript.config(state="normal")
+            recap_transcript.delete("1.0", "end")
+            recap_transcript.config(state="disabled")
+            recap_input.delete("1.0", "end")
+            recap_selected_dates.clear()
+            recap_update_sel_label()
+            recap_refresh_cal_marks()
+            recap_set_sending(False)
+
+        def reset_recap_on_page_leave() -> None:
+            reset_recap_session()
+            recap_to_var.set(False)
+            try:
+                td = datetime.now().date()
+                if recap_from_de is not None:
+                    recap_from_de.set_date(td)
+                if recap_to_de is not None:
+                    recap_to_de.set_date(td)
+            except Exception:
+                pass
+            recap_sync_to_checkbox()
+            on_recap_to_mode()
+
+        page_leave_reset_handlers["ai_recap"] = reset_recap_on_page_leave
+
+        def recap_new_chat() -> None:
+            if recap_session.get("busy"):
+                return
+            reset_recap_session()
+
+        recap_new_btn.config(command=recap_new_chat)
+
+        def recap_build_context() -> Optional[str]:
+            if recap_all_journal_var.get():
+                return build_journal_context()
+            if recap_to_var.get():
+                if DateEntry is None or recap_from_de is None or recap_to_de is None:
+                    messagebox.showerror(tr("msg.ai_recap"), tr("recap.err.tkcal_range"))
+                    return None
+                try:
+                    d0 = recap_from_de.get_date()
+                    d1 = recap_to_de.get_date()
+                except Exception as exc:
+                    messagebox.showerror(tr("msg.ai_recap"), tr("recap.err.read_range", err=str(exc)))
+                    return None
+                start = datetime.combine(d0, datetime.min.time())
+                end = datetime.combine(d1, datetime.min.time())
+                if end < start:
+                    start, end = end, start
+                return build_journal_context_for_range((start, end))
+            if recap_selected_dates:
+                return build_journal_context_for_date_set(recap_selected_dates)
+            if DateEntry is None or recap_from_de is None:
+                messagebox.showerror(tr("msg.ai_recap"), tr("recap.err.from_tkcal"))
+                return None
+            try:
+                only = recap_from_de.get_date()
+            except Exception as exc:
+                messagebox.showerror(tr("msg.ai_recap"), tr("recap.err.read_from", err=str(exc)))
+                return None
+            return build_journal_context_for_date_set({only})
+
+        def recap_send() -> None:
+            if recap_session["busy"]:
+                return
+            if not get_openai_api_key():
+                go_settings = messagebox.askyesno(
+                    tr("msg.no_api_key_use_ai_title"),
+                    tr("msg.no_api_key_use_ai_body"),
+                )
+                if go_settings:
+                    goto_tok = api_key_prompt_hooks.get("goto_token")
+                    if callable(goto_tok):
+                        goto_tok()
+                return
+            text = recap_input.get("1.0", "end-1c").strip()
+            if not text and not recap_pending_images and not recap_pending_files:
+                return
+            ctx = recap_build_context()
+            if ctx is None:
+                return
+            model_name = OPENAI_THINKING_MODEL if recap_thinking_var.get() else OPENAI_MODEL
+            effort = "high" if recap_thinking_var.get() else None
+            imgs = list(recap_pending_images)
+            files = list(recap_pending_files)
+            recap_set_sending(True)
+
+            def kickoff() -> None:
+                try:
+                    if not recap_session["bootstrapped"]:
+                        recap_session["messages"] = [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You answer questions only using the user's journal context. "
+                                    "If the answer is not in the journal, say you do not know based on the journal."
+                                ),
+                            },
+                            {"role": "system", "content": f"Journal context:\n{ctx}"},
+                        ]
+                        recap_session["bootstrapped"] = True
+                    user_msg = build_user_message_with_attachments(text, imgs, files)
+                    recap_session["messages"].append(user_msg)
+                    answer = chat_completion(
+                        recap_session["messages"],
+                        model=model_name,
+                        reasoning_effort=effort,
+                    )
+
+                    def done() -> None:
+                        recap_set_sending(False)
+                        if _is_likely_api_error_message(answer):
+                            messagebox.showerror(tr("msg.ai_recap"), answer[:4000])
+                            if recap_session["messages"] and recap_session["messages"][-1].get("role") == "user":
+                                recap_session["messages"].pop()
+                            return
+                        recap_session["messages"].append({"role": "assistant", "content": answer})
+                        _append_transcript(recap_transcript, "user", text or tr("chat.attachment_only"))
+                        _append_transcript(recap_transcript, "assistant", answer)
+                        recap_input.delete("1.0", "end")
+                        recap_pending_images.clear()
+                        recap_pending_files.clear()
+                        recap_refresh_pending_lbl()
+
+                    root.after(0, done)
+                except Exception as exc:
+
+                    def fail() -> None:
+                        recap_set_sending(False)
+                        messagebox.showerror(tr("msg.ai_recap"), str(exc))
+                        if recap_session["messages"] and recap_session["messages"][-1].get("role") == "user":
+                            recap_session["messages"].pop()
+
+                    root.after(0, fail)
+
+            threading.Thread(target=kickoff, daemon=True).start()
+
+        recap_send_btn.config(command=recap_send)
+
+        def recap_on_enter_key(event: Any) -> Optional[str]:
+            # Text widget: <Return> alone may not consume the key; use KeyPress-Return / KP_Enter.
+            if (getattr(event, "state", 0) or 0) & 0x0001:
+                return None
+            if (getattr(event, "state", 0) or 0) & 0x0004:
+                return None
+            recap_send()
+            return "break"
+
+        recap_input.bind("<KeyPress-Return>", recap_on_enter_key, add="+")
+        recap_input.bind("<KeyPress-KP_Enter>", recap_on_enter_key, add="+")
+
+        # ========== Chatbot ==========
+        cb_wrap = tk.Frame(chatbot_page, bg=t0.surface)
+        cb_wrap.pack(
+            fill="both",
+            expand=True,
+            padx=t0.pad_outer,
+            pady=(0, t0.pad_center_y + JOURNAL_WINDOW_CONSOLE_RESERVE_BOTTOM),
+        )
+        cb_wrap.grid_columnconfigure(0, weight=1)
+        cb_wrap.grid_rowconfigure(1, weight=1)
+
+        cb_title = tk.Label(
+            cb_wrap,
+            text=tr("chatbot.title"),
+            bg=t0.surface,
+            fg=t0.text,
+            font=("Segoe UI", 15, "bold"),
+            anchor="w",
+        )
+        cb_title.grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        cb_top = tk.Frame(cb_wrap, bg=t0.panel, highlightthickness=1, highlightbackground=t0.border)
+        cb_top.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        cb_top.grid_rowconfigure(0, weight=1)
+        cb_top.grid_columnconfigure(0, weight=1)
+
+        cb_transcript = tk.Text(
+            cb_top,
+            wrap="word",
+            state="disabled",
+            font=("Segoe UI", 10),
+            bg=t0.field,
+            fg=t0.text,
+            insertbackground=t0.text,
+            relief="flat",
+            padx=12,
+            pady=12,
+            highlightthickness=1,
+            highlightbackground=t0.border,
+            highlightcolor=t0.accent,
+        )
+        cb_ts = tk.Scrollbar(
+            cb_top,
+            command=cb_transcript.yview,
+            bg=t0.panel,
+            troughcolor=t0.field,
+            activebackground=t0.accent,
+            bd=0,
+            highlightthickness=0,
+            width=11,
+        )
+        cb_transcript.configure(yscrollcommand=cb_ts.set)
+        cb_transcript.grid(row=0, column=0, sticky="nsew")
+        cb_ts.grid(row=0, column=1, sticky="ns")
+        cb_transcript.tag_configure("t_meta", foreground=t0.muted, font=("Segoe UI", 9, "bold"))
+        cb_transcript.tag_configure("t_user", foreground=t0.text, font=("Segoe UI", 10))
+        cb_transcript.tag_configure("t_bot", foreground=t0.text, font=("Segoe UI", 10))
+
+        cb_attach = tk.Frame(cb_wrap, bg=t0.surface)
+        cb_attach.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+        cb_thinking_var = tk.BooleanVar(value=False)
+        cb_thinking_chk = tk.Checkbutton(
+            cb_attach,
+            text=tr("chatbot.thinking"),
+            variable=cb_thinking_var,
+            bg=t0.surface,
+            fg=t0.muted,
+            activebackground=t0.surface,
+            activeforeground=t0.text,
+            selectcolor=t0.field,
+            font=("Segoe UI", 9),
+        )
+        cb_thinking_chk.pack(side="left")
+        cb_pending_lbl = tk.Label(
+            cb_attach,
+            text=tr("recap.attachments", what=tr("recap.attachments_none")),
+            bg=t0.surface,
+            fg=t0.muted,
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        cb_pending_lbl.pack(side="left", fill="x", expand=True, padx=(12, 0))
+
+        cb_session: Dict[str, Any] = {
+            "messages": [{"role": "system", "content": "You are a helpful assistant."}],
+            "busy": False,
+        }
+        cb_pending_images: List[Path] = []
+        cb_pending_files: List[Path] = []
+
+        def cb_refresh_pending() -> None:
+            bits = []
+            if cb_pending_images:
+                bits.append(tr("recap.n_images", n=len(cb_pending_images)))
+            if cb_pending_files:
+                bits.append(tr("recap.n_files", n=len(cb_pending_files)))
+            what = ", ".join(bits) if bits else tr("recap.attachments_none")
+            cb_pending_lbl.config(text=tr("recap.attachments", what=what))
+
+        def cb_pick_image() -> None:
+            p = filedialog.askopenfilename(
+                title="Attach image",
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.webp"), ("All files", "*.*")],
+            )
+            if p:
+                cb_pending_images.append(Path(p))
+                cb_refresh_pending()
+
+        def cb_pick_file() -> None:
+            p = filedialog.askopenfilename(title="Attach file", filetypes=[("All files", "*.*")])
+            if p:
+                cb_pending_files.append(Path(p))
+                cb_refresh_pending()
+
+        cb_img_btn = tk.Button(
+            cb_attach,
+            text=tr("recap.image"),
+            command=cb_pick_image,
+            bg=_tb,
+            fg=_tf,
+            activebackground=_tab,
+            activeforeground=_taf,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        cb_img_btn.pack(side="right", padx=(6, 0))
+        cb_file_btn = tk.Button(
+            cb_attach,
+            text=tr("recap.file"),
+            command=cb_pick_file,
+            bg=_tb,
+            fg=_tf,
+            activebackground=_tab,
+            activeforeground=_taf,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        cb_file_btn.pack(side="right", padx=(6, 0))
+
+        cb_bottom = tk.Frame(cb_wrap, bg=t0.panel, highlightthickness=1, highlightbackground=t0.border)
+        cb_bottom.grid(row=3, column=0, sticky="ew")
+        cb_bottom.grid_columnconfigure(0, weight=1)
+
+        cb_input = tk.Text(
+            cb_bottom,
+            height=3,
+            wrap="word",
+            font=("Segoe UI", 10),
+            bg=t0.field,
+            fg=t0.text,
+            insertbackground=t0.text,
+            relief="flat",
+            padx=10,
+            pady=8,
+            highlightthickness=0,
+        )
+        cb_input.grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=8)
+
+        cb_btn_fr = tk.Frame(cb_bottom, bg=t0.panel)
+        cb_btn_fr.grid(row=0, column=1, sticky="ns", padx=(4, 8), pady=8)
+
+        cb_send_btn = tk.Button(
+            cb_btn_fr,
+            text=tr("recap.send"),
+            bg=t0.accent,
+            fg="white",
+            activebackground=t0.hover_primary,
+            activeforeground="white",
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=14,
+            pady=8,
+            cursor="hand2",
+        )
+        cb_send_btn.pack(fill="x", pady=(0, 6))
+        cb_new_btn = tk.Button(
+            cb_btn_fr,
+            text=tr("recap.new_chat"),
+            bg=_tb,
+            fg=_tf,
+            activebackground=_tab,
+            activeforeground=_taf,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=6,
+            cursor="hand2",
+        )
+        cb_new_btn.pack(fill="x")
+
+        def _cb_send_rest_style() -> Tuple[str, str, str, str, str]:
+            t = th()
+            if str(cb_send_btn.cget("state")) != "normal":
+                ds, gb, gf, dab, daf = t.gen_bind_disabled()
+                return ds, gb, gf, dab, daf
+            return ("normal", t.accent, "white", t.hover_primary, "white")
+
+        bind_button_hover_if_enabled(
+            cb_img_btn,
+            lambda: th().toolbar_bind_rest(),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
+        bind_button_hover_if_enabled(
+            cb_file_btn,
+            lambda: th().toolbar_bind_rest(),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
+        bind_button_hover_if_enabled(
+            cb_new_btn,
+            lambda: th().toolbar_bind_rest(),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
+        bind_button_hover_if_enabled(
+            cb_send_btn,
+            _cb_send_rest_style,
+            lambda: th().hover_primary,
+            lambda: "white",
+        )
+
+        cb_send_spin: Dict[str, Any] = {"after_id": None, "i": 0}
+
+        def _stop_cb_send_spinner() -> None:
+            aid = cb_send_spin.get("after_id")
+            if aid is not None:
+                try:
+                    root.after_cancel(aid)
+                except (tk.TclError, ValueError):
+                    pass
+                cb_send_spin["after_id"] = None
+
+        def _start_cb_send_spinner() -> None:
+            _stop_cb_send_spinner()
+
+            def _tick() -> None:
+                if not cb_session.get("busy"):
+                    cb_send_spin["after_id"] = None
+                    return
+                try:
+                    i = cb_send_spin["i"] % len(_AI_SEND_SPIN)
+                    cb_send_btn.config(text=tr("ai.send_busy_prefix") + _AI_SEND_SPIN[i])
+                    cb_send_spin["i"] = cb_send_spin["i"] + 1
+                    cb_send_spin["after_id"] = root.after(130, _tick)
+                except tk.TclError:
+                    cb_send_spin["after_id"] = None
+
+            cb_send_spin["i"] = 0
+            _tick()
+
+        def cb_set_sending(sending: bool) -> None:
+            cb_session["busy"] = sending
+            st = "disabled" if sending else "normal"
+            cb_send_btn.config(state=st)
+            cb_new_btn.config(state=st)
+            cb_img_btn.config(state=st)
+            cb_file_btn.config(state=st)
+            cb_input.config(state=st)
+            cb_thinking_chk.config(state=st)
+            if sending:
+                _start_cb_send_spinner()
+            else:
+                _stop_cb_send_spinner()
+                try:
+                    cb_send_btn.config(text=tr("recap.send"))
+                except tk.TclError:
+                    pass
+
+        def reset_chatbot_session(*_a: Any) -> None:
+            cb_session["messages"] = [{"role": "system", "content": "You are a helpful assistant."}]
+            cb_session["busy"] = False
+            cb_pending_images.clear()
+            cb_pending_files.clear()
+            cb_refresh_pending()
+            cb_transcript.config(state="normal")
+            cb_transcript.delete("1.0", "end")
+            cb_transcript.config(state="disabled")
+            cb_input.delete("1.0", "end")
+            cb_set_sending(False)
+
+        page_leave_reset_handlers["chatbot"] = reset_chatbot_session
+
+        def cb_new_chat() -> None:
+            if cb_session.get("busy"):
+                return
+            reset_chatbot_session()
+
+        cb_new_btn.config(command=cb_new_chat)
+
+        def cb_send() -> None:
+            if cb_session["busy"]:
+                return
+            if not get_openai_api_key():
+                if messagebox.askyesno(
+                    tr("msg.no_api_key_use_ai_title"),
+                    tr("msg.no_api_key_use_ai_body"),
+                ):
+                    goto_tok = api_key_prompt_hooks.get("goto_token")
+                    if callable(goto_tok):
+                        goto_tok()
+                return
+            text = cb_input.get("1.0", "end-1c").strip()
+            if not text and not cb_pending_images and not cb_pending_files:
+                return
+            model_name = OPENAI_THINKING_MODEL if cb_thinking_var.get() else OPENAI_MODEL
+            effort = "high" if cb_thinking_var.get() else None
+            imgs = list(cb_pending_images)
+            files = list(cb_pending_files)
+            cb_set_sending(True)
+
+            def kickoff() -> None:
+                try:
+                    user_msg = build_user_message_with_attachments(text, imgs, files)
+                    cb_session["messages"].append(user_msg)
+                    answer = chat_completion(
+                        cb_session["messages"],
+                        model=model_name,
+                        reasoning_effort=effort,
+                    )
+
+                    def done() -> None:
+                        cb_set_sending(False)
+                        if _is_likely_api_error_message(answer):
+                            messagebox.showerror(tr("msg.chatbot"), answer[:4000])
+                            if cb_session["messages"] and cb_session["messages"][-1].get("role") == "user":
+                                cb_session["messages"].pop()
+                            return
+                        cb_session["messages"].append({"role": "assistant", "content": answer})
+                        _append_transcript(cb_transcript, "user", text or tr("chat.attachment_only"))
+                        _append_transcript(cb_transcript, "assistant", answer)
+                        cb_input.delete("1.0", "end")
+                        cb_pending_images.clear()
+                        cb_pending_files.clear()
+                        cb_refresh_pending()
+
+                    root.after(0, done)
+                except Exception as exc:
+
+                    def fail() -> None:
+                        cb_set_sending(False)
+                        messagebox.showerror(tr("msg.chatbot"), str(exc))
+                        if cb_session["messages"] and cb_session["messages"][-1].get("role") == "user":
+                            cb_session["messages"].pop()
+
+                    root.after(0, fail)
+
+            threading.Thread(target=kickoff, daemon=True).start()
+
+        cb_send_btn.config(command=cb_send)
+
+        def cb_on_enter_key(event: Any) -> Optional[str]:
+            if (getattr(event, "state", 0) or 0) & 0x0001:
+                return None
+            if (getattr(event, "state", 0) or 0) & 0x0004:
+                return None
+            cb_send()
+            return "break"
+
+        cb_input.bind("<KeyPress-Return>", cb_on_enter_key, add="+")
+        cb_input.bind("<KeyPress-KP_Enter>", cb_on_enter_key, add="+")
+
+        def apply_ai_recap_chatbot_theme() -> None:
+            t = th()
+            tb, tf, tab, taf = t.toolbar_btn_config()
+            for fr in (
+                recap_wrap,
+                recap_title,
+                recap_top,
+                recap_thinking_chk,
+                recap_all_journal_chk,
+                recap_from_fr,
+                recap_to_wrap,
+                recap_to_chk,
+                recap_through_fr,
+                recap_cal_row,
+                recap_sel_lbl,
+                recap_mid,
+                recap_attach_row,
+                recap_pending_lbl,
+                recap_bottom,
+                recap_btn_fr,
+                cb_wrap,
+                cb_title,
+                cb_attach,
+                cb_pending_lbl,
+                cb_bottom,
+                cb_btn_fr,
+            ):
+                try:
+                    fr.configure(bg=t.surface)
+                except Exception:
+                    try:
+                        fr.configure(bg=t.panel)
+                    except Exception:
+                        pass
+            recap_title.configure(bg=t.surface, fg=t.text)
+            recap_top.configure(bg=t.panel, highlightbackground=t.border)
+            recap_thinking_chk.configure(
+                bg=t.panel,
+                fg=t.muted,
+                activebackground=t.panel,
+                activeforeground=t.text,
+                selectcolor=t.field,
+            )
+            recap_all_journal_chk.configure(
+                bg=t.panel,
+                fg=t.muted,
+                activebackground=t.panel,
+                activeforeground=t.text,
+                selectcolor=t.field,
+            )
+            recap_to_wrap.configure(bg=t.panel)
+            recap_to_chk.configure(
+                bg=t.panel,
+                fg=t.muted,
+                activebackground=t.panel,
+                activeforeground=t.text,
+                selectcolor=t.field,
+            )
+            recap_from_fr.configure(bg=t.panel)
+            for _w in recap_from_fr.winfo_children():
+                if isinstance(_w, tk.Label):
+                    _w.configure(bg=t.panel, fg=t.muted)
+            recap_through_fr.configure(bg=t.panel)
+            for _w in recap_through_fr.winfo_children():
+                if isinstance(_w, tk.Label):
+                    _w.configure(bg=t.panel, fg=t.muted)
+            recap_cal_row.configure(bg=t.surface)
+            recap_sel_lbl.configure(bg=t.surface, fg=t.muted)
+            recap_mid.configure(bg=t.surface)
+            recap_transcript.config(
+                bg=t.field,
+                fg=t.text,
+                insertbackground=t.text,
+                highlightbackground=t.border,
+                highlightcolor=t.accent,
+            )
+            recap_ts.config(bg=t.panel, troughcolor=t.field, activebackground=t.accent)
+            recap_transcript.tag_configure("t_meta", foreground=t.muted)
+            recap_transcript.tag_configure("t_user", foreground=t.text)
+            recap_transcript.tag_configure("t_bot", foreground=t.text)
+            recap_attach_row.configure(bg=t.surface)
+            recap_pending_lbl.configure(bg=t.surface, fg=t.muted)
+            recap_bottom.configure(bg=t.panel, highlightbackground=t.border)
+            recap_input.config(bg=t.field, fg=t.text, insertbackground=t.text)
+            recap_btn_fr.configure(bg=t.panel)
+            recap_send_btn.configure(
+                bg=t.accent,
+                fg="white",
+                activebackground=t.hover_primary,
+                activeforeground="white",
+            )
+            recap_new_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
+            recap_img_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
+            recap_file_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
+            if recap_calendar is not None:
+                try:
+                    recap_calendar.config(
+                        background=t.field,
+                        foreground=t.text,
+                        headersbackground=t.panel,
+                        headersforeground=t.text,
+                        weekendbackground=t.field,
+                        weekendforeground=t.muted,
+                        normalbackground=t.field,
+                        normalforeground=t.text,
+                        othermonthbackground=t.field,
+                        othermonthforeground=t.muted,
+                        selectbackground=t.accent,
+                        selectforeground="white",
+                        bordercolor=t.border,
+                    )
+                except Exception:
+                    pass
+                recap_refresh_cal_marks()
+            if DateEntry is not None and recap_from_de is not None:
+                try:
+                    recap_from_de.config(background=t.field, foreground=t.text)
+                except tk.TclError:
+                    pass
+            if DateEntry is not None and recap_to_de is not None:
+                try:
+                    recap_to_de.config(background=t.field, foreground=t.text)
+                except tk.TclError:
+                    pass
+            cb_wrap.configure(bg=t.surface)
+            cb_title.configure(bg=t.surface, fg=t.text)
+            cb_top.configure(bg=t.panel, highlightbackground=t.border)
+            cb_transcript.config(
+                bg=t.field,
+                fg=t.text,
+                insertbackground=t.text,
+                highlightbackground=t.border,
+                highlightcolor=t.accent,
+            )
+            cb_ts.config(bg=t.panel, troughcolor=t.field, activebackground=t.accent)
+            cb_transcript.tag_configure("t_meta", foreground=t.muted)
+            cb_transcript.tag_configure("t_user", foreground=t.text)
+            cb_transcript.tag_configure("t_bot", foreground=t.text)
+            cb_attach.configure(bg=t.surface)
+            cb_thinking_chk.configure(
+                bg=t.surface,
+                fg=t.muted,
+                activebackground=t.surface,
+                activeforeground=t.text,
+                selectcolor=t.field,
+            )
+            cb_pending_lbl.configure(bg=t.surface, fg=t.muted)
+            cb_bottom.configure(bg=t.panel, highlightbackground=t.border)
+            cb_input.config(bg=t.field, fg=t.text, insertbackground=t.text)
+            cb_btn_fr.configure(bg=t.panel)
+            cb_send_btn.configure(
+                bg=t.accent,
+                fg="white",
+                activebackground=t.hover_primary,
+                activeforeground="white",
+            )
+            cb_new_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
+            cb_img_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
+            cb_file_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
+
+        def refresh_recap_chat_i18n() -> None:
+            try:
+                _has_key = bool(get_openai_api_key())
+                recap_title.config(
+                    text=tr("recap.title" if _has_key else "recap.title_no_key")
+                )
+                recap_thinking_chk.config(text=tr("recap.thinking"))
+                recap_all_journal_chk.config(text=tr("recap.all_journal"))
+                recap_from_lbl.config(text=tr("recap.from"))
+                recap_to_chk.config(text=tr("recap.to_chk"))
+                recap_through_lbl.config(text=tr("recap.through"))
+                recap_img_btn.config(text=tr("recap.image"))
+                recap_file_btn.config(text=tr("recap.file"))
+                if not recap_session.get("busy"):
+                    recap_send_btn.config(text=tr("recap.send"))
+                recap_new_btn.config(text=tr("recap.new_chat"))
+                recap_update_sel_label()
+                recap_refresh_pending_lbl()
+                cb_title.config(
+                    text=tr("chatbot.title" if _has_key else "chatbot.title_no_key")
+                )
+                cb_thinking_chk.config(text=tr("chatbot.thinking"))
+                cb_img_btn.config(text=tr("recap.image"))
+                cb_file_btn.config(text=tr("recap.file"))
+                if not cb_session.get("busy"):
+                    cb_send_btn.config(text=tr("recap.send"))
+                cb_new_btn.config(text=tr("recap.new_chat"))
+                cb_refresh_pending()
+            except tk.TclError:
+                pass
+
+        build_ai_recap_and_chatbot_pages._i18n = refresh_recap_chat_i18n  # type: ignore[attr-defined]
+        build_ai_recap_and_chatbot_pages._apply_theme = apply_ai_recap_chatbot_theme  # type: ignore[attr-defined]
+
+    build_ai_recap_and_chatbot_pages()
     settings_wrap = tk.Frame(settings_page, bg=t_init.surface)
     settings_wrap.pack(fill="both", expand=True, padx=20, pady=20)
     _register_page_toggle(settings_page)
     settings_title = tk.Label(
         settings_wrap,
-        text="Settings",
+        text=tr("settings.title"),
         bg=t_init.surface,
         fg=t_init.text,
         font=("Segoe UI", 16, "bold"),
@@ -3396,13 +4760,14 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     settings_rows: List[Any] = []
     settings_labels: List[Any] = []
+    settings_label_keys: List[Tuple[Any, str]] = []
 
-    def _make_settings_row(label_text: str) -> Tuple[Any, Any]:
+    def _make_settings_row(label_key: str) -> Tuple[Any, Any]:
         row = tk.Frame(settings_wrap, bg=t_init.surface)
         row.pack(fill="x", pady=(0, 10))
         lbl = tk.Label(
             row,
-            text=label_text,
+            text=tr(label_key),
             bg=t_init.surface,
             fg=t_init.muted,
             font=("Segoe UI", 10, "bold"),
@@ -3412,6 +4777,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         lbl.pack(side="left")
         settings_rows.append(row)
         settings_labels.append(lbl)
+        settings_label_keys.append((lbl, label_key))
         return row, lbl
 
     settings_prefs = load_preferences()
@@ -3445,7 +4811,44 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         if callable(apply_hint):
             apply_hint()
 
-    rename_row, _ = _make_settings_row("Rename")
+    lang_row, _ = _make_settings_row("settings.language")
+    ui_lang_var = tk.StringVar(
+        value=tr("settings.lang.chinese")
+        if ui_lang_holder[0] == "zh"
+        else tr("settings.lang.english")
+    )
+    lang_ui_combo: Any = None
+    if ttk is not None:
+        lang_ui_combo = ttk.Combobox(
+            lang_row,
+            textvariable=ui_lang_var,
+            values=(tr("settings.lang.english"), tr("settings.lang.chinese")),
+            state="readonly",
+            width=14,
+            style="Journal.TCombobox",
+        )
+        lang_ui_combo.pack(side="left", fill="x", expand=True, padx=(0, 8))
+    else:
+        lang_ui_combo = tk.OptionMenu(
+            lang_row,
+            ui_lang_var,
+            tr("settings.lang.english"),
+            tr("settings.lang.chinese"),
+        )
+        lang_ui_combo.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+    def _on_ui_language_selected(_evt: object | None = None) -> None:
+        raw = ui_lang_var.get().strip()
+        new_lang = "zh" if raw == tr("settings.lang.chinese") else "en"
+        if new_lang == ui_lang_holder[0]:
+            return
+        prefs = load_preferences()
+        prefs[UI_LANGUAGE_PREF_KEY] = new_lang
+        save_preferences(prefs)
+        ui_lang_holder[0] = new_lang
+        apply_journal_window_colors()
+
+    rename_row, _ = _make_settings_row("settings.rename")
     rename_entry = tk.Entry(
         rename_row,
         bg=t_init.field,
@@ -3461,7 +4864,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     rename_entry.insert(0, settings_app_name["value"])
     rename_btn = tk.Button(
         rename_row,
-        text="Rename",
+        text=tr("settings.rename_btn"),
         bg=t_init.btn_secondary,
         fg=t_init.text,
         activebackground=t_init.secondary_hover,
@@ -3474,11 +4877,11 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     )
     rename_btn.pack(side="left")
 
-    startup_row, _ = _make_settings_row("Start Up Launch")
+    startup_row, _ = _make_settings_row("settings.startup")
     startup_state = {"enabled": is_startup_enabled()}
     startup_toggle_btn = tk.Button(
         startup_row,
-        text="On" if startup_state["enabled"] else "Off",
+        text=tr("settings.on") if startup_state["enabled"] else tr("settings.off"),
         bg=t_init.btn_secondary,
         fg=t_init.text,
         activebackground=t_init.secondary_hover,
@@ -3492,7 +4895,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     )
     startup_toggle_btn.pack(side="left")
 
-    theme_row, _ = _make_settings_row("Window Theme")
+    theme_row, _ = _make_settings_row("settings.theme")
     settings_theme_btn = tk.Button(
         theme_row,
         text=t_init.toggle_label,
@@ -3509,7 +4912,14 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     )
     settings_theme_btn.pack(side="left")
 
-    backup_row, _ = _make_settings_row("Back Up")
+    def _backup_mode_btn_label(mode_val: str) -> str:
+        return tr(
+            {"On": "backup.on", "Off": "backup.off", "Limited": "backup.limited"}.get(
+                mode_val, "backup.off"
+            )
+        )
+
+    backup_row, _ = _make_settings_row("settings.backup")
     backup_mode = {"value": "On"}
     if _is_pref_true(settings_prefs.get("backup_limited", "false")):
         backup_mode["value"] = "Limited"
@@ -3517,7 +4927,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         backup_mode["value"] = "Off"
     backup_mode_btn = tk.Button(
         backup_row,
-        text=backup_mode["value"],
+        text=_backup_mode_btn_label(backup_mode["value"]),
         bg=t_init.btn_secondary,
         fg=t_init.text,
         activebackground=t_init.secondary_hover,
@@ -3532,7 +4942,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     backup_mode_btn.pack(side="left", padx=(0, 8))
     backup_manual_btn = tk.Button(
         backup_row,
-        text="Manual",
+        text=tr("settings.manual"),
         bg=t_init.btn_secondary,
         fg=t_init.text,
         activebackground=t_init.secondary_hover,
@@ -3547,14 +4957,14 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     backup_manual_btn.pack(side="left")
     bind_hover_tooltip(
         backup_mode_btn,
-        lambda: "Backup mode cycles: On (daily), Off (disabled), Limited (daily + keep max 3 backups).",
+        lambda: tr("tip.backup_mode"),
     )
     bind_hover_tooltip(
         backup_manual_btn,
-        lambda: "Run one backup now immediately.",
+        lambda: tr("tip.backup_manual"),
     )
 
-    token_row, _ = _make_settings_row("Token")
+    token_row, _ = _make_settings_row("settings.token")
     token_saved = {"value": get_openai_api_key() or ""}
     token_entry = tk.Entry(
         token_row,
@@ -3572,7 +4982,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         token_entry.insert(0, "*" * max(32, len(token_saved["value"])))
     token_save_btn = tk.Button(
         token_row,
-        text="Save",
+        text=tr("settings.save"),
         bg=t_init.btn_secondary,
         fg=t_init.text,
         activebackground=t_init.secondary_hover,
@@ -3587,7 +4997,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     token_save_btn.pack(side="left", padx=(0, 8))
     token_copy_btn = tk.Button(
         token_row,
-        text="Copy",
+        text=tr("settings.copy"),
         bg=t_init.btn_secondary,
         fg=t_init.text,
         activebackground=t_init.secondary_hover,
@@ -3601,7 +5011,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     )
     token_copy_btn.pack(side="left")
 
-    start_menu_row, _ = _make_settings_row("Start Menu Shortcut")
+    start_menu_row, _ = _make_settings_row("settings.start_menu")
     start_menu_app_btn = tk.Button(
         start_menu_row,
         bg=t_init.btn_secondary,
@@ -3609,7 +5019,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         activebackground=t_init.secondary_hover,
         activeforeground=t_init.text,
         relief="flat",
-        text="App",
+        text=tr("settings.start_menu_app"),
         font=("Segoe UI", 9, "bold"),
         padx=12,
         pady=6,
@@ -3618,7 +5028,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     start_menu_app_btn.pack(side="left", padx=(0, 8))
     start_menu_journal_btn = tk.Button(
         start_menu_row,
-        text="Journal",
+        text=tr("settings.start_menu_journal"),
         bg=t_init.btn_secondary,
         fg=t_init.text,
         activebackground=t_init.secondary_hover,
@@ -3632,11 +5042,11 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     start_menu_journal_btn.pack(side="left")
     bind_hover_tooltip(
         start_menu_app_btn,
-        lambda: "Create a Start Menu shortcut for the Daily Logger app launcher (.bat).",
+        lambda: tr("tip.start_menu_app"),
     )
     bind_hover_tooltip(
         start_menu_journal_btn,
-        lambda: "Create a Start Menu shortcut for Journal.xlsx so it appears in Windows search.",
+        lambda: tr("tip.start_menu_journal"),
     )
 
     def _refresh_token_entry_mask() -> None:
@@ -3656,20 +5066,24 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         nav_title.config(text=updated)
         rename_entry.delete(0, "end")
         rename_entry.insert(0, updated)
-        _set_settings_status(f'App renamed to "{updated}".')
+        _set_settings_status(tr("status.rename_ok", name=updated))
 
     def _on_toggle_startup() -> None:
         should_enable = not startup_state["enabled"]
         ok = create_startup_shortcut() if should_enable else remove_startup_shortcut()
         if not ok:
-            _set_settings_status("Could not update startup launch setting.")
+            _set_settings_status(tr("status.startup_fail"))
             return
         startup_state["enabled"] = should_enable
-        startup_toggle_btn.config(text="On" if should_enable else "Off")
+        startup_toggle_btn.config(
+            text=tr("settings.on") if should_enable else tr("settings.off")
+        )
         prefs = load_preferences()
         prefs["startup_enabled"] = "true" if should_enable else "false"
         save_preferences(prefs)
-        _set_settings_status("Startup launch enabled." if should_enable else "Startup launch disabled.")
+        _set_settings_status(
+            tr("status.startup_on") if should_enable else tr("status.startup_off")
+        )
 
     def _persist_backup_mode(mode: str) -> None:
         prefs = load_preferences()
@@ -3683,16 +5097,16 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             prefs["backup_enabled"] = "true"
             prefs["backup_limited"] = "true"
         if save_preferences(prefs):
-            _set_settings_status(f"Backup mode set to {mode}.")
+            _set_settings_status(tr("status.backup_mode", mode=_backup_mode_btn_label(mode)))
         else:
-            _set_settings_status("Could not save backup mode setting.")
+            _set_settings_status(tr("status.backup_save_fail"))
 
     def _on_cycle_backup_mode() -> None:
         order = ("On", "Off", "Limited")
         idx = order.index(backup_mode["value"])
         next_mode = order[(idx + 1) % len(order)]
         backup_mode["value"] = next_mode
-        backup_mode_btn.config(text=next_mode)
+        backup_mode_btn.config(text=_backup_mode_btn_label(next_mode))
         _persist_backup_mode(next_mode)
 
     def _on_manual_backup() -> None:
@@ -3700,10 +5114,10 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         evict_oldest_backup_if_limited_full(prefs)
         backup_path = run_backup_now()
         if backup_path is None:
-            _set_settings_status("Manual backup skipped: nothing in daily_logs to back up.")
+            _set_settings_status(tr("status.backup_skip"))
             return
         trim_backups_if_limited(prefs)
-        _set_settings_status(f"Manual backup created: {backup_path.name}")
+        _set_settings_status(tr("status.backup_ok", name=backup_path.name))
 
     def _on_token_focus_in(_evt: Optional[Any] = None) -> None:
         if _is_token_mask(token_entry.get()):
@@ -3712,32 +5126,38 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     def _on_token_save() -> None:
         typed = token_entry.get().strip()
         if _is_token_mask(typed):
-            _set_settings_status("Token unchanged.")
+            _set_settings_status(tr("status.token_same"))
             return
         if not typed:
             if delete_openai_api_key():
                 token_saved["value"] = ""
                 _refresh_token_entry_mask()
-                _set_settings_status("Token removed.")
+                _set_settings_status(tr("status.token_removed"))
+                _ai_i18n = getattr(build_ai_recap_and_chatbot_pages, "_i18n", None)
+                if callable(_ai_i18n):
+                    _ai_i18n()
             else:
-                _set_settings_status("Could not remove token.")
+                _set_settings_status(tr("status.token_remove_fail"))
             return
         if save_openai_api_key(typed):
             token_saved["value"] = typed
             _refresh_token_entry_mask()
-            _set_settings_status("Token saved.")
+            _set_settings_status(tr("status.token_saved"))
+            _ai_i18n = getattr(build_ai_recap_and_chatbot_pages, "_i18n", None)
+            if callable(_ai_i18n):
+                _ai_i18n()
         else:
-            _set_settings_status("Could not save token.")
+            _set_settings_status(tr("status.token_save_fail"))
 
     def _on_token_copy() -> None:
         current = get_openai_api_key() or ""
         if not current:
-            _set_settings_status("No saved token to copy.")
+            _set_settings_status(tr("status.token_no_copy"))
             return
         if copy_text_to_clipboard(current):
-            _set_settings_status("Current token copied to clipboard.")
+            _set_settings_status(tr("status.token_copied"))
         else:
-            _set_settings_status("Could not copy token to clipboard.")
+            _set_settings_status(tr("status.token_copy_fail"))
 
     def _on_start_menu_button(selected: str) -> None:
         if selected == "journal":
@@ -3745,9 +5165,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         else:
             ok = sb_create_bat_search_shortcut()
         if ok:
-            _set_settings_status(f'Start Menu "{selected}" shortcut enabled.')
+            _set_settings_status(tr("status.start_menu_ok", which=selected))
         else:
-            _set_settings_status(f'Could not enable Start Menu "{selected}" shortcut.')
+            _set_settings_status(tr("status.start_menu_fail", which=selected))
 
     rename_btn.config(command=_on_rename_apply)
     startup_toggle_btn.config(command=_on_toggle_startup)
@@ -3758,6 +5178,24 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     start_menu_app_btn.config(command=lambda: _on_start_menu_button("app"))
     start_menu_journal_btn.config(command=lambda: _on_start_menu_button("journal"))
     token_entry.bind("<FocusIn>", _on_token_focus_in, add="+")
+
+    def _goto_settings_token_field() -> None:
+        show_page("settings")
+
+        def _focus_token() -> None:
+            try:
+                token_entry.focus_set()
+            except tk.TclError:
+                return
+            try:
+                token_entry.selection_range(0, "end")
+            except tk.TclError:
+                pass
+
+        root.after(100, _focus_token)
+
+    api_key_prompt_hooks["goto_token"] = _goto_settings_token_field
+
     for _btn in (
         rename_btn,
         startup_toggle_btn,
@@ -3850,7 +5288,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     )
     console_entry.pack(side="left", fill="x", expand=True, padx=(0, 0))
     console_insertwidth_normal = int(console_entry.cget("insertwidth") or 1)
-    console_placeholder = "Type console messages"
     console_entry_state: Dict[str, bool] = {"placeholder": False}
 
     def _set_console_placeholder() -> None:
@@ -3863,7 +5300,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             insertwidth=0,
         )
         hint = str(console_hint_state.get("text", "")).strip()
-        console_entry.insert(0, hint or console_placeholder)
+        console_entry.insert(0, hint or tr("console.placeholder"))
 
     def _clear_console_placeholder() -> None:
         if not console_entry_state["placeholder"]:
@@ -4475,28 +5912,15 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     def transcribe_tooltip_text() -> str:
         if transcribing_busy["v"]:
             pct = int(transcribing_progress.get("v", 0))
-            return (
-                f"Transcribing… ({pct}%)\n"
-                "Uses a small amount of API cost."
-            )
+            return tr("journal.transcribe_tooltip_busy_full").format(pct=pct)
         if recording_ui_busy["v"]:
-            return "Finish recording before transcribing"
+            return tr("journal.transcribe_tooltip_wait_recording")
         p = last_journal_wav.get("path")
         if p is not None and isinstance(p, Path) and p.exists():
-            return (
-                "Transcribe previous recording to text.\n"
-                "Uses a small amount of API cost."
-            )
+            return tr("journal.transcribe_tooltip_prev_session")
         if latest_archived_journal_wav() is not None:
-            return (
-                "Transcribe the most recent saved recording in your Recording folder.\n"
-                "You will be asked to confirm before it is sent.\n"
-                "Uses a small amount of API cost."
-            )
-        return (
-            "No recording available. Record audio first, or add rcd*.wav files under:\n"
-            f"{RECORDING_DIR}"
-        )
+            return tr("journal.transcribe_tooltip_archived")
+        return tr("journal.transcribe_tooltip_no_recording").format(dir=str(RECORDING_DIR))
 
     def run_transcribe() -> None:
         if transcribing_busy["v"]:
@@ -4636,6 +6060,128 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     wave_canvas.bind("<Configure>", lambda _e: redraw_waveform_canvas())
     wave_canvas.after(80, redraw_waveform_canvas)
 
+    def _editor_has_meaningful_body_content() -> bool:
+        return bool(
+            text_box.get("1.0", "end-1c").strip()
+            or stt_box.get("1.0", "end-1c").strip()
+            or report_box.get("1.0", "end-1c").strip()
+        )
+
+    def _draft_file_has_restorable_content(d: Dict[str, object]) -> bool:
+        if str(d.get("text", "") or "").strip():
+            return True
+        if str(d.get("speech_transcript", "") or "").strip():
+            return True
+        if str(d.get("ai_report", "") or "").strip():
+            return True
+        wraw = d.get("journal_recording_wav")
+        if not wraw:
+            return False
+        try:
+            return Path(str(wraw)).is_file()
+        except OSError:
+            return False
+
+    def apply_draft_dict_to_ui(d: Dict[str, object]) -> None:
+        nonlocal edit_target_sheet, edit_target_row
+        _txt = str(d.get("text", "") or "")
+        _sp = str(d.get("speech_transcript", "") or "")
+        _rp = str(d.get("ai_report", "") or "")
+        text_box.delete("1.0", "end")
+        text_box.insert("1.0", _txt)
+        stt_box.delete("1.0", "end")
+        stt_box.insert("1.0", _sp)
+        report_box.delete("1.0", "end")
+        report_box.insert("1.0", _rp)
+        _dt = str(d.get("date", "") or "").strip()
+        if _dt:
+            if DateEntry is not None and isinstance(date_entry, DateEntry):  # type: ignore[arg-type]
+                try:
+                    date_entry.set_date(_dt)  # type: ignore[attr-defined]
+                except Exception:
+                    try:
+                        date_entry.delete(0, "end")  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    date_entry.insert(0, _dt)  # type: ignore[attr-defined]
+            else:
+                date_entry.delete(0, "end")
+                date_entry.insert(0, _dt)
+        _tm = str(d.get("time", "") or "").strip()
+        if _tm:
+            time_entry.delete(0, "end")
+            time_entry.insert(0, _tm)
+        edit_target_sheet = str(d.get("edit_target_sheet", "") or "")
+        try:
+            edit_target_row = int(d.get("edit_target_row", 0) or 0)
+        except (TypeError, ValueError):
+            edit_target_row = 0
+        is_edit_mode["v"] = bool(edit_target_sheet and edit_target_row > 0)
+        _wav = d.get("journal_recording_wav")
+        last_journal_wav["path"] = None
+        if _wav:
+            try:
+                _wp = Path(str(_wav))
+                if _wp.is_file():
+                    last_journal_wav["path"] = _wp.resolve()
+                    _set_stt_saved_path_display(tr("journal.saved_path", path=str(_wp)))
+                else:
+                    _set_stt_saved_path_display("")
+            except OSError:
+                _set_stt_saved_path_display("")
+        else:
+            _set_stt_saved_path_display("")
+        stt_status.config(text="")
+        report_status.config(text="")
+        update_transcribe_ui()
+        refresh_save_entry_state()
+        try:
+            text_box.focus_set()
+        except tk.TclError:
+            pass
+
+    def on_restore_draft_click() -> None:
+        d = load_journal_window_draft()
+        if not isinstance(d, dict) or not _draft_file_has_restorable_content(d):
+            messagebox.showinfo(
+                tr("msg.journal_window"),
+                tr("msg.no_draft_to_restore"),
+            )
+            return
+        if _editor_has_meaningful_body_content():
+            if not messagebox.askyesno(
+                tr("journal.restore_confirm_title"),
+                tr("journal.restore_confirm"),
+            ):
+                return
+        apply_draft_dict_to_ui(d)
+        save_draft()
+
+    journal_top_actions = tk.Frame(top, bg=t_init.panel)
+    journal_top_actions.grid(row=0, column=5, sticky="w", padx=(4, 8), pady=12)
+    restore_draft_btn = tk.Button(
+        journal_top_actions,
+        text=tr("journal.restore_draft"),
+        command=on_restore_draft_click,
+        bg=_ut_bg,
+        fg=_ut_fg,
+        activebackground=_ut_abg,
+        activeforeground=_ut_afg,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=6,
+        cursor="hand2",
+    )
+    restore_draft_btn.pack(side="left")
+    bind_button_hover_if_enabled(
+        restore_draft_btn,
+        lambda: th().toolbar_bind_rest(),
+        lambda: th().toolbar_hover()[0],
+        lambda: th().toolbar_hover()[1],
+    )
+    bind_hover_tooltip(restore_draft_btn, lambda: tr("tip.restore_draft"))
+
     def _language_code_for_whisper() -> Optional[str]:
         choice = lang_var.get().strip()
         if choice == "English":
@@ -4745,7 +6291,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         if dest is not None:
             last_journal_wav["path"] = dest
             stt_status.config(text="")
-            _set_stt_saved_path_display(f"Saved: {str(dest)}")
+            _set_stt_saved_path_display(tr("journal.saved_path", path=str(dest)))
         else:
             last_journal_wav["path"] = None
             _set_stt_saved_path_display("")
@@ -4948,10 +6494,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     gen_button.config(command=run_generate_report)
 
     def generate_report_tooltip_text() -> str:
-        return (
-            "Uses the AI report feature (ChatGPT) to build a summary from your journal text "
-            "and speech transcript. Requires an API key and uses paid API usage."
-        )
+        return tr("tip.generate_report")
 
     bind_hover_tooltip(gen_button, generate_report_tooltip_text)
 
@@ -5496,6 +7039,95 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         _tb.bind("<Control-f>", _find_open, add="+")
     root.bind("<Control-f>", _find_open, add="+")
 
+    def apply_journal_window_i18n() -> None:
+        try:
+            splash_title.config(text=tr("splash.title", app=window_app_name))
+        except tk.TclError:
+            pass
+        settings_title.config(text=tr("settings.title"))
+        for _lbl, _key in settings_label_keys:
+            _lbl.config(text=tr(_key))
+        try:
+            if lang_ui_combo is not None and ttk is not None:
+                lang_ui_combo.config(
+                    values=(tr("settings.lang.english"), tr("settings.lang.chinese"))
+                )
+        except tk.TclError:
+            pass
+        _want_ui_lang = (
+            tr("settings.lang.chinese")
+            if ui_lang_holder[0] == "zh"
+            else tr("settings.lang.english")
+        )
+        if ui_lang_var.get().strip() != _want_ui_lang.strip():
+            ui_lang_var.set(_want_ui_lang)
+        rename_btn.config(text=tr("settings.rename_btn"))
+        startup_toggle_btn.config(
+            text=tr("settings.on") if startup_state["enabled"] else tr("settings.off")
+        )
+        settings_theme_btn.config(
+            text=tr("theme.dark") if th().is_dark else tr("theme.light")
+        )
+        backup_mode_btn.config(text=_backup_mode_btn_label(backup_mode["value"]))
+        backup_manual_btn.config(text=tr("settings.manual"))
+        token_save_btn.config(text=tr("settings.save"))
+        token_copy_btn.config(text=tr("settings.copy"))
+        start_menu_app_btn.config(text=tr("settings.start_menu_app"))
+        start_menu_journal_btn.config(text=tr("settings.start_menu_journal"))
+        nav_buttons["journal"].config(text=tr("nav.journal"))
+        nav_buttons["ai_recap"].config(text=tr("nav.ai_recap"))
+        nav_buttons["chatbot"].config(text=tr("nav.chatbot"))
+        nav_buttons["console"].config(text=tr("nav.console"))
+        nav_settings_btn.config(text=tr("nav.settings"))
+        date_lbl.config(text=tr("journal.date"))
+        time_lbl.config(text=tr("journal.time"))
+        update_time_btn.config(text=tr("journal.update_time"))
+        restore_draft_btn.config(text=tr("journal.restore_draft"))
+        find_lbl.config(text=tr("find.label"))
+        find_scope_all_rb.config(text=tr("find.all"))
+        find_scope_one_rb.config(text=tr("find.current_box"))
+        find_case_chk.config(text=tr("find.case"))
+        find_word_chk.config(text=tr("find.word"))
+        find_prev_btn.config(text=tr("find.prev"))
+        find_next_btn.config(text=tr("find.next"))
+        find_close_btn.config(text=tr("find.close"))
+        journal_title_lbl.config(text=tr("journal.section.journal"))
+        stt_title_lbl.config(text=tr("journal.section.stt"))
+        report_title_lbl.config(text=tr("journal.section.report"))
+        open_recording_btn.config(text=tr("journal.open"))
+        stt_lang_lbl.config(text=tr("journal.lang_label"))
+        transcribe_btn.config(text=tr("journal.transcribe"))
+        gen_button.config(text=tr("journal.generate_report"))
+        save_entry_btn.config(text=tr("journal.save_entry"))
+        start_rec_button.config(text=tr("journal.rec.start"))
+        stop_rec_button.config(text=tr("journal.rec.stop"))
+        if recording_ui_busy["v"]:
+            pause_rec_button.config(
+                text=tr("journal.rec.resume")
+                if record_pause.is_set()
+                else tr("journal.rec.pause")
+            )
+        else:
+            pause_rec_button.config(text=tr("journal.rec.pause"))
+        console_title.config(text=tr("console.title"))
+        _show_console_hint_placeholder()
+        theme_toggle_btn.config(text=tr("theme.dark") if th().is_dark else tr("theme.light"))
+        _ai_i18n = getattr(build_ai_recap_and_chatbot_pages, "_i18n", None)
+        if callable(_ai_i18n):
+            _ai_i18n()
+
+    def _apply_console_ui_language(new_lang: str) -> None:
+        ui_lang_holder[0] = new_lang
+        apply_journal_window_i18n()
+
+    set_journal_ui_language_changed_hook(_apply_console_ui_language)
+
+    def _on_journal_root_destroy(event: Any) -> None:
+        if getattr(event, "widget", None) is root:
+            set_journal_ui_language_changed_hook(None)
+
+    root.bind("<Destroy>", _on_journal_root_destroy, add="+")
+
     def apply_journal_window_colors() -> None:
         t = th()
         root.configure(bg=t.surface)
@@ -5526,6 +7158,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             _w.configure(bg=t.surface, fg=t.text)
         for _w in placeholder_body_labels:
             _w.configure(bg=t.surface, fg=t.muted)
+        _ai_theme_fn = getattr(build_ai_recap_and_chatbot_pages, "_apply_theme", None)
+        if callable(_ai_theme_fn):
+            _ai_theme_fn()
         settings_wrap.configure(bg=t.surface)
         settings_title.configure(bg=t.surface, fg=t.text)
         settings_status_lbl.configure(bg=t.surface, fg=t.muted)
@@ -5674,6 +7309,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         update_time_btn.config(
             bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg
         )
+        restore_draft_btn.config(bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg)
+        journal_top_actions.configure(bg=t.panel)
         for _b in (find_prev_btn, find_next_btn, find_close_btn):
             _b.config(bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg)
         theme_toggle_btn.config(
@@ -5801,8 +7438,11 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         button_row.pack_configure(padx=t.pad_outer, pady=(0, t.pad_button_y))
         refresh_save_entry_state()
         redraw_waveform_canvas()
+        apply_journal_window_i18n()
 
-    _startup_step("Building pages...")
+    ui_lang_var.trace_add("write", lambda *_a: root.after_idle(_on_ui_language_selected))
+
+    _startup_step("splash.detail.pages")
 
     def toggle_journal_window_theme() -> None:
         prefs = load_preferences()
@@ -5827,7 +7467,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         pady=6,
         cursor="hand2",
     )
-    theme_toggle_btn.grid(row=0, column=5, sticky="e", padx=(0, 12), pady=12)
+    theme_toggle_btn.grid(row=0, column=6, sticky="e", padx=(8, 12), pady=12)
     bind_button_hover_if_enabled(
         theme_toggle_btn,
         lambda: (
@@ -5944,7 +7584,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             root.focus_set()
 
     root.bind_all("<Button-1>", _unfocus_console_on_button_click, add="+")
-    _startup_step("Finalizing UI...")
+    _startup_step("splash.detail.finalize")
     show_page("journal")
 
     def _on_escape(event=None) -> None:
@@ -5955,17 +7595,18 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     root.bind("<Escape>", _on_escape)
     root.protocol("WM_DELETE_WINDOW", on_close)
-    _startup_step("Journal ready")
+    _startup_step("splash.detail.journal_ready")
     startup_overlay.destroy()
     root.lift()
+    apply_journal_window_colors()
 
     def _background_post_init() -> None:
-        _startup_step("Loading other pages...")
+        _startup_step("splash.detail.other_pages")
         set_nav_visible(True)
-        _startup_step("Starting autosave...")
+        _startup_step("splash.detail.autosave")
         autosave()
         refresh_save_entry_state()
-        _startup_step("Ready")
+        _startup_step("splash.detail.ready")
 
     root.after(1, _background_post_init)
     root.mainloop()
@@ -6059,6 +7700,62 @@ def setup_first_time_preferences() -> str:
 
 def get_chat_completions_url() -> str:
     return os.getenv("OPENAI_CHAT_COMPLETIONS_URL", OPENAI_CHAT_COMPLETIONS_URL).strip()
+
+
+def _image_mime_for_path(path: Path) -> str:
+    suf = path.suffix.lower()
+    if suf in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    if suf == ".gif":
+        return "image/gif"
+    if suf == ".webp":
+        return "image/webp"
+    return "image/png"
+
+
+def build_user_message_with_attachments(
+    question: str,
+    image_paths: List[Path],
+    file_paths: List[Path],
+) -> Dict[str, object]:
+    """Build a user message with optional images (vision) and text file excerpts."""
+    text_chunks: List[str] = []
+    q = (question or "").strip()
+    if q:
+        text_chunks.append(q)
+    for fp in file_paths:
+        ctx, _resolved, err = load_recap_context_from_file(str(fp))
+        if err:
+            text_chunks.append(f"[Attachment {fp.name}: {err}]")
+        elif ctx:
+            label = str(fp.resolve())
+            clip = ctx if len(ctx) <= 48000 else ctx[:48000] + "\n\n[Truncated attachment]"
+            text_chunks.append(f"[Attached file: {label}]\n{clip}")
+    combined_text = "\n\n".join(text_chunks).strip() or "(no text)"
+    parts: List[Dict[str, object]] = [{"type": "text", "text": combined_text}]
+    for img_path in image_paths:
+        try:
+            raw = img_path.read_bytes()
+        except OSError as exc:
+            parts.append({"type": "text", "text": f"[Image {img_path.name} unreadable: {exc}]"})
+            continue
+        try:
+            mime = _image_mime_for_path(img_path)
+            b64 = base64.b64encode(raw).decode("ascii")
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                }
+            )
+        except Exception as exc:
+            parts.append(
+                {"type": "text", "text": f"[Image {img_path.name} could not attach: {exc}]"}
+            )
+
+    if len(parts) == 1 and parts[0].get("type") == "text":
+        return {"role": "user", "content": combined_text}
+    return {"role": "user", "content": parts}
 
 
 def chat_completion(
@@ -6988,6 +8685,7 @@ def print_main_help() -> None:
     print("  TOKEN ADD [token] - save API token")
     print("  TOKEN RESET - delete saved API token")
     print("  TOKEN COPY - copy current API token")
+    print("  LAN cn | LAN en | LANGUAGE Chinese | LANGUAGE English - UI language")
     print("  SB bat     - Start Menu shortcut so Windows Search finds the .bat launcher")
     print("  SB journal - Start Menu shortcut so Windows Search finds Journal.xlsx")
     print("  Enter  - Continue/Exit")
@@ -7070,6 +8768,27 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
             print("Restored draft saved.")
         else:
             print("Draft restore opened. Unsaved draft remains available.")
+        return True, app_name
+    _menu_parts = raw.split(None, 1)
+    if _menu_parts and _menu_parts[0].upper() in ("LAN", "LANGUAGE"):
+        _arg = _menu_parts[1].strip() if len(_menu_parts) > 1 else ""
+        if not _arg:
+            print("Usage: LAN cn | LAN en | LANGUAGE Chinese | LANGUAGE English")
+            return True, app_name
+        new_lang = normalize_ui_language(_arg)
+        prefs = load_preferences()
+        cur = normalize_ui_language(str(prefs.get(UI_LANGUAGE_PREF_KEY, "en")))
+        if new_lang == cur:
+            print(f"UI language is already {'Chinese' if new_lang == 'zh' else 'English'}.")
+            return True, app_name
+        prefs[UI_LANGUAGE_PREF_KEY] = new_lang
+        if not save_preferences(prefs):
+            print("Could not save language preference.")
+            return True, app_name
+        hook = _journal_ui_language_changed_hook
+        if hook is not None:
+            hook(new_lang)
+        print(f"UI language set to {'Chinese' if new_lang == 'zh' else 'English'}.")
         return True, app_name
     if key.startswith("TOKEN ADD "):
         token_value = raw[10:].strip()
@@ -7274,7 +8993,7 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
     module = MODULES.get(key)
     if not module:
         print(
-            "Unknown choice. Please enter J, J SETTINGS, J SETTING, JOURNAL SETTINGS, JS, R, RT, C, CT, H, HELP, RENAME, STARTUP TRUE/FALSE, DEFAULT WINDOWS/CONSOLE, OPEN DIRECTORY/JOURNAL/SCREENSHOTS, DIRECTOR OPEN, BACKUP START/TRUE/FALSE/LIMITED, TS, UNINSTALL, CONFIRM UNINSTALL, SB bat/journal, WIFI WARN [name], RESTORE, TOKEN ADD/RESET/COPY, or press Enter to skip."
+            "Unknown choice. Please enter J, J SETTINGS, J SETTING, JOURNAL SETTINGS, JS, R, RT, C, CT, H, HELP, RENAME, STARTUP TRUE/FALSE, DEFAULT WINDOWS/CONSOLE, OPEN DIRECTORY/JOURNAL/SCREENSHOTS, DIRECTOR OPEN, BACKUP START/TRUE/FALSE/LIMITED, TS, UNINSTALL, CONFIRM UNINSTALL, SB bat/journal, WIFI WARN [name], RESTORE, LAN/LANGUAGE, TOKEN ADD/RESET/COPY, or press Enter to skip."
         )
         return True, app_name
 
@@ -7330,6 +9049,12 @@ MAIN_MENU_COMPLETIONS: Tuple[str, ...] = tuple(
             "SB bat",
             "SB journal",
             "REANAME ",
+            "LAN ",
+            "LAN CN",
+            "LAN EN",
+            "LANGUAGE ",
+            "LANGUAGE CHINESE",
+            "LANGUAGE ENGLISH",
         },
         key=lambda s: s.upper(),
     )
@@ -7646,7 +9371,8 @@ def input_menu_choice(prompt: str) -> str:
 
 
 def run() -> None:
-    if not ensure_runtime_dependencies():
+    _deps_ok = ensure_runtime_dependencies()
+    if not _deps_ok:
         return
     migrate_legacy_storage_if_needed()
     setup_first_time_preferences()
