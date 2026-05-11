@@ -97,6 +97,9 @@ WHISPER_PRE_MIN_SPEECH_MS = 50
 WHISPER_PRE_MAX_INTERNAL_SILENCE_SEC = 1.25
 WHISPER_PRE_KEEP_INTERNAL_SILENCE_SEC = 0.35
 WHISPER_TRANSCRIBE_CHUNK_SEC = 8 * 60
+# OpenAI Whisper multipart limit is ~25 MiB total; keep each mono int16 chunk smaller than that.
+WHISPER_SAFE_CHUNK_PCM_BYTES = 20 * 1024 * 1024
+WHISPER_SKIP_SINGLE_FILE_BYTES = 22 * 1024 * 1024
 WHISPER_TRANSCRIBE_PROMPT_CHAR_LIMIT = 600
 # Hover tooltips: narrow wrap → shorter line length, more lines (taller block).
 TOOLTIP_WRAP_PX = 220
@@ -1745,14 +1748,26 @@ def prepare_wav_path_for_whisper(source: Path) -> Tuple[Path, Optional[str], Opt
     return tmp, None, tmp
 
 
+
+
 def _transcribe_audio_openai_single(
     file_path: Path,
     language: Optional[str],
     *,
     prompt: Optional[str] = None,
     temperature: float = 0.0,
+    progress: Optional[Callable[[int], None]] = None,
 ) -> str:
     """Single-request Whisper upload. Caller handles retries/fallback strategy."""
+
+    def _pg(p: int) -> None:
+        if progress is not None:
+            try:
+                progress(min(100, max(0, int(p))))
+            except Exception:
+                pass
+
+    _pg(10)
     boundary = uuid.uuid4().hex.encode("ascii")
     crlf = b"\r\n"
     body_chunks: List[bytes] = []
@@ -1768,6 +1783,7 @@ def _transcribe_audio_openai_single(
     if not api_key:
         return "OPENAI_API_KEY is not set. Use TOKEN ADD in the main menu or set the environment variable."
 
+    _pg(14)
     add_field("model", "whisper-1")
     if language:
         add_field("language", language)
@@ -1775,17 +1791,14 @@ def _transcribe_audio_openai_single(
         add_field("prompt", prompt.strip()[:WHISPER_TRANSCRIBE_PROMPT_CHAR_LIMIT])
     add_field("temperature", str(temperature))
 
-    filename = upload_path.name
+    _pg(22)
+    filename = file_path.name
     try:
-        audio_bytes = upload_path.read_bytes()
+        audio_bytes = file_path.read_bytes()
     except OSError as exc:
-        if temp_upload is not None:
-            try:
-                temp_upload.unlink(missing_ok=True)
-            except OSError:
-                pass
         return f"Could not read audio file: {exc}"
 
+    _pg(30)
     body_chunks.append(b"--" + boundary + crlf)
     body_chunks.append(
         f'Content-Disposition: form-data; name="file"; filename="{filename}"'.encode("utf-8")
@@ -1796,6 +1809,7 @@ def _transcribe_audio_openai_single(
     body_chunks.append(b"--" + boundary + b"--" + crlf)
     body = b"".join(body_chunks)
 
+    _pg(38)
     req = request.Request(
         OPENAI_TRANSCRIPTION_URL,
         data=body,
@@ -1808,14 +1822,18 @@ def _transcribe_audio_openai_single(
 
     try:
         with request.urlopen(req, timeout=120) as response:
-            raw = response.read().decode("utf-8")
+            raw_bytes = response.read()
+        _pg(76)
+        raw = raw_bytes.decode("utf-8")
     except error.HTTPError as exc:
+        _pg(50)
         try:
             details = exc.read().decode("utf-8")
         except Exception:
             details = str(exc)
         result = f"Whisper API error ({exc.code}): {details}"
     except Exception as exc:
+        _pg(50)
         result = f"Whisper request failed: {exc}"
     else:
         try:
@@ -1823,10 +1841,13 @@ def _transcribe_audio_openai_single(
             text = parsed.get("text")
             if isinstance(text, str):
                 result = text.strip()
+                _pg(94)
             else:
                 result = "Whisper returned an unexpected response format."
+                _pg(88)
         except json.JSONDecodeError:
             result = "Whisper returned invalid JSON."
+            _pg(88)
 
     return result
 
@@ -1843,8 +1864,43 @@ def _whisper_context_too_long_error(text: str) -> bool:
         "reduce the length",
         "request too large",
         "payload too large",
+        "content size limit",
+        "maximum content size",
+        "26214400",
+        "413",
+        "entity too large",
     )
     return any(m in needle for m in markers)
+
+
+def _is_likely_api_error_message_global(text: str) -> bool:
+    """Module-level variant used by non-UI helpers (UI also defines its own)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    prefixes = (
+        "OPENAI_API_KEY",
+        "ChatGPT API error",
+        "Failed to contact ChatGPT",
+        "ChatGPT returned",
+        "No response received",
+        "Whisper API error",
+        "Whisper request failed",
+        "Whisper returned",
+        "Could not read audio file",
+        "Recording needs optional packages",
+        "No speech detected",
+        "Empty audio.",
+    )
+    return any(t.startswith(p) for p in prefixes)
+
+
+def whisper_chunk_duration_sec(sample_rate: int) -> int:
+    """Seconds of mono int16 audio per chunk so WAV uploads stay under Whisper size limits."""
+    rate = max(1, int(sample_rate))
+    pcm_bps = 2 * rate
+    max_sec_budget = int(WHISPER_SAFE_CHUNK_PCM_BYTES // pcm_bps)
+    return max(45, min(WHISPER_TRANSCRIBE_CHUNK_SEC, max_sec_budget))
 
 
 def _transcribe_audio_openai_chunked(
@@ -1853,22 +1909,44 @@ def _transcribe_audio_openai_chunked(
     *,
     prompt: Optional[str] = None,
     temperature: float = 0.0,
+    progress: Optional[Callable[[int], None]] = None,
 ) -> str:
     """Fallback for oversized uploads/context: split WAV and merge partial transcripts."""
+
+    def _pg(p: int) -> None:
+        if progress is not None:
+            try:
+                progress(min(100, max(0, int(p))))
+            except Exception:
+                pass
+
+    _pg(12)
     mono, rate, read_err = _read_wav_mono_int16(file_path)
     if read_err is not None or mono is None:
         return _transcribe_audio_openai_single(
-            file_path, language, prompt=prompt, temperature=temperature
+            file_path,
+            language,
+            prompt=prompt,
+            temperature=temperature,
+            progress=progress,
         )
-    chunk_samples = max(int(rate * WHISPER_TRANSCRIBE_CHUNK_SEC), 1)
+    chunk_sec = whisper_chunk_duration_sec(int(rate))
+    chunk_samples = max(int(rate * chunk_sec), 1)
     if int(mono.shape[0]) <= chunk_samples:
         return _transcribe_audio_openai_single(
-            file_path, language, prompt=prompt, temperature=temperature
+            file_path,
+            language,
+            prompt=prompt,
+            temperature=temperature,
+            progress=progress,
         )
 
     transcripts: List[str] = []
     sample_count = int(mono.shape[0])
-    for start in range(0, sample_count, chunk_samples):
+    chunk_starts = list(range(0, sample_count, chunk_samples))
+    n_chunks = max(len(chunk_starts), 1)
+    _pg(18)
+    for ci, start in enumerate(chunk_starts):
         end = min(start + chunk_samples, sample_count)
         part = mono[start:end]
         if int(part.shape[0]) < 1:
@@ -1881,18 +1959,24 @@ def _transcribe_audio_openai_chunked(
             if werr is not None:
                 return f"Could not write chunked audio: {werr}"
             chunk_result = _transcribe_audio_openai_single(
-                tmp, language, prompt=prompt, temperature=temperature
+                tmp,
+                language,
+                prompt=prompt,
+                temperature=temperature,
+                progress=None,
             ).strip()
         finally:
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
-        if _is_likely_api_error_message(chunk_result):
+        if _is_likely_api_error_message_global(chunk_result):
             return chunk_result
         if chunk_result:
             transcripts.append(chunk_result)
+        _pg(22 + int(72 * (ci + 1) / n_chunks))
     merged = " ".join(t for t in transcripts if t.strip()).strip()
+    _pg(97)
     if merged:
         return merged
     return "Whisper returned empty text."
@@ -1904,19 +1988,60 @@ def transcribe_audio_openai(
     *,
     prompt: Optional[str] = None,
     temperature: float = 0.0,
+    progress: Optional[Callable[[int], None]] = None,
 ) -> str:
     """Send local audio to Whisper with fallback for long context/uploads."""
+    last_pct = [0]
+
+    def _p(pct: int) -> None:
+        v = min(100, max(0, int(pct)))
+        if v < last_pct[0]:
+            v = last_pct[0]
+        else:
+            last_pct[0] = v
+        if progress is not None:
+            try:
+                progress(v)
+            except Exception:
+                pass
+
+    _p(2)
     upload_path, prep_err, temp_upload = prepare_wav_path_for_whisper(file_path)
     if prep_err is not None:
         return prep_err
+    _p(6)
     try:
+        upl_sz = 0
+        try:
+            upl_sz = int(upload_path.stat().st_size)
+        except OSError:
+            pass
+        if upl_sz >= WHISPER_SKIP_SINGLE_FILE_BYTES:
+            _p(10)
+            return _transcribe_audio_openai_chunked(
+                upload_path,
+                language,
+                prompt=prompt,
+                temperature=temperature,
+                progress=_p,
+            )
         first_try = _transcribe_audio_openai_single(
-            upload_path, language, prompt=prompt, temperature=temperature
+            upload_path,
+            language,
+            prompt=prompt,
+            temperature=temperature,
+            progress=_p,
         )
         if _whisper_context_too_long_error(first_try):
+            _p(92)
             return _transcribe_audio_openai_chunked(
-                upload_path, language, prompt=prompt, temperature=temperature
+                upload_path,
+                language,
+                prompt=prompt,
+                temperature=temperature,
+                progress=_p,
             )
+        _p(99)
         return first_try
     finally:
         if temp_upload is not None:
@@ -1942,6 +2067,30 @@ def archive_journal_recording(wav_path: Path) -> Optional[Path]:
                 continue
             shutil.copy2(wav_path, dest)
             return dest.resolve()
+    except OSError:
+        return None
+
+
+def latest_archived_journal_wav() -> Optional[Path]:
+    """Newest journal clip in ``RECORDING_DIR`` (``rcd*.wav`` by modification time), or ``None``."""
+    try:
+        if not RECORDING_DIR.is_dir():
+            return None
+        best_mtime: float = -1.0
+        best_path: Optional[Path] = None
+        for p in RECORDING_DIR.iterdir():
+            if not p.is_file() or p.suffix.lower() != ".wav":
+                continue
+            if not p.stem.lower().startswith("rcd"):
+                continue
+            try:
+                mtime = float(p.stat().st_mtime)
+            except OSError:
+                continue
+            if mtime > best_mtime:
+                best_mtime = mtime
+                best_path = p.resolve()
+        return best_path
     except OSError:
         return None
 
@@ -2280,23 +2429,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     def th() -> JournalWindowThemeSpec:
         return theme_holder[0]
 
-    # region agent log
-    def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
-        try:
-            payload = {
-                "sessionId": "8dd4b6",
-                "runId": run_id,
-                "hypothesisId": hypothesis_id,
-                "location": location,
-                "message": message,
-                "data": data,
-                "timestamp": int(time.time() * 1000),
-            }
-            with open("debug-8dd4b6.log", "a", encoding="utf-8") as _f:
-                _f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-    # endregion
 
     t_init = th()
     root.configure(bg=t_init.surface)
@@ -2393,7 +2525,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     root.attributes("-topmost", True)
     root.after(250, lambda: root.attributes("-topmost", False))
     root.focus_force()
-    is_edit_mode = bool(edit_target_sheet and edit_target_row > 0)
+    # Mutable so console commands (like editprev) can toggle edit mode in-place.
+    is_edit_mode = {"v": bool(edit_target_sheet and edit_target_row > 0)}
 
     shell = tk.Frame(root, bg=t_init.surface, bd=0, highlightthickness=0)
     shell.pack(fill="both", expand=True)
@@ -2473,19 +2606,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             "console": console_page,
             "settings": settings_page,
         }
-        # region agent log
-        _debug_log(
-            "pre-fix",
-            "H1",
-            "daily_logger.py:show_page",
-            "show_page invoked",
-            {
-                "page_key": page_key,
-                "active_before": active_page["key"],
-                "overlay_exists": bool(startup_overlay.winfo_exists()),
-            },
-        )
-        # endregion
         if page_key == "console":
             _clear_console_hint()
         frame = page_map.get(page_key, journal_page)
@@ -2621,18 +2741,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 for btn in page_toggle_buttons:
                     _place_page_toggle(btn)
                 restore_key = nav_restore_page.get("key", "journal")
-                # region agent log
-                _debug_log(
-                    "pre-fix",
-                    "H2",
-                    "daily_logger.py:set_nav_visible._on_expand_done",
-                    "nav expand done restore key",
-                    {
-                        "restore_key": restore_key,
-                        "active_before_restore": active_page["key"],
-                    },
-                )
-                # endregion
                 if restore_key in ("journal", "ai_recap", "chatbot", "console", "settings"):
                     show_page(restore_key)
 
@@ -2725,7 +2833,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         time_entry.insert(0, current_now.strftime("%I:%M%p").lstrip("0"))
         save_draft()
     _ut_bg, _ut_fg, _ut_abg, _ut_afg = t_init.toolbar_btn_config()
-    _uth_bg, _uth_fg = t_init.toolbar_hover()
     update_time_btn = tk.Button(
         top,
         text="Update Time",
@@ -4049,6 +4156,184 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 cursor="arrow",
             )
 
+    def load_latest_entry_into_current_journal(values: Dict[str, object]) -> None:
+        """
+        Load an existing journal record into the currently visible journal text boxes.
+
+        Used by the GUI console command `JS -> EDITPREV` so we don't open a new journal editor window.
+        """
+        nonlocal edit_target_sheet, edit_target_row
+        # Journal console helpers pass keys from `get_latest_journal_entry_for_edit()`.
+        edit_target_sheet = str(values.get("sheet_name", "") or "")
+        try:
+            edit_target_row = int(values.get("row_index", 0) or 0)
+        except (TypeError, ValueError):
+            edit_target_row = 0
+        is_edit_mode["v"] = bool(edit_target_sheet and edit_target_row > 0)
+
+        new_text = str(values.get("text", "") or "")
+        new_speech = str(values.get("speech_transcript", "") or "")
+        new_report = str(values.get("ai_report", "") or "")
+        new_date = str(values.get("date", "") or "")
+        new_time = str(values.get("time", "") or "")
+
+        text_box.delete("1.0", "end")
+        text_box.insert("1.0", new_text)
+        stt_box.delete("1.0", "end")
+        stt_box.insert("1.0", new_speech)
+        report_box.delete("1.0", "end")
+        report_box.insert("1.0", new_report)
+
+        # DateEntry may be `DateEntry` or `tk.Entry`; try both.
+        try:
+            date_entry.delete(0, "end")
+            date_entry.insert(0, new_date)
+        except Exception:
+            try:
+                if new_date:
+                    date_entry.set_date(new_date)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        try:
+            time_entry.delete(0, "end")
+            time_entry.insert(0, new_time)
+        except Exception:
+            pass
+
+        last_journal_wav["path"] = None
+        _set_stt_saved_path_display("")
+        stt_status.config(text="")
+        report_status.config(text="")
+        update_transcribe_ui()
+        refresh_save_entry_state()
+        try:
+            text_box.focus_set()
+        except tk.TclError:
+            pass
+
+    def load_draft_into_current_journal() -> bool:
+        """Load saved journal window draft into the current journal editor widgets."""
+        draft = load_journal_window_draft()
+        if not draft:
+            return False
+        # Drafts should not be treated as "edit existing row".
+        nonlocal edit_target_sheet, edit_target_row
+        edit_target_sheet = ""
+        edit_target_row = 0
+        is_edit_mode["v"] = False
+
+        text_box.delete("1.0", "end")
+        text_box.insert("1.0", str(draft.get("text", "") or ""))
+        stt_box.delete("1.0", "end")
+        stt_box.insert("1.0", str(draft.get("speech_transcript", "") or ""))
+        report_box.delete("1.0", "end")
+        report_box.insert("1.0", str(draft.get("ai_report", "") or ""))
+
+        draft_date = str(draft.get("date", "") or "").strip()
+        draft_time = str(draft.get("time", "") or "").strip()
+        try:
+            date_entry.delete(0, "end")
+            date_entry.insert(0, draft_date)
+        except Exception:
+            try:
+                if draft_date:
+                    date_entry.set_date(draft_date)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        try:
+            time_entry.delete(0, "end")
+            time_entry.insert(0, draft_time)
+        except Exception:
+            pass
+
+        last_journal_wav["path"] = None
+        _set_stt_saved_path_display("")
+        stt_status.config(text="")
+        report_status.config(text="")
+        update_transcribe_ui()
+        refresh_save_entry_state()
+        try:
+            text_box.focus_set()
+        except tk.TclError:
+            pass
+        return True
+
+    def start_new_journal(discard_without_confirm: bool = False) -> bool:
+        """
+        Clear the current journal editor widgets to start a fresh page.
+        If there is unsaved content, ask for confirmation unless `discard_without_confirm` is True.
+        """
+        if recording_ui_busy["v"] or transcribing_busy["v"]:
+            messagebox.showinfo(
+                "New Journal",
+                "Finish recording/transcribing before starting a new journal.",
+            )
+            return False
+
+        has_content = any(
+            [
+                text_box.get("1.0", "end-1c").strip(),
+                stt_box.get("1.0", "end-1c").strip(),
+                report_box.get("1.0", "end-1c").strip(),
+            ]
+        )
+
+        should_discard = True
+        if has_content and not discard_without_confirm:
+            should_discard = messagebox.askyesno(
+                "Start new journal",
+                "Discard the current journal editor content and clear the saved draft? ",
+            )
+        if not should_discard:
+            return False
+
+        # Clear stored draft so we don't immediately bring it back from disk.
+        try:
+            clear_journal_window_draft()
+        except Exception:
+            pass
+
+        # Reset editor state.
+        edit_target_sheet = ""
+        edit_target_row = 0
+        is_edit_mode["v"] = False
+        last_journal_wav["path"] = None
+        _set_stt_saved_path_display("")
+        stt_status.config(text="")
+        report_status.config(text="")
+        transcribing_progress["v"] = 0
+
+        text_box.delete("1.0", "end")
+        stt_box.delete("1.0", "end")
+        report_box.delete("1.0", "end")
+
+        # Reset date/time to now.
+        now = datetime.now()
+        current_now_date = now.strftime("%m/%d/%Y")
+        current_now_time = now.strftime("%I:%M%p").lstrip("0")
+        try:
+            date_entry.delete(0, "end")
+            date_entry.insert(0, current_now_date)
+        except Exception:
+            try:
+                date_entry.set_date(current_now_date)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        try:
+            time_entry.delete(0, "end")
+            time_entry.insert(0, current_now_time)
+        except Exception:
+            pass
+
+        update_transcribe_ui()
+        refresh_save_entry_state()
+
+        try:
+            text_box.focus_set()
+        except tk.TclError:
+            pass
+        return True
+
     record_stop = threading.Event()
     record_pause = threading.Event()
     record_thread_holder: Dict[str, object] = {"thread": None}
@@ -4056,6 +4341,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     recording_ui_busy = {"v": False}
     last_journal_wav: Dict[str, Optional[Path]] = {"path": None}
     transcribing_busy = {"v": False}
+    transcribing_progress: Dict[str, int] = {"v": 0}
     wave_lock = threading.Lock()
     wave_holder: Dict[str, List[float]] = {"levels": []}
     wave_gate: Dict[str, Any] = {"rms": 0.0}
@@ -4149,8 +4435,22 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 disabledforeground=tb[4],
             )
             return
+        if recording_ui_busy["v"]:
+            tb = t.transcribe_idle_disabled_config()
+            transcribe_btn.config(
+                state="disabled",
+                width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+                bg=tb[0],
+                fg=tb[1],
+                activebackground=tb[2],
+                activeforeground=tb[3],
+                disabledforeground=tb[4],
+            )
+            return
         p = last_journal_wav.get("path")
-        if p is not None and isinstance(p, Path) and p.exists():
+        has_session = p is not None and isinstance(p, Path) and p.exists()
+        has_archived = latest_archived_journal_wav() is not None
+        if has_session or has_archived:
             bg, fg, abg, afg = t.side_action_config()
             transcribe_btn.config(
                 state="normal",
@@ -4174,37 +4474,122 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     def transcribe_tooltip_text() -> str:
         if transcribing_busy["v"]:
-            return "Transcribing…"
+            pct = int(transcribing_progress.get("v", 0))
+            return (
+                f"Transcribing… ({pct}%)\n"
+                "Uses a small amount of API cost."
+            )
+        if recording_ui_busy["v"]:
+            return "Finish recording before transcribing"
         p = last_journal_wav.get("path")
-        if p is None or not isinstance(p, Path) or not p.exists():
-            return "Record an audio first"
+        if p is not None and isinstance(p, Path) and p.exists():
+            return (
+                "Transcribe previous recording to text.\n"
+                "Uses a small amount of API cost."
+            )
+        if latest_archived_journal_wav() is not None:
+            return (
+                "Transcribe the most recent saved recording in your Recording folder.\n"
+                "You will be asked to confirm before it is sent.\n"
+                "Uses a small amount of API cost."
+            )
         return (
-            "Transcribe previous recording to text.\n"
-            "Uses a small amount of API cost."
+            "No recording available. Record audio first, or add rcd*.wav files under:\n"
+            f"{RECORDING_DIR}"
         )
 
     def run_transcribe() -> None:
-        p = last_journal_wav.get("path")
-        if p is None or not isinstance(p, Path) or not p.exists():
-            return
         if transcribing_busy["v"]:
             return
+        p = last_journal_wav.get("path")
+        cleared_stale_cache = False
+        if p is not None and isinstance(p, Path) and not p.exists():
+            last_journal_wav["path"] = None
+            cleared_stale_cache = True
+            update_transcribe_ui()
+            p = None
+        if p is not None and isinstance(p, Path) and p.exists():
+            use_path = p
+        else:
+            archived = latest_archived_journal_wav()
+            if archived is None:
+                messagebox.showinfo(
+                    "Speech to text",
+                    "No recording is available. Record audio first, or save a journal recording "
+                    f"to your Recording folder:\n{RECORDING_DIR}",
+                )
+                return
+            if cleared_stale_cache:
+                use_path = archived
+                last_journal_wav["path"] = archived
+            elif not messagebox.askyesno(
+                "Speech to text",
+                "There is no recording from this session.\n\n"
+                "Would you like to transcribe the most recent saved file in your Recording folder?\n\n"
+                f"{archived.name}",
+            ):
+                return
+            else:
+                use_path = archived
+                last_journal_wav["path"] = archived
+        if not use_path.exists():
+            last_journal_wav["path"] = None
+            alt = latest_archived_journal_wav()
+            if alt is None:
+                messagebox.showinfo(
+                    "Speech to text",
+                    "That recording file is no longer on disk. There are no other saved "
+                    f"recordings in:\n{RECORDING_DIR}",
+                )
+                update_transcribe_ui()
+                return
+            use_path = alt
+            last_journal_wav["path"] = alt
         if not get_openai_api_key():
             messagebox.showerror(
                 "Speech to text",
                 "No OpenAI API key. Use TOKEN ADD in the main menu or set OPENAI_API_KEY.",
             )
             return
+        transcribing_progress["v"] = 0
+
+        def schedule_progress(pct: int) -> None:
+            p = min(100, max(0, int(pct)))
+            transcribing_progress["v"] = p
+
+            def _ui() -> None:
+                try:
+                    stt_status.config(text=f"Transcribing… ({p}%)")
+                except tk.TclError:
+                    pass
+
+            root.after(0, _ui)
+
         transcribing_busy["v"] = True
         update_transcribe_ui()
-        stt_status.config(text="Transcribing…")
+        schedule_progress(0)
         lang_snap = _language_code_for_whisper()
 
         def work() -> None:
-            result = transcribe_audio_openai(p, lang_snap, temperature=0.0)
+            result = ""
+            try:
+                result = transcribe_audio_openai(
+                    use_path,
+                    lang_snap,
+                    temperature=0.0,
+                    progress=schedule_progress,
+                )
+            except BaseException as _tw_exc:
+                result = f"Whisper request failed: {_tw_exc}"
+            finally:
+                try:
+                    schedule_progress(100)
+                except Exception:
+                    pass
 
             def done() -> None:
                 transcribing_busy["v"] = False
+                transcribing_progress["v"] = 0
                 update_transcribe_ui()
                 stt_status.config(text="")
                 if _is_likely_api_error_message(result):
@@ -4230,8 +4615,13 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         if transcribing_busy["v"]:
             b0, b1, b2, b3, b4 = t.transcribe_busy_config()
             return ("disabled", b0, b1, b2, b3)
+        if recording_ui_busy["v"]:
+            b0, b1, b2, b3, b4 = t.transcribe_idle_disabled_config()
+            return ("disabled", b0, b1, b2, b3)
         p = last_journal_wav.get("path")
-        if p is not None and isinstance(p, Path) and p.exists():
+        if (p is not None and isinstance(p, Path) and p.exists()) or (
+            latest_archived_journal_wav() is not None
+        ):
             return t.side_action_bind_rest()
         b0, b1, b2, b3, b4 = t.transcribe_idle_disabled_config()
         return ("disabled", b0, b1, b2, b3)
@@ -4242,6 +4632,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         lambda: th().hover_primary,
         lambda: "white",
     )
+    update_transcribe_ui()
     wave_canvas.bind("<Configure>", lambda _e: redraw_waveform_canvas())
     wave_canvas.after(80, redraw_waveform_canvas)
 
@@ -4604,7 +4995,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             messagebox.showerror("Journal Window", "Invalid time. Example: 2:03PM")
             return
         text_value = text_box.get("1.0", "end-1c").strip()
-        if not text_value and is_edit_mode:
+        if not text_value and is_edit_mode["v"]:
             should_delete = messagebox.askyesno(
                 "Clear Entry",
                 "Text is empty. Saving now will delete the previous entry. Are you sure?",
@@ -4687,6 +5078,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     console_hist_index = {"value": 0}
     prefs_for_console = load_preferences()
     console_app_name = {"value": prefs_for_console.get("app_name", "Daily Logger") or "Daily Logger"}
+    # GUI console "JS" state: when user types JS, we enter a non-freezing sub-mode.
+    js_gui_state: Dict[str, object] = {"active": False}
 
     def console_append(text: str) -> None:
         if not text:
@@ -4708,6 +5101,158 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             console_history.append(raw)
         console_hist_index["value"] = len(console_history)
         cmd = raw.upper()
+        if bool(js_gui_state.get("active")):
+            # First token after JS is treated as "journal_settings_menu" choice.
+            # This mirrors the old CLI menu, but stays non-blocking for the Tk GUI.
+            try:
+                choice = raw.strip()
+                choice_key = choice.upper()
+                help_text = (
+                    "Journal settings:\n"
+                    "  WINDOW               - open window editor\n"
+                    "  CONSOLE              - type journal text in console\n"
+                    "  EDITPREV             - edit latest entry in window\n"
+                    "  DP                   - delete latest entry\n"
+                    "  RESTORE              - reopen latest unsaved draft\n"
+                    "  HELP                 - show this list\n"
+                    "  Enter                - return to main menu\n"
+                    "  DEFAULT WINDOWS     - set preferred journal input to window\n"
+                    "  DEFAULT CONSOLE      - set preferred journal input to console"
+                )
+                if is_enter_equivalent(choice_key) or not choice:
+                    js_gui_state["active"] = False
+                    console_append("JS menu closed.")
+                    return
+                if choice_key == "HELP":
+                    console_append(help_text)
+                    return
+                if choice_key in ("W", "WINDOW", "WINDOWS"):
+                    js_gui_state["active"] = False
+                    show_page("journal")
+                    open_journal_window_editor()
+                    console_append("Opened Journal window editor.")
+                    return
+                if choice_key in ("C", "CONSOLE", "CONSOLE", "COINSOLE"):
+                    # Multi-step: typed note + date/time.
+                    js_gui_state["active"] = False
+                    show_page("journal")
+                    typed_note = _ask_typed_note_gui(root)
+                    if typed_note is None:
+                        console_append("Journal CONSOLE cancelled.")
+                        return
+                    dt = ask_entry_date_time_gui(root)
+                    if dt is None:
+                        console_append("Journal date/time cancelled.")
+                        return
+                    date_value, time_value = dt
+                    append_row(MODULES["J"], [date_value, time_value, typed_note, "", ""])
+                    console_append(f'Journal saved to: {DATA_DIR / MODULES["J"].workbook_name}')
+                    return
+                if choice_key in ("EDITPREV", "EDIT PREV", "EDIT PREVIOUS", "OPENPREV", "OPEN PREV", "OPENPREVIOUS", "OPEN PREVIOUS"):
+                    js_gui_state["active"] = False
+                    show_page("journal")
+                    latest = get_latest_journal_entry_for_edit()
+                    if not latest:
+                        console_append("No previous journal entry found to edit.")
+                        return
+                    try:
+                        load_latest_entry_into_current_journal(latest)
+                        console_append("Loaded latest journal entry into current textbox (edit mode on).")
+                    except Exception as exc:
+                        console_append(f"EDITPREV failed: {exc}")
+                    return
+                if choice_key == "DP":
+                    js_gui_state["active"] = False
+                    show_page("journal")
+                    latest = get_latest_journal_entry_for_delete()
+                    if not latest:
+                        console_append("No previous journal entry found to delete.")
+                        return
+                    date_label = str(latest.get("date", "")).strip() or "(unknown date)"
+                    time_label = str(latest.get("time", "")).strip() or "(unknown time)"
+                    if messagebox.askyesno(
+                        "Delete previous journal entry",
+                        f"Delete previous journal entry at {date_label} {time_label}?",
+                    ):
+                        delete_latest_journal_entry()
+                        console_append("Deleted previous journal entry.")
+                    else:
+                        console_append("Delete cancelled.")
+                    return
+                if choice_key == "RESTORE":
+                    js_gui_state["active"] = False
+                    show_page("journal")
+                    draft = load_journal_window_draft()
+                    if not draft:
+                        console_append("No journal draft to restore.")
+                        return
+                    open_journal_window_editor(draft)
+                    console_append("Restored draft opened.")
+                    return
+                if choice_key in ("DEFAULT WINDOWS", "DEFAULT CONSOLE"):
+                    js_gui_state["active"] = False
+                    show_page("journal")
+                    prefs = load_preferences()
+                    default_mode = "windows" if choice_key == "DEFAULT WINDOWS" else "console"
+                    prefs["journal_input_default"] = default_mode
+                    if save_preferences(prefs):
+                        console_append(f"Default set to {default_mode}.")
+                    else:
+                        console_append("Could not save default journal input preference.")
+                    return
+                if choice_key == "J":
+                    js_gui_state["active"] = False
+                    show_page("journal")
+                    console_append("Switched to Journal page.")
+                    return
+                console_append("Unknown JS choice. Type HELP for options.")
+            except Exception as exc:
+                console_append(f"JS menu error: {exc}")
+            return
+
+        # Non-JS direct commands in GUI console:
+        # - RESTORE: load saved journal draft into the existing editor widgets
+        # - EDITPREV/OPENPREV: load latest journal entry into the existing editor widgets
+        if cmd in {"RESTORE"}:
+            js_gui_state["active"] = False
+            show_page("journal")
+            ok = load_draft_into_current_journal()
+            if not ok:
+                console_append("No journal draft to restore.")
+            else:
+                console_append("Restored draft into current journal textbox.")
+            return
+        if cmd in {"EDITPREV", "EDIT PREV", "EDIT PREVIOUS", "OPENPREV", "OPEN PREV", "OPEN PREVIOUS"}:
+            js_gui_state["active"] = False
+            show_page("journal")
+            latest = get_latest_journal_entry_for_edit()
+            if not latest:
+                console_append("No previous journal entry found to edit.")
+                return
+            load_latest_entry_into_current_journal(latest)
+            console_append("Loaded latest journal entry into current textbox (edit mode on).")
+            return
+        if cmd in {"NEW", "NEW JOURNAL"}:
+            js_gui_state["active"] = False
+            show_page("journal")
+            ok = start_new_journal()
+            if ok:
+                console_append("Started new journal. Editor cleared.")
+            else:
+                console_append("New journal cancelled.")
+            return
+        # Prevent GUI freeze: "JS" triggers an interactive CLI prompt (`input()`),
+        # which can block the Tk main thread.
+        # GUI version uses Tk dialogs instead of ``input()``.
+        if cmd in {"J SETTINGS", "J SETTING", "JOURNAL SETTINGS", "JS"}:
+            show_page("journal")
+            js_gui_state["active"] = True
+            console_append("JS menu opened. Type HELP for available choices, then submit one choice.")
+            console_append(
+                "Journal settings: "
+                "WINDOW | CONSOLE | EDITPREV | DP | RESTORE | DEFAULT WINDOWS | DEFAULT CONSOLE | HELP"
+            )
+            return
         if cmd in {"J", "JOURNAL", "WINDOW"}:
             show_page("journal")
             console_append("Switched to Journal page.")
@@ -4789,7 +5334,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             _set_console_placeholder()
 
     def _console_entry_keypress(evt: Optional[Any] = None) -> Optional[str]:
-        if evt is None or not console_entry_state["placeholder"]:
+        if evt is None:
+            return None
+        if not console_entry_state["placeholder"]:
             return None
         if evt.keysym in {"Left", "Right", "Home", "End"}:
             return "break"
@@ -5398,18 +5945,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     root.bind_all("<Button-1>", _unfocus_console_on_button_click, add="+")
     _startup_step("Finalizing UI...")
-    # region agent log
-    _debug_log(
-        "pre-fix",
-        "H3",
-        "daily_logger.py:startup",
-        "before initial journal show",
-        {
-            "active_before": active_page["key"],
-            "overlay_exists": bool(startup_overlay.winfo_exists()),
-        },
-    )
-    # endregion
     show_page("journal")
 
     def _on_escape(event=None) -> None:
@@ -5421,86 +5956,18 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     root.bind("<Escape>", _on_escape)
     root.protocol("WM_DELETE_WINDOW", on_close)
     _startup_step("Journal ready")
-    # region agent log
-    _debug_log(
-        "pre-fix",
-        "H4",
-        "daily_logger.py:startup",
-        "before overlay destroy",
-        {
-            "active_page": active_page["key"],
-            "overlay_exists": bool(startup_overlay.winfo_exists()),
-        },
-    )
-    # endregion
     startup_overlay.destroy()
     root.lift()
 
     def _background_post_init() -> None:
-        # region agent log
-        _debug_log(
-            "pre-fix",
-            "H5",
-            "daily_logger.py:_background_post_init",
-            "background init start",
-            {
-                "active_page": active_page["key"],
-                "text_box_y": int(text_box.winfo_y()),
-                "center_y": int(center.winfo_y()),
-                "top_h": int(top.winfo_height()),
-            },
-        )
-        # endregion
         _startup_step("Loading other pages...")
         set_nav_visible(True)
-        # region agent log
-        _debug_log(
-            "pre-fix",
-            "H6",
-            "daily_logger.py:_background_post_init",
-            "after set_nav_visible",
-            {
-                "active_page": active_page["key"],
-                "text_box_y": int(text_box.winfo_y()),
-                "center_y": int(center.winfo_y()),
-                "top_h": int(top.winfo_height()),
-            },
-        )
-        # endregion
         _startup_step("Starting autosave...")
         autosave()
         refresh_save_entry_state()
         _startup_step("Ready")
-        # region agent log
-        _debug_log(
-            "pre-fix",
-            "H7",
-            "daily_logger.py:_background_post_init",
-            "background init complete",
-            {
-                "active_page": active_page["key"],
-                "text_box_y": int(text_box.winfo_y()),
-                "center_y": int(center.winfo_y()),
-                "top_h": int(top.winfo_height()),
-            },
-        )
-        # endregion
 
     root.after(1, _background_post_init)
-    # region agent log
-    _debug_log(
-        "pre-fix",
-        "H8",
-        "daily_logger.py:startup",
-        "after overlay destroy before background init",
-        {
-            "active_page": active_page["key"],
-            "text_box_y": int(text_box.winfo_y()),
-            "center_y": int(center.winfo_y()),
-            "top_h": int(top.winfo_height()),
-        },
-    )
-    # endregion
     root.mainloop()
     return saved["value"]
 
@@ -5930,6 +6397,310 @@ def ask_entry_date_time() -> Optional[Tuple[str, str]]:
             print("Invalid time format. Use hh:mmAM/PM (example: 2:03PM), or rn for current time.")
 
     return date_value, time_value
+
+
+def ask_entry_date_time_gui(parent: Optional[Any] = None) -> Optional[Tuple[str, str]]:
+    """
+    GUI version of ``ask_entry_date_time()``.
+    The CLI version uses ``input()`` which freezes the Tk main thread in the GUI console.
+    """
+    if tk is None:
+        return ask_entry_date_time()
+
+    _parent = parent if parent is not None else tk._default_root  # type: ignore[attr-defined]
+    if _parent is None:
+        # Last-resort fallback: no Tk root to attach to.
+        return ask_entry_date_time()
+
+    now = datetime.now()
+    default_date = now.strftime("%m/%d/%Y")
+
+    dlg = tk.Toplevel(_parent)
+    dlg.title("Entry date & time")
+    dlg.transient(_parent)
+
+    # Make modal without blocking background threads; Tk will run its own nested event loop.
+    result: Dict[str, Optional[Tuple[str, str]]] = {"v": None}
+    dlg.grab_set()
+
+    tk.Label(dlg, text=f"Entry date (mm/dd/yyyy, Enter for today {default_date}):").pack(
+        padx=12, pady=(12, 4)
+    )
+    date_var = tk.StringVar(value=default_date)
+    date_entry = tk.Entry(dlg, textvariable=date_var, width=22)
+    date_entry.pack(padx=12, pady=(0, 8))
+
+    tk.Label(dlg, text="Entry time (example: 11:00AM, type rn for now, Enter for N/A):").pack(
+        padx=12, pady=(0, 4)
+    )
+    time_var = tk.StringVar(value="")
+    time_entry = tk.Entry(dlg, textvariable=time_var, width=22)
+    time_entry.pack(padx=12, pady=(0, 8))
+
+    def _parse_date(date_input: str) -> Optional[str]:
+        di = date_input.strip()
+        if not di:
+            return default_date
+        if di.upper() == "X":
+            return None
+        parsed_date = parse_flexible_date(di, now.year)
+        if parsed_date:
+            return parsed_date.strftime("%m/%d/%Y")
+        return None
+
+    def _parse_time(time_input: str) -> Optional[str]:
+        ti = time_input.strip()
+        if not ti:
+            return "N/A"
+        if ti.upper() == "X":
+            return None
+        if ti.lower() == "rn":
+            return datetime.now().strftime("%I:%M%p").lstrip("0")
+        normalized = ti.upper().replace(" ", "")
+        try:
+            parsed = datetime.strptime(normalized, "%I:%M%p")
+            return parsed.strftime("%I:%M%p").lstrip("0")
+        except ValueError:
+            return None
+
+    def on_ok() -> None:
+        date_input = date_var.get()
+        time_input = time_var.get()
+        parsed_date = _parse_date(date_input)
+        if parsed_date is None:
+            # "X" or invalid date -> treat X as cancel, invalid as error.
+            if date_input.strip().upper() == "X":
+                result["v"] = None
+                dlg.destroy()
+                return
+            messagebox.showerror("Invalid date", "Enter a valid date like 04/20/2026 or April 26.")
+            return
+
+        parsed_time = _parse_time(time_input)
+        if parsed_time is None:
+            if time_input.strip().upper() == "X":
+                result["v"] = None
+                dlg.destroy()
+                return
+            messagebox.showerror(
+                "Invalid time",
+                "Enter time like 11:00AM or type rn for now, or leave blank for N/A.",
+            )
+            return
+
+        result["v"] = (parsed_date, parsed_time)
+        dlg.destroy()
+
+    def on_cancel() -> None:
+        result["v"] = None
+        dlg.destroy()
+
+    btn_row = tk.Frame(dlg)
+    btn_row.pack(padx=12, pady=12)
+    tk.Button(btn_row, text="OK", command=on_ok, width=10).pack(side="left", padx=(0, 8))
+    tk.Button(btn_row, text="Cancel", command=on_cancel, width=10).pack(side="left")
+
+    dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+    # Focus defaults for quick keyboard entry.
+    try:
+        date_entry.focus_set()
+    except tk.TclError:
+        pass
+    dlg.wait_window()
+    return result["v"]
+
+
+def _ask_typed_note_gui(parent: Optional[Any] = None) -> Optional[str]:
+    if tk is None:
+        return None
+    _parent = parent if parent is not None else tk._default_root  # type: ignore[attr-defined]
+    if _parent is None:
+        return None
+    dlg = tk.Toplevel(_parent)
+    dlg.title("What happened today?")
+    dlg.transient(_parent)
+    dlg.grab_set()
+
+    result: Dict[str, Optional[str]] = {"v": None}
+    tk.Label(dlg, text="Type what happened today:").pack(padx=12, pady=(12, 4))
+    box = tk.Text(dlg, height=8, width=52)
+    box.pack(padx=12, pady=(0, 8))
+
+    def on_ok() -> None:
+        result["v"] = box.get("1.0", "end-1c").strip()
+        dlg.destroy()
+
+    def on_cancel() -> None:
+        result["v"] = None
+        dlg.destroy()
+
+    btn_row = tk.Frame(dlg)
+    btn_row.pack(padx=12, pady=12)
+    tk.Button(btn_row, text="OK", command=on_ok, width=10).pack(side="left", padx=(0, 8))
+    tk.Button(btn_row, text="Cancel", command=on_cancel, width=10).pack(side="left")
+    dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+    try:
+        box.focus_set()
+    except tk.TclError:
+        pass
+    dlg.wait_window()
+    return result["v"]
+
+
+def journal_settings_menu_gui(parent: Optional[Any] = None) -> Optional[List[str]]:
+    """
+    GUI replacement for ``journal_settings_menu()``.
+    Mirrors the same choices, but avoids blocking ``input()`` used by the CLI menu.
+    """
+    if tk is None:
+        return journal_settings_menu()
+
+    _parent = parent if parent is not None else tk._default_root  # type: ignore[attr-defined]
+    if _parent is None:
+        return journal_settings_menu()
+
+    result: Dict[str, Optional[List[str]]] = {"v": None}
+    dlg = tk.Toplevel(_parent)
+    dlg.title("Journal settings")
+    dlg.transient(_parent)
+    dlg.grab_set()
+
+    def _show_help() -> None:
+        help_text = (
+            "Journal choices:\n"
+            "  WINDOW               - open window editor\n"
+            "  CONSOLE              - type journal text in console\n"
+            "  EDITPREV             - edit latest entry in window\n"
+            "  DP                   - delete latest entry\n"
+            "  RESTORE              - reopen latest unsaved draft\n"
+            "  HELP                 - show this list\n"
+            "  Enter                - return to main menu\n"
+            "  DEFAULT WINDOWS     - set preferred journal input to window\n"
+            "  DEFAULT CONSOLE      - set preferred journal input to console\n"
+        )
+        messagebox.showinfo("Journal settings help", help_text)
+
+    tk.Label(dlg, text="Journal choice (type HELP for options):").pack(padx=12, pady=(12, 4))
+    cmd_var = tk.StringVar(value="")
+    entry = tk.Entry(dlg, textvariable=cmd_var, width=44)
+    entry.pack(padx=12, pady=(0, 10))
+
+    # For multi-step flows (CONSOLE), keep a pointer so we can close the menu once they finish.
+    def on_submit() -> None:
+        note = (cmd_var.get() or "").strip()
+        key = note.lower()
+
+        if is_enter_equivalent(note.upper()):
+            dlg.destroy()
+            return
+        if key == "help":
+            _show_help()
+            return
+
+        if key in ("c", "console", "coinsole"):
+            typed = _ask_typed_note_gui(dlg)
+            if typed is None:
+                dlg.destroy()
+                return
+            dt = ask_entry_date_time_gui(dlg)
+            if dt is None:
+                dlg.destroy()
+                return
+            date_value, time_value = dt
+            result["v"] = [date_value, time_value, typed, "", ""]
+            dlg.destroy()
+            return
+
+        if key in (
+            "editprev",
+            "edit prev",
+            "edit previous",
+            "openprev",
+            "open prev",
+            "openprevious",
+            "open previous",
+        ):
+            latest = get_latest_journal_entry_for_edit()
+            if not latest:
+                messagebox.showinfo("Edit previous", "No previous journal entry found to edit.")
+                return
+            open_journal_window_editor(
+                {
+                    "text": str(latest.get("text", "")),
+                    "speech_transcript": str(latest.get("speech_transcript", "")),
+                    "ai_report": str(latest.get("ai_report", "")),
+                    "date": str(latest.get("date", "")),
+                    "time": str(latest.get("time", "")),
+                    "images": [],
+                    "edit_target_sheet": str(latest.get("sheet_name", "")),
+                    "edit_target_row": int(latest.get("row_index", 0) or 0),
+                }
+            )
+            dlg.destroy()
+            return
+
+        if key in ("w", "window", "windows"):
+            open_journal_window_editor()
+            dlg.destroy()
+            return
+
+        if key in ("default windows", "default console"):
+            prefs = load_preferences()
+            default_mode = "windows" if key.endswith("windows") else "console"
+            prefs["journal_input_default"] = default_mode
+            if save_preferences(prefs):
+                messagebox.showinfo(
+                    "Default updated",
+                    f"Default journal input set to {default_mode}.",
+                )
+            dlg.destroy()
+            return
+
+        if key == "restore":
+            draft = load_journal_window_draft()
+            if not draft:
+                messagebox.showinfo("Restore", "No journal draft to restore.")
+                dlg.destroy()
+                return
+            open_journal_window_editor(draft)
+            dlg.destroy()
+            return
+
+        if key.upper() == "DP":
+            latest = get_latest_journal_entry_for_delete()
+            if not latest:
+                messagebox.showinfo("Delete previous", "No previous journal entry found to delete.")
+                return
+            date_label = str(latest.get("date", "")).strip() or "(unknown date)"
+            time_label = str(latest.get("time", "")).strip() or "(unknown time)"
+            should_delete = messagebox.askyesno(
+                "Delete previous journal entry",
+                f"Delete previous journal entry at {date_label} {time_label}?",
+            )
+            if should_delete:
+                delete_latest_journal_entry()
+                dlg.destroy()
+            return
+
+        messagebox.showerror("Unknown choice", "Unknown journal choice. Type HELP to see valid options.")
+
+    def on_cancel() -> None:
+        result["v"] = None
+        dlg.destroy()
+
+    entry.bind("<Return>", lambda _e: on_submit())
+    btn_row = tk.Frame(dlg)
+    btn_row.pack(padx=12, pady=(0, 12))
+    tk.Button(btn_row, text="Submit", command=on_submit, width=10).pack(side="left", padx=(0, 8))
+    tk.Button(btn_row, text="Cancel", command=on_cancel, width=10).pack(side="left")
+
+    dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+    try:
+        entry.focus_set()
+    except tk.TclError:
+        pass
+    dlg.wait_window()
+    return result["v"]
 
 
 def parse_flexible_date(raw: str, default_year: int):
@@ -6888,8 +7659,9 @@ def run() -> None:
                 ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
         except Exception:
             pass
-    draft = load_journal_window_draft()
-    open_journal_window_editor(draft if isinstance(draft, dict) else None)
+    # Do NOT auto-restore on app launch; only restore when user types `restore`.
+    # This prevents the journal editor from popping up with an old unsaved draft.
+    open_journal_window_editor(None)
 
 
 if __name__ == "__main__":
