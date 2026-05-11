@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 import base64
 import contextlib
 import ctypes
@@ -37,9 +37,10 @@ except Exception:
     messagebox = None
     ttk = None
 try:
-    from tkcalendar import DateEntry
+    from tkcalendar import Calendar, DateEntry
 except Exception:
     DateEntry = None  # type: ignore[assignment]
+    Calendar = None  # type: ignore[assignment]
 try:
     import msvcrt
 except Exception:
@@ -932,6 +933,28 @@ def build_journal_context_for_range(
             return "No journal entries available in the selected date range."
     lines = []
     for _, when_value, text in entries:
+        lines.append(f"- [{when_value}] {text}")
+    return "\n".join(lines)
+
+
+def build_journal_context_for_date_set(selected_dates: set) -> str:
+    """Build recap context from journal entries on any of the given calendar dates."""
+    if not selected_dates:
+        return "No journal entries available (no dates selected)."
+    entries = load_all_journal_entries()
+    if not entries:
+        return "No journal entries available."
+    date_set: set = set()
+    for d in selected_dates:
+        if isinstance(d, datetime):
+            date_set.add(d.date())
+        elif isinstance(d, date):
+            date_set.add(d)
+    filtered = [item for item in entries if item[0].date() in date_set]
+    if not filtered:
+        return "No journal entries available for the selected dates."
+    lines = []
+    for _, when_value, text in filtered:
         lines.append(f"- [{when_value}] {text}")
     return "\n".join(lines)
 
@@ -2440,6 +2463,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     nav_buttons: Dict[str, Any] = {}
     active_page = {"key": "journal"}
     active_page_frame: Dict[str, Any] = {"frame": None}
+    page_leave_reset_handlers: Dict[str, Callable[[], None]] = {}
 
     def _layout_console_row(frame: Any) -> None:
         frame.update_idletasks()
@@ -2473,6 +2497,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             "console": console_page,
             "settings": settings_page,
         }
+        prev_key = active_page["key"]
         # region agent log
         _debug_log(
             "pre-fix",
@@ -2491,6 +2516,10 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         frame = page_map.get(page_key, journal_page)
         frame.tkraise()
         active_page["key"] = page_key
+        if prev_key != page_key:
+            reset_fn = page_leave_reset_handlers.get(prev_key)
+            if reset_fn is not None:
+                reset_fn()
         active_page_frame["frame"] = frame
         console_row = console_input_holder.get("row")
         if console_row is not None:
@@ -3233,35 +3262,968 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     placeholder_title_labels: List[Any] = []
     placeholder_body_labels: List[Any] = []
 
-    def _build_placeholder_page(parent: Any, title: str) -> None:
-        _register_page_toggle(parent)
-        wrap = tk.Frame(parent, bg=t_init.surface)
-        wrap.pack(fill="both", expand=True, padx=28, pady=24)
-        title_lbl = tk.Label(
-            wrap,
-            text=title,
-            bg=t_init.surface,
-            fg=t_init.text,
-            font=("Segoe UI", 16, "bold"),
+    def build_ai_recap_and_chatbot_pages() -> None:
+        _register_page_toggle(ai_recap_page)
+        _register_page_toggle(chatbot_page)
+
+        t0 = t_init
+        _tb, _tf, _tab, _taf = t0.toolbar_btn_config()
+
+        # --- Shared: append styled lines to a read-only transcript ---
+        def _append_transcript(box: Any, role: str, body: str) -> None:
+            box.config(state="normal")
+            if role == "user":
+                box.insert("end", "You\n", ("t_meta",))
+                box.insert("end", (body or "").strip() + "\n\n", ("t_user",))
+            else:
+                box.insert("end", "Assistant\n", ("t_meta",))
+                box.insert("end", (body or "").strip() + "\n\n", ("t_bot",))
+            box.config(state="disabled")
+            box.see("end")
+
+        # ========== AI Recap ==========
+        recap_wrap = tk.Frame(ai_recap_page, bg=t0.surface)
+        recap_wrap.pack(fill="both", expand=True, padx=t0.pad_outer, pady=(0, t0.pad_center_y))
+        recap_wrap.grid_columnconfigure(0, weight=1)
+        recap_wrap.grid_rowconfigure(2, weight=1)
+
+        recap_title = tk.Label(
+            recap_wrap,
+            text="AI Recap",
+            bg=t0.surface,
+            fg=t0.text,
+            font=("Segoe UI", 15, "bold"),
             anchor="w",
         )
-        title_lbl.pack(anchor="w", pady=(0, 10))
-        body_lbl = tk.Label(
-            wrap,
-            text="Coming soon - this page is ready for future UI features.",
-            bg=t_init.surface,
-            fg=t_init.muted,
-            font=("Segoe UI", 11),
+        recap_title.grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        recap_top = tk.Frame(recap_wrap, bg=t0.panel, highlightthickness=1, highlightbackground=t0.border)
+        recap_top.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        for c in range(8):
+            recap_top.grid_columnconfigure(c, weight=0)
+        recap_top.grid_columnconfigure(7, weight=1)
+
+        recap_thinking_var = tk.BooleanVar(value=False)
+        recap_thinking_chk = tk.Checkbutton(
+            recap_top,
+            text="Thinking model",
+            variable=recap_thinking_var,
+            bg=t0.panel,
+            fg=t0.muted,
+            activebackground=t0.panel,
+            activeforeground=t0.text,
+            selectcolor=t0.field,
+            font=("Segoe UI", 9),
+        )
+        recap_thinking_chk.grid(row=0, column=0, padx=(10, 6), pady=8, sticky="w")
+
+        recap_to_var = tk.BooleanVar(value=False)
+        recap_to_wrap = tk.Frame(recap_top, bg=t0.panel)
+        recap_to_wrap.grid(row=0, column=1, padx=(4, 4), pady=8, sticky="w")
+        recap_to_chk = tk.Checkbutton(
+            recap_to_wrap,
+            text="To (date range)",
+            variable=recap_to_var,
+            bg=t0.panel,
+            fg=t0.muted,
+            activebackground=t0.panel,
+            activeforeground=t0.text,
+            selectcolor=t0.field,
+            font=("Segoe UI", 9),
+        )
+        recap_to_chk.pack(side="left")
+
+        recap_range_fr = tk.Frame(recap_top, bg=t0.panel)
+        recap_range_fr.grid(row=0, column=2, columnspan=4, padx=(4, 8), pady=8, sticky="w")
+        tk.Label(recap_range_fr, text="From:", bg=t0.panel, fg=t0.muted, font=("Segoe UI", 9)).pack(
+            side="left", padx=(0, 4)
+        )
+        recap_from_de: Any = None
+        recap_to_de: Any = None
+        if DateEntry is not None:
+            recap_from_de = DateEntry(
+                recap_range_fr,
+                width=12,
+                date_pattern="mm/dd/yyyy",
+                background=t0.field,
+                foreground=t0.text,
+            )
+            recap_from_de.pack(side="left", padx=(0, 10))
+            tk.Label(recap_range_fr, text="To:", bg=t0.panel, fg=t0.muted, font=("Segoe UI", 9)).pack(
+                side="left", padx=(0, 4)
+            )
+            recap_to_de = DateEntry(
+                recap_range_fr,
+                width=12,
+                date_pattern="mm/dd/yyyy",
+                background=t0.field,
+                foreground=t0.text,
+            )
+            recap_to_de.pack(side="left")
+        else:
+            tk.Label(
+                recap_range_fr,
+                text="Install tkcalendar for date range pickers.",
+                bg=t0.panel,
+                fg=t0.muted,
+                font=("Segoe UI", 9),
+            ).pack(side="left")
+
+        recap_multi_fr = tk.Frame(recap_top, bg=t0.panel)
+        recap_multi_fr.grid(row=1, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 8))
+        recap_multi_fr.grid_columnconfigure(0, weight=0)
+        recap_multi_fr.grid_columnconfigure(1, weight=1)
+
+        recap_selected_dates: set = set()
+        recap_calendar: Any = None
+        if Calendar is not None:
+            recap_calendar = Calendar(
+                recap_multi_fr,
+                selectmode="day",
+                background=t0.field,
+                foreground=t0.text,
+                headersbackground=t0.panel,
+                weekendbackground=t0.field,
+                weekendforeground=t0.muted,
+                selectbackground=t0.accent,
+                selectforeground="white",
+                bordercolor=t0.border,
+                font=("Segoe UI", 9),
+            )
+            recap_calendar.grid(row=0, column=0, sticky="nw")
+        else:
+            tk.Label(
+                recap_multi_fr,
+                text="Install tkcalendar for the multi-day calendar.",
+                bg=t0.panel,
+                fg=t0.muted,
+                font=("Segoe UI", 9),
+                wraplength=360,
+                justify="left",
+            ).grid(row=0, column=0, sticky="w")
+
+        recap_sel_lbl = tk.Label(
+            recap_multi_fr,
+            text="Selected days: (none)",
+            bg=t0.panel,
+            fg=t0.muted,
+            font=("Segoe UI", 9),
             anchor="w",
             justify="left",
         )
-        body_lbl.pack(anchor="w")
-        placeholder_frames.append(wrap)
-        placeholder_title_labels.append(title_lbl)
-        placeholder_body_labels.append(body_lbl)
+        recap_sel_lbl.grid(row=0, column=1, sticky="nw", padx=(12, 8))
 
-    _build_placeholder_page(ai_recap_page, "AI Recap")
-    _build_placeholder_page(chatbot_page, "Chatbot")
+        recap_cal_marks_tag = "recap_sel"
+
+        def recap_refresh_cal_marks() -> None:
+            if recap_calendar is None:
+                return
+            try:
+                recap_calendar.calevent_remove("all")
+            except Exception:
+                pass
+            t = th()
+            for d in recap_selected_dates:
+                try:
+                    recap_calendar.calevent_create(d, "", recap_cal_marks_tag)
+                except Exception:
+                    pass
+            try:
+                recap_calendar.tag_config(recap_cal_marks_tag, background=t.accent, foreground="white")
+            except Exception:
+                pass
+
+        def recap_update_sel_label() -> None:
+            if not recap_selected_dates:
+                recap_sel_lbl.config(text="Selected days: (none)")
+                return
+            ordered = sorted(recap_selected_dates)
+            parts = [x.strftime("%m/%d/%Y") for x in ordered]
+            recap_sel_lbl.config(text="Selected days: " + ", ".join(parts))
+
+        def recap_sync_to_checkbox() -> None:
+            if len(recap_selected_dates) > 1:
+                recap_to_chk.config(state="disabled")
+            else:
+                recap_to_chk.config(state="normal")
+
+        def recap_to_tooltip() -> str:
+            if str(recap_to_chk.cget("state")) == "disabled":
+                return (
+                    "The \"To\" range option is only available when a single day is selected "
+                    "on the calendar. Clear extra days or start over."
+                )
+            return "When checked, use From/To dates instead of multi-day calendar picks."
+
+        bind_hover_tooltip(recap_to_wrap, recap_to_tooltip)
+
+        def on_recap_calendar_toggle(_evt: Optional[Any] = None) -> None:
+            if recap_to_var.get() or recap_calendar is None:
+                return
+            try:
+                picked = recap_calendar.selection_get()
+            except Exception:
+                return
+            if picked in recap_selected_dates:
+                recap_selected_dates.remove(picked)
+            else:
+                recap_selected_dates.add(picked)
+            recap_refresh_cal_marks()
+            recap_update_sel_label()
+            recap_sync_to_checkbox()
+
+        if recap_calendar is not None:
+            recap_calendar.bind("<<CalendarSelected>>", on_recap_calendar_toggle)
+
+        def on_recap_to_mode(*_a: Any) -> None:
+            if recap_to_var.get():
+                recap_multi_fr.grid_remove()
+                recap_range_fr.grid()
+                if len(recap_selected_dates) == 1:
+                    only = next(iter(recap_selected_dates))
+                    if DateEntry is not None and recap_from_de is not None and recap_to_de is not None:
+                        try:
+                            recap_from_de.set_date(only)
+                            recap_to_de.set_date(only)
+                        except Exception:
+                            pass
+            else:
+                recap_range_fr.grid_remove()
+                recap_multi_fr.grid()
+                recap_refresh_cal_marks()
+
+        recap_to_var.trace_add("write", lambda *_: on_recap_to_mode())
+        recap_range_fr.grid_remove()
+
+        recap_session: Dict[str, Any] = {"messages": [], "bootstrapped": False, "busy": False}
+        recap_pending_images: List[Path] = []
+        recap_pending_files: List[Path] = []
+
+        recap_mid = tk.Frame(recap_wrap, bg=t0.surface)
+        recap_mid.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+        recap_mid.grid_rowconfigure(0, weight=1)
+        recap_mid.grid_columnconfigure(0, weight=1)
+
+        recap_transcript = tk.Text(
+            recap_mid,
+            wrap="word",
+            state="disabled",
+            font=("Segoe UI", 10),
+            bg=t0.field,
+            fg=t0.text,
+            insertbackground=t0.text,
+            relief="flat",
+            padx=12,
+            pady=12,
+            highlightthickness=1,
+            highlightbackground=t0.border,
+            highlightcolor=t0.accent,
+        )
+        recap_ts = tk.Scrollbar(
+            recap_mid,
+            command=recap_transcript.yview,
+            bg=t0.panel,
+            troughcolor=t0.field,
+            activebackground=t0.accent,
+            bd=0,
+            highlightthickness=0,
+            width=11,
+        )
+        recap_transcript.configure(yscrollcommand=recap_ts.set)
+        recap_transcript.grid(row=0, column=0, sticky="nsew")
+        recap_ts.grid(row=0, column=1, sticky="ns")
+        recap_transcript.tag_configure("t_meta", foreground=t0.muted, font=("Segoe UI", 9, "bold"))
+        recap_transcript.tag_configure("t_user", foreground=t0.text, font=("Segoe UI", 10))
+        recap_transcript.tag_configure("t_bot", foreground=t0.text, font=("Segoe UI", 10))
+
+        recap_attach_row = tk.Frame(recap_wrap, bg=t0.surface)
+        recap_attach_row.grid(row=3, column=0, sticky="ew", pady=(0, 4))
+        recap_pending_lbl = tk.Label(
+            recap_attach_row,
+            text="Attachments: none",
+            bg=t0.surface,
+            fg=t0.muted,
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        recap_pending_lbl.pack(side="left", fill="x", expand=True)
+
+        def recap_refresh_pending_lbl() -> None:
+            bits = []
+            if recap_pending_images:
+                bits.append(f"{len(recap_pending_images)} image(s)")
+            if recap_pending_files:
+                bits.append(f"{len(recap_pending_files)} file(s)")
+            recap_pending_lbl.config(text="Attachments: " + (", ".join(bits) if bits else "none"))
+
+        def recap_pick_image() -> None:
+            p = filedialog.askopenfilename(
+                title="Attach image",
+                filetypes=[
+                    ("Images", "*.png *.jpg *.jpeg *.gif *.webp"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if p:
+                recap_pending_images.append(Path(p))
+                recap_refresh_pending_lbl()
+
+        def recap_pick_file() -> None:
+            p = filedialog.askopenfilename(title="Attach file", filetypes=[("Text / data", "*.*")])
+            if p:
+                recap_pending_files.append(Path(p))
+                recap_refresh_pending_lbl()
+
+        recap_img_btn = tk.Button(
+            recap_attach_row,
+            text="Image",
+            command=recap_pick_image,
+            bg=_tb,
+            fg=_tf,
+            activebackground=_tab,
+            activeforeground=_taf,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        recap_img_btn.pack(side="right", padx=(6, 0))
+        recap_file_btn = tk.Button(
+            recap_attach_row,
+            text="File",
+            command=recap_pick_file,
+            bg=_tb,
+            fg=_tf,
+            activebackground=_tab,
+            activeforeground=_taf,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        recap_file_btn.pack(side="right", padx=(6, 0))
+
+        recap_bottom = tk.Frame(recap_wrap, bg=t0.panel, highlightthickness=1, highlightbackground=t0.border)
+        recap_bottom.grid(row=4, column=0, sticky="ew", pady=(0, 0))
+        recap_bottom.grid_columnconfigure(0, weight=1)
+
+        recap_input = tk.Text(
+            recap_bottom,
+            height=3,
+            wrap="word",
+            font=("Segoe UI", 10),
+            bg=t0.field,
+            fg=t0.text,
+            insertbackground=t0.text,
+            relief="flat",
+            padx=10,
+            pady=8,
+            highlightthickness=0,
+        )
+        recap_input.grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=8)
+
+        recap_btn_fr = tk.Frame(recap_bottom, bg=t0.panel)
+        recap_btn_fr.grid(row=0, column=1, sticky="ns", padx=(4, 8), pady=8)
+
+        recap_send_btn = tk.Button(
+            recap_btn_fr,
+            text="Send",
+            bg=t0.accent,
+            fg="white",
+            activebackground=t0.hover_primary,
+            activeforeground="white",
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=14,
+            pady=8,
+            cursor="hand2",
+        )
+        recap_send_btn.pack(fill="x", pady=(0, 6))
+        recap_new_btn = tk.Button(
+            recap_btn_fr,
+            text="New chat",
+            bg=_tb,
+            fg=_tf,
+            activebackground=_tab,
+            activeforeground=_taf,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=6,
+            cursor="hand2",
+        )
+        recap_new_btn.pack(fill="x")
+
+        def recap_set_sending(sending: bool) -> None:
+            recap_session["busy"] = sending
+            st = "disabled" if sending else "normal"
+            recap_send_btn.config(state=st)
+            recap_new_btn.config(state=st)
+            recap_img_btn.config(state=st)
+            recap_file_btn.config(state=st)
+            recap_input.config(state=st)
+            if sending:
+                recap_thinking_chk.config(state="disabled")
+                recap_to_chk.config(state="disabled")
+            else:
+                recap_thinking_chk.config(state="normal")
+                recap_sync_to_checkbox()
+
+        def reset_recap_session(*_a: Any) -> None:
+            recap_session["messages"].clear()
+            recap_session["bootstrapped"] = False
+            recap_session["busy"] = False
+            recap_pending_images.clear()
+            recap_pending_files.clear()
+            recap_refresh_pending_lbl()
+            recap_transcript.config(state="normal")
+            recap_transcript.delete("1.0", "end")
+            recap_transcript.config(state="disabled")
+            recap_input.delete("1.0", "end")
+            recap_set_sending(False)
+
+        def reset_recap_on_page_leave() -> None:
+            reset_recap_session()
+            recap_selected_dates.clear()
+            recap_to_var.set(False)
+            recap_update_sel_label()
+            recap_refresh_cal_marks()
+            recap_sync_to_checkbox()
+
+        page_leave_reset_handlers["ai_recap"] = reset_recap_on_page_leave
+
+        def recap_new_chat() -> None:
+            if recap_session.get("busy"):
+                return
+            reset_recap_session()
+
+        recap_new_btn.config(command=recap_new_chat)
+
+        def recap_build_context() -> Optional[str]:
+            if recap_to_var.get():
+                if DateEntry is None or recap_from_de is None or recap_to_de is None:
+                    messagebox.showerror("AI Recap", "Date pickers require tkcalendar.")
+                    return None
+                try:
+                    d0 = recap_from_de.get_date()
+                    d1 = recap_to_de.get_date()
+                except Exception as exc:
+                    messagebox.showerror("AI Recap", f"Could not read dates: {exc}")
+                    return None
+                start = datetime.combine(d0, datetime.min.time())
+                end = datetime.combine(d1, datetime.min.time())
+                if end < start:
+                    start, end = end, start
+                return build_journal_context_for_range((start, end))
+            if not recap_selected_dates:
+                messagebox.showwarning("AI Recap", "Select one or more days on the calendar.")
+                return None
+            return build_journal_context_for_date_set(recap_selected_dates)
+
+        def recap_send() -> None:
+            if recap_session["busy"]:
+                return
+            if not get_openai_api_key():
+                messagebox.showerror(
+                    "AI Recap",
+                    "No OpenAI API key. Add one in Settings or set OPENAI_API_KEY.",
+                )
+                return
+            text = recap_input.get("1.0", "end-1c").strip()
+            if not text and not recap_pending_images and not recap_pending_files:
+                return
+            ctx = recap_build_context()
+            if ctx is None:
+                return
+            model_name = OPENAI_THINKING_MODEL if recap_thinking_var.get() else OPENAI_MODEL
+            effort = "high" if recap_thinking_var.get() else None
+            imgs = list(recap_pending_images)
+            files = list(recap_pending_files)
+            recap_set_sending(True)
+
+            def kickoff() -> None:
+                try:
+                    if not recap_session["bootstrapped"]:
+                        recap_session["messages"] = [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You answer questions only using the user's journal context. "
+                                    "If the answer is not in the journal, say you do not know based on the journal."
+                                ),
+                            },
+                            {"role": "system", "content": f"Journal context:\n{ctx}"},
+                        ]
+                        recap_session["bootstrapped"] = True
+                    user_msg = build_user_message_with_attachments(text, imgs, files)
+                    recap_session["messages"].append(user_msg)
+                    answer = chat_completion(
+                        recap_session["messages"],
+                        model=model_name,
+                        reasoning_effort=effort,
+                    )
+
+                    def done() -> None:
+                        recap_set_sending(False)
+                        if _is_likely_api_error_message(answer):
+                            messagebox.showerror("AI Recap", answer[:4000])
+                            if recap_session["messages"] and recap_session["messages"][-1].get("role") == "user":
+                                recap_session["messages"].pop()
+                            return
+                        recap_session["messages"].append({"role": "assistant", "content": answer})
+                        _append_transcript(recap_transcript, "user", text or "(attachment only)")
+                        _append_transcript(recap_transcript, "assistant", answer)
+                        recap_input.delete("1.0", "end")
+                        recap_pending_images.clear()
+                        recap_pending_files.clear()
+                        recap_refresh_pending_lbl()
+
+                    root.after(0, done)
+                except Exception as exc:
+
+                    def fail() -> None:
+                        recap_set_sending(False)
+                        messagebox.showerror("AI Recap", str(exc))
+                        if recap_session["messages"] and recap_session["messages"][-1].get("role") == "user":
+                            recap_session["messages"].pop()
+
+                    root.after(0, fail)
+
+            threading.Thread(target=kickoff, daemon=True).start()
+
+        recap_send_btn.config(command=recap_send)
+
+        def recap_on_enter(_evt: Any) -> str:
+            recap_send()
+            return "break"
+
+        recap_input.bind("<Return>", recap_on_enter)
+
+        # ========== Chatbot ==========
+        cb_wrap = tk.Frame(chatbot_page, bg=t0.surface)
+        cb_wrap.pack(fill="both", expand=True, padx=t0.pad_outer, pady=(0, t0.pad_center_y))
+        cb_wrap.grid_columnconfigure(0, weight=1)
+        cb_wrap.grid_rowconfigure(1, weight=1)
+
+        cb_title = tk.Label(
+            cb_wrap,
+            text="Chatbot",
+            bg=t0.surface,
+            fg=t0.text,
+            font=("Segoe UI", 15, "bold"),
+            anchor="w",
+        )
+        cb_title.grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        cb_top = tk.Frame(cb_wrap, bg=t0.panel, highlightthickness=1, highlightbackground=t0.border)
+        cb_top.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        cb_top.grid_rowconfigure(0, weight=1)
+        cb_top.grid_columnconfigure(0, weight=1)
+
+        cb_transcript = tk.Text(
+            cb_top,
+            wrap="word",
+            state="disabled",
+            font=("Segoe UI", 10),
+            bg=t0.field,
+            fg=t0.text,
+            insertbackground=t0.text,
+            relief="flat",
+            padx=12,
+            pady=12,
+            highlightthickness=1,
+            highlightbackground=t0.border,
+            highlightcolor=t0.accent,
+        )
+        cb_ts = tk.Scrollbar(
+            cb_top,
+            command=cb_transcript.yview,
+            bg=t0.panel,
+            troughcolor=t0.field,
+            activebackground=t0.accent,
+            bd=0,
+            highlightthickness=0,
+            width=11,
+        )
+        cb_transcript.configure(yscrollcommand=cb_ts.set)
+        cb_transcript.grid(row=0, column=0, sticky="nsew")
+        cb_ts.grid(row=0, column=1, sticky="ns")
+        cb_transcript.tag_configure("t_meta", foreground=t0.muted, font=("Segoe UI", 9, "bold"))
+        cb_transcript.tag_configure("t_user", foreground=t0.text, font=("Segoe UI", 10))
+        cb_transcript.tag_configure("t_bot", foreground=t0.text, font=("Segoe UI", 10))
+
+        cb_attach = tk.Frame(cb_wrap, bg=t0.surface)
+        cb_attach.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+        cb_thinking_var = tk.BooleanVar(value=False)
+        cb_thinking_chk = tk.Checkbutton(
+            cb_attach,
+            text="Thinking model",
+            variable=cb_thinking_var,
+            bg=t0.surface,
+            fg=t0.muted,
+            activebackground=t0.surface,
+            activeforeground=t0.text,
+            selectcolor=t0.field,
+            font=("Segoe UI", 9),
+        )
+        cb_thinking_chk.pack(side="left")
+        cb_pending_lbl = tk.Label(
+            cb_attach,
+            text="Attachments: none",
+            bg=t0.surface,
+            fg=t0.muted,
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        cb_pending_lbl.pack(side="left", fill="x", expand=True, padx=(12, 0))
+
+        cb_session: Dict[str, Any] = {
+            "messages": [{"role": "system", "content": "You are a helpful assistant."}],
+            "busy": False,
+        }
+        cb_pending_images: List[Path] = []
+        cb_pending_files: List[Path] = []
+
+        def cb_refresh_pending() -> None:
+            bits = []
+            if cb_pending_images:
+                bits.append(f"{len(cb_pending_images)} image(s)")
+            if cb_pending_files:
+                bits.append(f"{len(cb_pending_files)} file(s)")
+            cb_pending_lbl.config(text="Attachments: " + (", ".join(bits) if bits else "none"))
+
+        def cb_pick_image() -> None:
+            p = filedialog.askopenfilename(
+                title="Attach image",
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.webp"), ("All files", "*.*")],
+            )
+            if p:
+                cb_pending_images.append(Path(p))
+                cb_refresh_pending()
+
+        def cb_pick_file() -> None:
+            p = filedialog.askopenfilename(title="Attach file", filetypes=[("All files", "*.*")])
+            if p:
+                cb_pending_files.append(Path(p))
+                cb_refresh_pending()
+
+        cb_img_btn = tk.Button(
+            cb_attach,
+            text="Image",
+            command=cb_pick_image,
+            bg=_tb,
+            fg=_tf,
+            activebackground=_tab,
+            activeforeground=_taf,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        cb_img_btn.pack(side="right", padx=(6, 0))
+        cb_file_btn = tk.Button(
+            cb_attach,
+            text="File",
+            command=cb_pick_file,
+            bg=_tb,
+            fg=_tf,
+            activebackground=_tab,
+            activeforeground=_taf,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        cb_file_btn.pack(side="right", padx=(6, 0))
+
+        cb_bottom = tk.Frame(cb_wrap, bg=t0.panel, highlightthickness=1, highlightbackground=t0.border)
+        cb_bottom.grid(row=3, column=0, sticky="ew")
+        cb_bottom.grid_columnconfigure(0, weight=1)
+
+        cb_input = tk.Text(
+            cb_bottom,
+            height=3,
+            wrap="word",
+            font=("Segoe UI", 10),
+            bg=t0.field,
+            fg=t0.text,
+            insertbackground=t0.text,
+            relief="flat",
+            padx=10,
+            pady=8,
+            highlightthickness=0,
+        )
+        cb_input.grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=8)
+
+        cb_btn_fr = tk.Frame(cb_bottom, bg=t0.panel)
+        cb_btn_fr.grid(row=0, column=1, sticky="ns", padx=(4, 8), pady=8)
+
+        cb_send_btn = tk.Button(
+            cb_btn_fr,
+            text="Send",
+            bg=t0.accent,
+            fg="white",
+            activebackground=t0.hover_primary,
+            activeforeground="white",
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=14,
+            pady=8,
+            cursor="hand2",
+        )
+        cb_send_btn.pack(fill="x", pady=(0, 6))
+        cb_new_btn = tk.Button(
+            cb_btn_fr,
+            text="New chat",
+            bg=_tb,
+            fg=_tf,
+            activebackground=_tab,
+            activeforeground=_taf,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=6,
+            cursor="hand2",
+        )
+        cb_new_btn.pack(fill="x")
+
+        def cb_set_sending(sending: bool) -> None:
+            cb_session["busy"] = sending
+            st = "disabled" if sending else "normal"
+            cb_send_btn.config(state=st)
+            cb_new_btn.config(state=st)
+            cb_img_btn.config(state=st)
+            cb_file_btn.config(state=st)
+            cb_input.config(state=st)
+            cb_thinking_chk.config(state=st)
+
+        def reset_chatbot_session(*_a: Any) -> None:
+            cb_session["messages"] = [{"role": "system", "content": "You are a helpful assistant."}]
+            cb_session["busy"] = False
+            cb_pending_images.clear()
+            cb_pending_files.clear()
+            cb_refresh_pending()
+            cb_transcript.config(state="normal")
+            cb_transcript.delete("1.0", "end")
+            cb_transcript.config(state="disabled")
+            cb_input.delete("1.0", "end")
+            cb_set_sending(False)
+
+        page_leave_reset_handlers["chatbot"] = reset_chatbot_session
+
+        def cb_new_chat() -> None:
+            if cb_session.get("busy"):
+                return
+            reset_chatbot_session()
+
+        cb_new_btn.config(command=cb_new_chat)
+
+        def cb_send() -> None:
+            if cb_session["busy"]:
+                return
+            if not get_openai_api_key():
+                messagebox.showerror(
+                    "Chatbot",
+                    "No OpenAI API key. Add one in Settings or set OPENAI_API_KEY.",
+                )
+                return
+            text = cb_input.get("1.0", "end-1c").strip()
+            if not text and not cb_pending_images and not cb_pending_files:
+                return
+            model_name = OPENAI_THINKING_MODEL if cb_thinking_var.get() else OPENAI_MODEL
+            effort = "high" if cb_thinking_var.get() else None
+            imgs = list(cb_pending_images)
+            files = list(cb_pending_files)
+            cb_set_sending(True)
+
+            def kickoff() -> None:
+                try:
+                    user_msg = build_user_message_with_attachments(text, imgs, files)
+                    cb_session["messages"].append(user_msg)
+                    answer = chat_completion(
+                        cb_session["messages"],
+                        model=model_name,
+                        reasoning_effort=effort,
+                    )
+
+                    def done() -> None:
+                        cb_set_sending(False)
+                        if _is_likely_api_error_message(answer):
+                            messagebox.showerror("Chatbot", answer[:4000])
+                            if cb_session["messages"] and cb_session["messages"][-1].get("role") == "user":
+                                cb_session["messages"].pop()
+                            return
+                        cb_session["messages"].append({"role": "assistant", "content": answer})
+                        _append_transcript(cb_transcript, "user", text or "(attachment only)")
+                        _append_transcript(cb_transcript, "assistant", answer)
+                        cb_input.delete("1.0", "end")
+                        cb_pending_images.clear()
+                        cb_pending_files.clear()
+                        cb_refresh_pending()
+
+                    root.after(0, done)
+                except Exception as exc:
+
+                    def fail() -> None:
+                        cb_set_sending(False)
+                        messagebox.showerror("Chatbot", str(exc))
+                        if cb_session["messages"] and cb_session["messages"][-1].get("role") == "user":
+                            cb_session["messages"].pop()
+
+                    root.after(0, fail)
+
+            threading.Thread(target=kickoff, daemon=True).start()
+
+        cb_send_btn.config(command=cb_send)
+
+        def cb_on_enter(_evt: Any) -> str:
+            cb_send()
+            return "break"
+
+        cb_input.bind("<Return>", cb_on_enter)
+
+        def apply_ai_recap_chatbot_theme() -> None:
+            t = th()
+            tb, tf, tab, taf = t.toolbar_btn_config()
+            for fr in (
+                recap_wrap,
+                recap_title,
+                recap_top,
+                recap_thinking_chk,
+                recap_to_wrap,
+                recap_to_chk,
+                recap_range_fr,
+                recap_multi_fr,
+                recap_sel_lbl,
+                recap_mid,
+                recap_attach_row,
+                recap_pending_lbl,
+                recap_bottom,
+                recap_btn_fr,
+                cb_wrap,
+                cb_title,
+                cb_attach,
+                cb_pending_lbl,
+                cb_bottom,
+                cb_btn_fr,
+            ):
+                try:
+                    fr.configure(bg=t.surface)
+                except Exception:
+                    try:
+                        fr.configure(bg=t.panel)
+                    except Exception:
+                        pass
+            recap_title.configure(bg=t.surface, fg=t.text)
+            recap_top.configure(bg=t.panel, highlightbackground=t.border)
+            recap_thinking_chk.configure(
+                bg=t.panel,
+                fg=t.muted,
+                activebackground=t.panel,
+                activeforeground=t.text,
+                selectcolor=t.field,
+            )
+            recap_to_wrap.configure(bg=t.panel)
+            recap_to_chk.configure(
+                bg=t.panel,
+                fg=t.muted,
+                activebackground=t.panel,
+                activeforeground=t.text,
+                selectcolor=t.field,
+            )
+            recap_range_fr.configure(bg=t.panel)
+            recap_multi_fr.configure(bg=t.panel)
+            recap_sel_lbl.configure(bg=t.panel, fg=t.muted)
+            recap_mid.configure(bg=t.surface)
+            recap_transcript.config(
+                bg=t.field,
+                fg=t.text,
+                insertbackground=t.text,
+                highlightbackground=t.border,
+                highlightcolor=t.accent,
+            )
+            recap_ts.config(bg=t.panel, troughcolor=t.field, activebackground=t.accent)
+            recap_transcript.tag_configure("t_meta", foreground=t.muted)
+            recap_transcript.tag_configure("t_user", foreground=t.text)
+            recap_transcript.tag_configure("t_bot", foreground=t.text)
+            recap_attach_row.configure(bg=t.surface)
+            recap_pending_lbl.configure(bg=t.surface, fg=t.muted)
+            recap_bottom.configure(bg=t.panel, highlightbackground=t.border)
+            recap_input.config(bg=t.field, fg=t.text, insertbackground=t.text)
+            recap_btn_fr.configure(bg=t.panel)
+            recap_send_btn.configure(
+                bg=t.accent,
+                fg="white",
+                activebackground=t.hover_primary,
+                activeforeground="white",
+            )
+            recap_new_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
+            recap_img_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
+            recap_file_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
+            if recap_calendar is not None:
+                try:
+                    recap_calendar.config(
+                        background=t.field,
+                        foreground=t.text,
+                        headersbackground=t.panel,
+                        weekendbackground=t.field,
+                        weekendforeground=t.muted,
+                        selectbackground=t.accent,
+                        selectforeground="white",
+                        bordercolor=t.border,
+                    )
+                except Exception:
+                    pass
+                recap_refresh_cal_marks()
+            if DateEntry is not None and recap_from_de is not None and recap_to_de is not None:
+                try:
+                    recap_from_de.config(background=t.field, foreground=t.text)
+                    recap_to_de.config(background=t.field, foreground=t.text)
+                except tk.TclError:
+                    pass
+            cb_wrap.configure(bg=t.surface)
+            cb_title.configure(bg=t.surface, fg=t.text)
+            cb_top.configure(bg=t.panel, highlightbackground=t.border)
+            cb_transcript.config(
+                bg=t.field,
+                fg=t.text,
+                insertbackground=t.text,
+                highlightbackground=t.border,
+                highlightcolor=t.accent,
+            )
+            cb_ts.config(bg=t.panel, troughcolor=t.field, activebackground=t.accent)
+            cb_transcript.tag_configure("t_meta", foreground=t.muted)
+            cb_transcript.tag_configure("t_user", foreground=t.text)
+            cb_transcript.tag_configure("t_bot", foreground=t.text)
+            cb_attach.configure(bg=t.surface)
+            cb_thinking_chk.configure(
+                bg=t.surface,
+                fg=t.muted,
+                activebackground=t.surface,
+                activeforeground=t.text,
+                selectcolor=t.field,
+            )
+            cb_pending_lbl.configure(bg=t.surface, fg=t.muted)
+            cb_bottom.configure(bg=t.panel, highlightbackground=t.border)
+            cb_input.config(bg=t.field, fg=t.text, insertbackground=t.text)
+            cb_btn_fr.configure(bg=t.panel)
+            cb_send_btn.configure(
+                bg=t.accent,
+                fg="white",
+                activebackground=t.hover_primary,
+                activeforeground="white",
+            )
+            cb_new_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
+            cb_img_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
+            cb_file_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
+
+        build_ai_recap_and_chatbot_pages._apply_theme = apply_ai_recap_chatbot_theme  # type: ignore[attr-defined]
+
+    build_ai_recap_and_chatbot_pages()
 
     settings_wrap = tk.Frame(settings_page, bg=t_init.surface)
     settings_wrap.pack(fill="both", expand=True, padx=20, pady=20)
@@ -4979,6 +5941,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             _w.configure(bg=t.surface, fg=t.text)
         for _w in placeholder_body_labels:
             _w.configure(bg=t.surface, fg=t.muted)
+        _ai_theme_fn = getattr(build_ai_recap_and_chatbot_pages, "_apply_theme", None)
+        if callable(_ai_theme_fn):
+            _ai_theme_fn()
         settings_wrap.configure(bg=t.surface)
         settings_title.configure(bg=t.surface, fg=t.text)
         settings_status_lbl.configure(bg=t.surface, fg=t.muted)
@@ -5772,6 +6737,51 @@ def build_user_message(question: str, screenshot_path: Optional[Path]) -> Dict[s
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
         ],
     }
+
+
+def _image_mime_for_path(path: Path) -> str:
+    suf = path.suffix.lower()
+    if suf in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    if suf == ".gif":
+        return "image/gif"
+    if suf == ".webp":
+        return "image/webp"
+    return "image/png"
+
+
+def build_user_message_with_attachments(
+    question: str,
+    image_paths: List[Path],
+    file_paths: List[Path],
+) -> Dict[str, object]:
+    """Build a user message with optional images (vision) and text file excerpts."""
+    text_chunks: List[str] = []
+    q = (question or "").strip()
+    if q:
+        text_chunks.append(q)
+    for fp in file_paths:
+        ctx, _resolved, err = load_recap_context_from_file(str(fp))
+        if err:
+            text_chunks.append(f"[Attachment {fp.name}: {err}]")
+        elif ctx:
+            label = str(fp.resolve())
+            clip = ctx if len(ctx) <= 48000 else ctx[:48000] + "\n\n[Truncated attachment]"
+            text_chunks.append(f"[Attached file: {label}]\n{clip}")
+    combined_text = "\n\n".join(text_chunks).strip() or "(no text)"
+    parts: List[Dict[str, object]] = [{"type": "text", "text": combined_text}]
+    for img_path in image_paths:
+        try:
+            raw = img_path.read_bytes()
+        except OSError as exc:
+            parts.append({"type": "text", "text": f"[Image {img_path.name} unreadable: {exc}]"})
+            continue
+        mime = _image_mime_for_path(img_path)
+        b64 = base64.b64encode(raw).decode("ascii")
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+    if len(parts) == 1:
+        return {"role": "user", "content": combined_text}
+    return {"role": "user", "content": parts}
 
 
 def run_chat_mode(
