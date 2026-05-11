@@ -2333,24 +2333,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     def th() -> JournalWindowThemeSpec:
         return theme_holder[0]
 
-    # region agent log
-    def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
-        try:
-            payload = {
-                "sessionId": "8dd4b6",
-                "runId": run_id,
-                "hypothesisId": hypothesis_id,
-                "location": location,
-                "message": message,
-                "data": data,
-                "timestamp": int(time.time() * 1000),
-            }
-            with open("debug-8dd4b6.log", "a", encoding="utf-8") as _f:
-                _f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-    # endregion
-
     t_init = th()
     root.configure(bg=t_init.surface)
     startup_total_steps = 6
@@ -2528,19 +2510,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             "settings": settings_page,
         }
         prev_key = active_page["key"]
-        # region agent log
-        _debug_log(
-            "pre-fix",
-            "H1",
-            "daily_logger.py:show_page",
-            "show_page invoked",
-            {
-                "page_key": page_key,
-                "active_before": active_page["key"],
-                "overlay_exists": bool(startup_overlay.winfo_exists()),
-            },
-        )
-        # endregion
         if page_key == "console":
             _clear_console_hint()
         frame = page_map.get(page_key, journal_page)
@@ -2680,18 +2649,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 for btn in page_toggle_buttons:
                     _place_page_toggle(btn)
                 restore_key = nav_restore_page.get("key", "journal")
-                # region agent log
-                _debug_log(
-                    "pre-fix",
-                    "H2",
-                    "daily_logger.py:set_nav_visible._on_expand_done",
-                    "nav expand done restore key",
-                    {
-                        "restore_key": restore_key,
-                        "active_before_restore": active_page["key"],
-                    },
-                )
-                # endregion
                 if restore_key in ("journal", "ai_recap", "chatbot", "console", "settings"):
                     show_page(restore_key)
 
@@ -4598,10 +4555,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         prefs[UI_LANGUAGE_PREF_KEY] = new_lang
         save_preferences(prefs)
         ui_lang_holder[0] = new_lang
-        apply_journal_window_i18n()
         apply_journal_window_colors()
-
-    ui_lang_var.trace_add("write", lambda *_a: root.after_idle(_on_ui_language_selected))
 
     rename_row, _ = _make_settings_row("settings.rename")
     rename_entry = tk.Entry(
@@ -6261,9 +6215,13 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 )
         except tk.TclError:
             pass
-        ui_lang_var.set(
-            tr("settings.lang.chinese") if ui_lang_holder[0] == "zh" else tr("settings.lang.english")
+        _want_ui_lang = (
+            tr("settings.lang.chinese")
+            if ui_lang_holder[0] == "zh"
+            else tr("settings.lang.english")
         )
+        if ui_lang_var.get().strip() != _want_ui_lang.strip():
+            ui_lang_var.set(_want_ui_lang)
         rename_btn.config(text=tr("settings.rename_btn"))
         startup_toggle_btn.config(
             text=tr("settings.on") if startup_state["enabled"] else tr("settings.off")
@@ -6628,6 +6586,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         redraw_waveform_canvas()
         apply_journal_window_i18n()
 
+    ui_lang_var.trace_add("write", lambda *_a: root.after_idle(_on_ui_language_selected))
+
     _startup_step("splash.detail.pages")
 
     def toggle_journal_window_theme() -> None:
@@ -6771,18 +6731,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     root.bind_all("<Button-1>", _unfocus_console_on_button_click, add="+")
     _startup_step("splash.detail.finalize")
-    # region agent log
-    _debug_log(
-        "pre-fix",
-        "H3",
-        "daily_logger.py:startup",
-        "before initial journal show",
-        {
-            "active_before": active_page["key"],
-            "overlay_exists": bool(startup_overlay.winfo_exists()),
-        },
-    )
-    # endregion
     show_page("journal")
 
     def _on_escape(event=None) -> None:
@@ -6794,87 +6742,19 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     root.bind("<Escape>", _on_escape)
     root.protocol("WM_DELETE_WINDOW", on_close)
     _startup_step("splash.detail.journal_ready")
-    # region agent log
-    _debug_log(
-        "pre-fix",
-        "H4",
-        "daily_logger.py:startup",
-        "before overlay destroy",
-        {
-            "active_page": active_page["key"],
-            "overlay_exists": bool(startup_overlay.winfo_exists()),
-        },
-    )
-    # endregion
     startup_overlay.destroy()
     root.lift()
-    apply_journal_window_i18n()
+    apply_journal_window_colors()
 
     def _background_post_init() -> None:
-        # region agent log
-        _debug_log(
-            "pre-fix",
-            "H5",
-            "daily_logger.py:_background_post_init",
-            "background init start",
-            {
-                "active_page": active_page["key"],
-                "text_box_y": int(text_box.winfo_y()),
-                "center_y": int(center.winfo_y()),
-                "top_h": int(top.winfo_height()),
-            },
-        )
-        # endregion
         _startup_step("splash.detail.other_pages")
         set_nav_visible(True)
-        # region agent log
-        _debug_log(
-            "pre-fix",
-            "H6",
-            "daily_logger.py:_background_post_init",
-            "after set_nav_visible",
-            {
-                "active_page": active_page["key"],
-                "text_box_y": int(text_box.winfo_y()),
-                "center_y": int(center.winfo_y()),
-                "top_h": int(top.winfo_height()),
-            },
-        )
-        # endregion
         _startup_step("splash.detail.autosave")
         autosave()
         refresh_save_entry_state()
         _startup_step("splash.detail.ready")
-        # region agent log
-        _debug_log(
-            "pre-fix",
-            "H7",
-            "daily_logger.py:_background_post_init",
-            "background init complete",
-            {
-                "active_page": active_page["key"],
-                "text_box_y": int(text_box.winfo_y()),
-                "center_y": int(center.winfo_y()),
-                "top_h": int(top.winfo_height()),
-            },
-        )
-        # endregion
 
     root.after(1, _background_post_init)
-    # region agent log
-    _debug_log(
-        "pre-fix",
-        "H8",
-        "daily_logger.py:startup",
-        "after overlay destroy before background init",
-        {
-            "active_page": active_page["key"],
-            "text_box_y": int(text_box.winfo_y()),
-            "center_y": int(center.winfo_y()),
-            "top_h": int(top.winfo_height()),
-        },
-    )
-    # endregion
     root.mainloop()
     return saved["value"]
 
