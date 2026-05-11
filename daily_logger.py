@@ -1986,6 +1986,23 @@ def archive_journal_recording(wav_path: Path) -> Optional[Path]:
         return None
 
 
+def latest_journal_archived_wav() -> Optional[Path]:
+    """Newest .wav in RECORDING_DIR by modification time, or None."""
+    try:
+        if not RECORDING_DIR.is_dir():
+            return None
+        candidates = [
+            p
+            for p in RECORDING_DIR.iterdir()
+            if p.is_file() and p.suffix.lower() == ".wav"
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: p.stat().st_mtime).resolve()
+    except OSError:
+        return None
+
+
 def wav_mono_duration_seconds(path: Path) -> float:
     """Return duration in seconds for a readable mono WAV, or 0.0 on error."""
     try:
@@ -2290,7 +2307,11 @@ def generate_journal_report_from_sources(journal_text: str, speech_transcript: s
     )
 
 
-def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -> bool:
+def open_journal_window_editor(
+    draft_data: Optional[Dict[str, object]] = None,
+    *,
+    apply_draft_on_open: bool = False,
+) -> bool:
     if tk is None or messagebox is None:
         print("Window mode is not available on this Python setup.")
         return False
@@ -2305,7 +2326,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     draft_time = default_time
     edit_target_sheet = ""
     edit_target_row = 0
-    if draft_data:
+    if draft_data and apply_draft_on_open:
         draft_text = str(draft_data.get("text", "") or "")
         draft_speech = str(draft_data.get("speech_transcript", "") or "")
         draft_report = str(draft_data.get("ai_report", "") or "")
@@ -2428,7 +2449,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     root.attributes("-topmost", True)
     root.after(250, lambda: root.attributes("-topmost", False))
     root.focus_force()
-    is_edit_mode = bool(edit_target_sheet and edit_target_row > 0)
 
     shell = tk.Frame(root, bg=t_init.surface, bd=0, highlightthickness=0)
     shell.pack(fill="both", expand=True)
@@ -5410,16 +5430,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 disabledforeground=tb[4],
             )
 
-    if draft_data:
-        _draft_wav = draft_data.get("journal_recording_wav")
-        if _draft_wav:
-            try:
-                _dw_path = Path(str(_draft_wav))
-                if _dw_path.is_file():
-                    last_journal_wav["path"] = _dw_path.resolve()
-                    _set_stt_saved_path_display(tr("journal.saved_path", path=str(_dw_path)))
-            except OSError:
-                pass
     update_transcribe_ui()
 
     def transcribe_tooltip_text() -> str:
@@ -5492,6 +5502,165 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         lambda: th().hover_primary,
         lambda: "white",
     )
+
+    def _editor_has_meaningful_body_content() -> bool:
+        return bool(
+            text_box.get("1.0", "end-1c").strip()
+            or stt_box.get("1.0", "end-1c").strip()
+            or report_box.get("1.0", "end-1c").strip()
+        )
+
+    def apply_draft_dict_to_ui(d: Dict[str, object]) -> None:
+        nonlocal edit_target_sheet, edit_target_row
+        _txt = str(d.get("text", "") or "")
+        _sp = str(d.get("speech_transcript", "") or "")
+        _rp = str(d.get("ai_report", "") or "")
+        text_box.delete("1.0", "end")
+        text_box.insert("1.0", _txt)
+        stt_box.delete("1.0", "end")
+        stt_box.insert("1.0", _sp)
+        report_box.delete("1.0", "end")
+        report_box.insert("1.0", _rp)
+        _dt = str(d.get("date", "") or "").strip()
+        if _dt:
+            if DateEntry is not None and isinstance(date_entry, DateEntry):
+                try:
+                    date_entry.set_date(_dt)
+                except Exception:
+                    try:
+                        date_entry.delete(0, "end")
+                    except Exception:
+                        pass
+                    date_entry.insert(0, _dt)
+            else:
+                date_entry.delete(0, "end")
+                date_entry.insert(0, _dt)
+        _tm = str(d.get("time", "") or "").strip()
+        if _tm:
+            time_entry.delete(0, "end")
+            time_entry.insert(0, _tm)
+        edit_target_sheet = str(d.get("edit_target_sheet", "") or "")
+        try:
+            edit_target_row = int(d.get("edit_target_row", 0) or 0)
+        except (TypeError, ValueError):
+            edit_target_row = 0
+        _wav = d.get("journal_recording_wav")
+        last_journal_wav["path"] = None
+        if _wav:
+            try:
+                _wp = Path(str(_wav))
+                if _wp.is_file():
+                    last_journal_wav["path"] = _wp.resolve()
+                    _set_stt_saved_path_display(
+                        tr("journal.saved_path", path=str(_wp))
+                    )
+                else:
+                    _set_stt_saved_path_display("")
+            except OSError:
+                _set_stt_saved_path_display("")
+        else:
+            _set_stt_saved_path_display("")
+        update_transcribe_ui()
+        refresh_save_entry_state()
+
+    def _draft_file_has_restorable_content(d: Dict[str, object]) -> bool:
+        if str(d.get("text", "") or "").strip():
+            return True
+        if str(d.get("speech_transcript", "") or "").strip():
+            return True
+        if str(d.get("ai_report", "") or "").strip():
+            return True
+        wraw = d.get("journal_recording_wav")
+        if not wraw:
+            return False
+        try:
+            return Path(str(wraw)).is_file()
+        except OSError:
+            return False
+
+    def on_restore_draft_click() -> None:
+        d = load_journal_window_draft()
+        if not isinstance(d, dict) or not _draft_file_has_restorable_content(d):
+            messagebox.showinfo(
+                tr("msg.journal_window"),
+                tr("msg.no_draft_to_restore"),
+            )
+            return
+        if _editor_has_meaningful_body_content():
+            if not messagebox.askyesno(
+                tr("journal.restore_confirm_title"),
+                tr("journal.restore_confirm"),
+            ):
+                return
+        apply_draft_dict_to_ui(d)
+        save_draft()
+
+    def on_transcribe_previous_click() -> None:
+        if recording_ui_busy["v"]:
+            messagebox.showinfo(
+                tr("msg.journal_window"),
+                tr("msg.transcribe_previous_busy"),
+            )
+            return
+        prev_wav = latest_journal_archived_wav()
+        if prev_wav is None:
+            messagebox.showinfo(
+                tr("msg.journal_window"),
+                tr("msg.no_archived_wav"),
+            )
+            return
+        last_journal_wav["path"] = prev_wav
+        _set_stt_saved_path_display(tr("journal.saved_path", path=str(prev_wav)))
+        update_transcribe_ui()
+        run_transcribe()
+
+    journal_top_actions = tk.Frame(top, bg=t_init.panel)
+    journal_top_actions.grid(row=0, column=5, sticky="e", padx=(8, 12), pady=12)
+    restore_draft_btn = tk.Button(
+        journal_top_actions,
+        text=tr("journal.restore_draft"),
+        command=on_restore_draft_click,
+        bg=_ut_bg,
+        fg=_ut_fg,
+        activebackground=_ut_abg,
+        activeforeground=_ut_afg,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=6,
+        cursor="hand2",
+    )
+    transcribe_prev_btn = tk.Button(
+        journal_top_actions,
+        text=tr("journal.transcribe_previous"),
+        command=on_transcribe_previous_click,
+        bg=_ut_bg,
+        fg=_ut_fg,
+        activebackground=_ut_abg,
+        activeforeground=_ut_afg,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=6,
+        cursor="hand2",
+    )
+    restore_draft_btn.pack(side="left", padx=(0, 6))
+    transcribe_prev_btn.pack(side="left")
+    bind_button_hover_if_enabled(
+        restore_draft_btn,
+        lambda: th().toolbar_bind_rest(),
+        lambda: th().toolbar_hover()[0],
+        lambda: th().toolbar_hover()[1],
+    )
+    bind_button_hover_if_enabled(
+        transcribe_prev_btn,
+        lambda: th().toolbar_bind_rest(),
+        lambda: th().toolbar_hover()[0],
+        lambda: th().toolbar_hover()[1],
+    )
+    bind_hover_tooltip(restore_draft_btn, lambda: tr("tip.restore_draft"))
+    bind_hover_tooltip(transcribe_prev_btn, lambda: tr("tip.transcribe_previous"))
+
     wave_canvas.bind("<Configure>", lambda _e: redraw_waveform_canvas())
     wave_canvas.after(80, redraw_waveform_canvas)
 
@@ -5855,7 +6024,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             messagebox.showerror(tr("msg.journal_window"), tr("msg.invalid_time"))
             return
         text_value = text_box.get("1.0", "end-1c").strip()
-        if not text_value and is_edit_mode:
+        if not text_value and (edit_target_sheet and edit_target_row > 0):
             should_delete = messagebox.askyesno(
                 "Clear Entry",
                 "Text is empty. Saving now will delete the previous entry. Are you sure?",
@@ -6243,6 +6412,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         date_lbl.config(text=tr("journal.date"))
         time_lbl.config(text=tr("journal.time"))
         update_time_btn.config(text=tr("journal.update_time"))
+        restore_draft_btn.config(text=tr("journal.restore_draft"))
+        transcribe_prev_btn.config(text=tr("journal.transcribe_previous"))
         find_lbl.config(text=tr("find.label"))
         find_scope_all_rb.config(text=tr("find.all"))
         find_scope_one_rb.config(text=tr("find.current_box"))
@@ -6455,6 +6626,13 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         )
         tbg, tfg, tabg, tafg = t.toolbar_btn_config()
         update_time_btn.config(
+            bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg
+        )
+        journal_top_actions.configure(bg=t.panel)
+        restore_draft_btn.config(
+            bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg
+        )
+        transcribe_prev_btn.config(
             bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg
         )
         for _b in (find_prev_btn, find_next_btn, find_close_btn):
@@ -7391,7 +7569,8 @@ def journal_settings_menu() -> Optional[List[str]]:
                     "images": [],
                     "edit_target_sheet": str(latest.get("sheet_name", "")),
                     "edit_target_row": int(latest.get("row_index", 0) or 0),
-                }
+                },
+                apply_draft_on_open=True,
             )
             return None
         if note.lower() in ("w", "window", "windows"):
@@ -7410,15 +7589,10 @@ def journal_settings_menu() -> Optional[List[str]]:
                 print("Could not save default journal input preference.")
             return None
         if note.lower() == "restore":
-            draft = load_journal_window_draft()
-            if not draft:
-                print("No journal draft to restore.")
-                return None
-            restored = open_journal_window_editor(draft)
-            if restored:
-                print("Restored draft saved.")
-            else:
-                print("Draft restore opened. Unsaved draft remains available.")
+            open_journal_window_editor()
+            print(
+                "Journal window opened. Use Restore draft in the journal date bar to load your saved draft, if any."
+            )
             return None
         if note.upper() == "DP":
             latest = get_latest_journal_entry_for_delete()
@@ -7589,15 +7763,10 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
             print("Could not save Wi-Fi warning list.")
         return True, app_name
     if key == "RESTORE":
-        draft = load_journal_window_draft()
-        if not draft:
-            print("No journal draft to restore.")
-            return True, app_name
-        restored = open_journal_window_editor(draft)
-        if restored:
-            print("Restored draft saved.")
-        else:
-            print("Draft restore opened. Unsaved draft remains available.")
+        open_journal_window_editor()
+        print(
+            "Journal window opened. Use Restore draft in the journal date bar to load your saved draft, if any."
+        )
         return True, app_name
     if key.startswith("TOKEN ADD "):
         token_value = raw[10:].strip()
@@ -7809,7 +7978,9 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
     values = module.prompt_builder()
     if values is None:
         if key == "J" and load_journal_window_draft():
-            print("Draft saved without journal entry. Use RESTORE to reopen it.")
+            print(
+                "Draft saved without journal entry. Open the journal window and use Restore draft in the date bar if you want to load it."
+            )
         return True, app_name
     append_row(module, values)
     print(f"{module.name} saved to: {DATA_DIR / module.workbook_name}")
@@ -8187,8 +8358,7 @@ def run() -> None:
                 ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
         except Exception:
             pass
-    draft = load_journal_window_draft()
-    open_journal_window_editor(draft if isinstance(draft, dict) else None)
+    open_journal_window_editor()
 
 
 if __name__ == "__main__":
