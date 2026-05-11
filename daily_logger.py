@@ -37,9 +37,10 @@ except Exception:
     messagebox = None
     ttk = None
 try:
-    from tkcalendar import DateEntry
+    from tkcalendar import Calendar, DateEntry
 except Exception:
     DateEntry = None  # type: ignore[assignment]
+    Calendar = None  # type: ignore[assignment]
 try:
     import msvcrt
 except Exception:
@@ -3291,7 +3292,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             pady=(0, t0.pad_center_y + JOURNAL_WINDOW_CONSOLE_RESERVE_BOTTOM),
         )
         recap_wrap.grid_columnconfigure(0, weight=1)
-        recap_wrap.grid_rowconfigure(2, weight=1)
+        recap_wrap.grid_rowconfigure(3, weight=1)
 
         recap_title = tk.Label(
             recap_wrap,
@@ -3372,11 +3373,6 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             font=("Segoe UI", 9),
         )
         recap_to_chk.pack(side="left")
-        bind_hover_tooltip(
-            recap_to_wrap,
-            lambda: "When enabled, choose a second date (Through) for an inclusive journal date range.",
-        )
-
         recap_through_fr = tk.Frame(recap_top, bg=t0.panel)
         tk.Label(
             recap_through_fr,
@@ -3409,21 +3405,142 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 font=("Segoe UI", 9),
             ).pack(side="left")
 
+        recap_cal_row = tk.Frame(recap_wrap, bg=t0.surface)
+        recap_cal_row.grid_columnconfigure(1, weight=1)
+        recap_selected_dates: set = set()
+        recap_calendar: Any = None
+        if Calendar is not None:
+            recap_calendar = Calendar(
+                recap_cal_row,
+                selectmode="day",
+                background=t0.field,
+                foreground=t0.text,
+                headersbackground=t0.panel,
+                weekendbackground=t0.field,
+                weekendforeground=t0.muted,
+                selectbackground=t0.accent,
+                selectforeground="white",
+                bordercolor=t0.border,
+                font=("Segoe UI", 9),
+            )
+            recap_calendar.grid(row=0, column=0, sticky="nw", padx=(0, 12), pady=(0, 4))
+        else:
+            tk.Label(
+                recap_cal_row,
+                text="Install tkcalendar for multi-day calendar selection.",
+                bg=t0.surface,
+                fg=t0.muted,
+                font=("Segoe UI", 9),
+                wraplength=400,
+                justify="left",
+            ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+
+        recap_sel_lbl = tk.Label(
+            recap_cal_row,
+            text="Selected: (none) — tap the calendar to add or remove days.",
+            bg=t0.surface,
+            fg=t0.muted,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+        )
+        recap_sel_lbl.grid(row=0, column=1, sticky="nw", pady=(0, 4))
+
+        recap_cal_marks_tag = "recap_sel"
+
+        def recap_refresh_cal_marks() -> None:
+            if recap_calendar is None:
+                return
+            try:
+                recap_calendar.calevent_remove("all")
+            except Exception:
+                pass
+            t = th()
+            for d in recap_selected_dates:
+                try:
+                    recap_calendar.calevent_create(d, "", recap_cal_marks_tag)
+                except Exception:
+                    pass
+            try:
+                recap_calendar.tag_config(recap_cal_marks_tag, background=t.accent, foreground="white")
+            except Exception:
+                pass
+
+        def recap_update_sel_label() -> None:
+            if not recap_selected_dates:
+                recap_sel_lbl.config(
+                    text="Selected: (none) — tap the calendar to add or remove days."
+                )
+                return
+            ordered = sorted(recap_selected_dates)
+            parts = [x.strftime("%m/%d/%Y") for x in ordered]
+            recap_sel_lbl.config(text="Selected days: " + ", ".join(parts))
+
+        def recap_sync_to_checkbox() -> None:
+            if recap_to_var.get():
+                return
+            if len(recap_selected_dates) > 1:
+                recap_to_chk.config(state="disabled")
+            else:
+                recap_to_chk.config(state="normal")
+
+        def recap_to_tooltip() -> str:
+            if str(recap_to_chk.cget("state")) == "disabled":
+                return (
+                    "The \"To\" range option is only available when at most one day is selected "
+                    "on the calendar. Remove extra days or use From only."
+                )
+            return "When enabled, pick Through for an inclusive date range (From → Through)."
+
+        bind_hover_tooltip(recap_to_wrap, recap_to_tooltip)
+
+        def on_recap_calendar_toggle(_evt: Optional[Any] = None) -> None:
+            if recap_to_var.get() or recap_calendar is None:
+                return
+            try:
+                picked = recap_calendar.selection_get()
+            except Exception:
+                return
+            if picked in recap_selected_dates:
+                recap_selected_dates.remove(picked)
+            else:
+                recap_selected_dates.add(picked)
+            recap_refresh_cal_marks()
+            recap_update_sel_label()
+            recap_sync_to_checkbox()
+
+        if recap_calendar is not None:
+            recap_calendar.bind("<<CalendarSelected>>", on_recap_calendar_toggle)
+
         def on_recap_to_mode(*_a: Any) -> None:
             if recap_to_var.get():
                 recap_through_fr.grid(row=0, column=3, padx=(0, 8), pady=8, sticky="w")
+                recap_cal_row.grid_remove()
+                if len(recap_selected_dates) == 1 and DateEntry is not None:
+                    only = next(iter(recap_selected_dates))
+                    if recap_from_de is not None and recap_to_de is not None:
+                        try:
+                            recap_from_de.set_date(only)
+                            recap_to_de.set_date(only)
+                        except Exception:
+                            pass
             else:
                 recap_through_fr.grid_remove()
+                recap_cal_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+                recap_refresh_cal_marks()
+                recap_update_sel_label()
+                recap_sync_to_checkbox()
 
         recap_to_var.trace_add("write", lambda *_: on_recap_to_mode())
         recap_through_fr.grid_remove()
+        recap_cal_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
 
         recap_session: Dict[str, Any] = {"messages": [], "bootstrapped": False, "busy": False}
         recap_pending_images: List[Path] = []
         recap_pending_files: List[Path] = []
 
         recap_mid = tk.Frame(recap_wrap, bg=t0.surface)
-        recap_mid.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+        recap_mid.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
         recap_mid.grid_rowconfigure(0, weight=1)
         recap_mid.grid_columnconfigure(0, weight=1)
 
@@ -3460,7 +3577,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         recap_transcript.tag_configure("t_bot", foreground=t0.text, font=("Segoe UI", 10))
 
         recap_attach_row = tk.Frame(recap_wrap, bg=t0.surface)
-        recap_attach_row.grid(row=3, column=0, sticky="ew", pady=(0, 4))
+        recap_attach_row.grid(row=4, column=0, sticky="ew", pady=(0, 4))
         recap_pending_lbl = tk.Label(
             recap_attach_row,
             text="Attachments: none",
@@ -3529,7 +3646,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         recap_file_btn.pack(side="right", padx=(6, 0))
 
         recap_bottom = tk.Frame(recap_wrap, bg=t0.panel, highlightthickness=1, highlightbackground=t0.border)
-        recap_bottom.grid(row=4, column=0, sticky="ew", pady=(0, 0))
+        recap_bottom.grid(row=5, column=0, sticky="ew", pady=(0, 0))
         recap_bottom.grid_columnconfigure(0, weight=1)
 
         recap_input = tk.Text(
@@ -3579,6 +3696,38 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         )
         recap_new_btn.pack(fill="x")
 
+        def _recap_send_rest_style() -> Tuple[str, str, str, str, str]:
+            t = th()
+            if str(recap_send_btn.cget("state")) != "normal":
+                ds, gb, gf, dab, daf = t.gen_bind_disabled()
+                return ds, gb, gf, dab, daf
+            return ("normal", t.accent, "white", t.hover_primary, "white")
+
+        bind_button_hover_if_enabled(
+            recap_img_btn,
+            lambda: th().toolbar_bind_rest(),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
+        bind_button_hover_if_enabled(
+            recap_file_btn,
+            lambda: th().toolbar_bind_rest(),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
+        bind_button_hover_if_enabled(
+            recap_new_btn,
+            lambda: th().toolbar_bind_rest(),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
+        bind_button_hover_if_enabled(
+            recap_send_btn,
+            _recap_send_rest_style,
+            lambda: th().hover_primary,
+            lambda: "white",
+        )
+
         def recap_set_sending(sending: bool) -> None:
             recap_session["busy"] = sending
             st = "disabled" if sending else "normal"
@@ -3592,7 +3741,10 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 recap_to_chk.config(state="disabled")
             else:
                 recap_thinking_chk.config(state="normal")
-                recap_to_chk.config(state="normal")
+                if recap_to_var.get():
+                    recap_to_chk.config(state="normal")
+                else:
+                    recap_sync_to_checkbox()
 
         def reset_recap_session(*_a: Any) -> None:
             recap_session["messages"].clear()
@@ -3605,6 +3757,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             recap_transcript.delete("1.0", "end")
             recap_transcript.config(state="disabled")
             recap_input.delete("1.0", "end")
+            recap_selected_dates.clear()
+            recap_update_sel_label()
+            recap_refresh_cal_marks()
             recap_set_sending(False)
 
         def reset_recap_on_page_leave() -> None:
@@ -3618,6 +3773,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                     recap_to_de.set_date(td)
             except Exception:
                 pass
+            recap_sync_to_checkbox()
             on_recap_to_mode()
 
         page_leave_reset_handlers["ai_recap"] = reset_recap_on_page_leave
@@ -3645,6 +3801,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 if end < start:
                     start, end = end, start
                 return build_journal_context_for_range((start, end))
+            if recap_selected_dates:
+                return build_journal_context_for_date_set(recap_selected_dates)
             if DateEntry is None or recap_from_de is None:
                 messagebox.showerror("AI Recap", "Date entry requires tkcalendar.")
                 return None
@@ -3929,6 +4087,38 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         )
         cb_new_btn.pack(fill="x")
 
+        def _cb_send_rest_style() -> Tuple[str, str, str, str, str]:
+            t = th()
+            if str(cb_send_btn.cget("state")) != "normal":
+                ds, gb, gf, dab, daf = t.gen_bind_disabled()
+                return ds, gb, gf, dab, daf
+            return ("normal", t.accent, "white", t.hover_primary, "white")
+
+        bind_button_hover_if_enabled(
+            cb_img_btn,
+            lambda: th().toolbar_bind_rest(),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
+        bind_button_hover_if_enabled(
+            cb_file_btn,
+            lambda: th().toolbar_bind_rest(),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
+        bind_button_hover_if_enabled(
+            cb_new_btn,
+            lambda: th().toolbar_bind_rest(),
+            lambda: th().toolbar_hover()[0],
+            lambda: th().toolbar_hover()[1],
+        )
+        bind_button_hover_if_enabled(
+            cb_send_btn,
+            _cb_send_rest_style,
+            lambda: th().hover_primary,
+            lambda: "white",
+        )
+
         def cb_set_sending(sending: bool) -> None:
             cb_session["busy"] = sending
             st = "disabled" if sending else "normal"
@@ -4036,6 +4226,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 recap_to_wrap,
                 recap_to_chk,
                 recap_through_fr,
+                recap_cal_row,
+                recap_sel_lbl,
                 recap_mid,
                 recap_attach_row,
                 recap_pending_lbl,
@@ -4080,6 +4272,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             for _w in recap_through_fr.winfo_children():
                 if isinstance(_w, tk.Label):
                     _w.configure(bg=t.panel, fg=t.muted)
+            recap_cal_row.configure(bg=t.surface)
+            recap_sel_lbl.configure(bg=t.surface, fg=t.muted)
             recap_mid.configure(bg=t.surface)
             recap_transcript.config(
                 bg=t.field,
@@ -4106,6 +4300,21 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             recap_new_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
             recap_img_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
             recap_file_btn.configure(bg=tb, fg=tf, activebackground=tab, activeforeground=taf)
+            if recap_calendar is not None:
+                try:
+                    recap_calendar.config(
+                        background=t.field,
+                        foreground=t.text,
+                        headersbackground=t.panel,
+                        weekendbackground=t.field,
+                        weekendforeground=t.muted,
+                        selectbackground=t.accent,
+                        selectforeground="white",
+                        bordercolor=t.border,
+                    )
+                except Exception:
+                    pass
+                recap_refresh_cal_marks()
             if DateEntry is not None and recap_from_de is not None:
                 try:
                     recap_from_de.config(background=t.field, foreground=t.text)
