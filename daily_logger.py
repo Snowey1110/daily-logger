@@ -101,7 +101,9 @@ WHISPER_PRE_EDGE_PAD_MS = 120
 WHISPER_PRE_MIN_SPEECH_MS = 50
 WHISPER_PRE_MAX_INTERNAL_SILENCE_SEC = 1.25
 WHISPER_PRE_KEEP_INTERNAL_SILENCE_SEC = 0.35
-WHISPER_TRANSCRIBE_CHUNK_SEC = 8 * 60
+WHISPER_TRANSCRIBE_CHUNK_SEC = 5 * 60
+WHISPER_TRANSCRIBE_SINGLE_MAX_SEC = 120.0
+WHISPER_TRANSCRIBE_SINGLE_MAX_BYTES = 24 * 1024 * 1024
 WHISPER_TRANSCRIBE_PROMPT_CHAR_LIMIT = 600
 # Hover tooltips: narrow wrap → shorter line length, more lines (taller block).
 TOOLTIP_WRAP_PX = 220
@@ -1802,15 +1804,10 @@ def _transcribe_audio_openai_single(
         add_field("prompt", prompt.strip()[:WHISPER_TRANSCRIBE_PROMPT_CHAR_LIMIT])
     add_field("temperature", str(temperature))
 
-    filename = upload_path.name
+    filename = file_path.name
     try:
-        audio_bytes = upload_path.read_bytes()
+        audio_bytes = file_path.read_bytes()
     except OSError as exc:
-        if temp_upload is not None:
-            try:
-                temp_upload.unlink(missing_ok=True)
-            except OSError:
-                pass
         return f"Could not read audio file: {exc}"
 
     body_chunks.append(b"--" + boundary + crlf)
@@ -1834,7 +1831,7 @@ def _transcribe_audio_openai_single(
     )
 
     try:
-        with request.urlopen(req, timeout=120) as response:
+        with request.urlopen(req, timeout=whisper_transcription_timeout_sec(file_path)) as response:
             raw = response.read().decode("utf-8")
     except error.HTTPError as exc:
         try:
@@ -1856,6 +1853,11 @@ def _transcribe_audio_openai_single(
             result = "Whisper returned invalid JSON."
 
     return result
+
+
+def _whisper_transcription_timeout_error(text: str) -> bool:
+    s = text.strip().lower()
+    return "timed out" in s or "timeout" in s or "read timed out" in s
 
 
 def _whisper_context_too_long_error(text: str) -> bool:
@@ -1937,10 +1939,21 @@ def transcribe_audio_openai(
     if prep_err is not None:
         return prep_err
     try:
+        dur = wav_mono_duration_seconds(upload_path)
+        force_chunk = dur > WHISPER_TRANSCRIBE_SINGLE_MAX_SEC
+        if not force_chunk:
+            try:
+                force_chunk = upload_path.stat().st_size > WHISPER_TRANSCRIBE_SINGLE_MAX_BYTES
+            except OSError:
+                pass
+        if force_chunk:
+            return _transcribe_audio_openai_chunked(
+                upload_path, language, prompt=prompt, temperature=temperature
+            )
         first_try = _transcribe_audio_openai_single(
             upload_path, language, prompt=prompt, temperature=temperature
         )
-        if _whisper_context_too_long_error(first_try):
+        if _whisper_context_too_long_error(first_try) or _whisper_transcription_timeout_error(first_try):
             return _transcribe_audio_openai_chunked(
                 upload_path, language, prompt=prompt, temperature=temperature
             )
@@ -1981,6 +1994,14 @@ def wav_mono_duration_seconds(path: Path) -> float:
             return wf.getnframes() / float(rate)
     except Exception:
         return 0.0
+
+
+def whisper_transcription_timeout_sec(path: Path) -> int:
+    """HTTP timeout for OpenAI transcription; scales with audio length, capped."""
+    dur = wav_mono_duration_seconds(path)
+    if dur <= 0:
+        return 240
+    return min(900, max(180, int(dur * 3.5) + 120))
 
 
 def estimate_whisper_cost_usd(wav_path: Path) -> Tuple[float, float]:
@@ -5435,6 +5456,18 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 disabledforeground=tb[4],
             )
 
+    if draft_data:
+        _draft_wav = draft_data.get("journal_recording_wav")
+        if _draft_wav:
+            try:
+                _dw_path = Path(str(_draft_wav))
+                if _dw_path.is_file():
+                    last_journal_wav["path"] = _dw_path.resolve()
+                    _set_stt_saved_path_display(tr("journal.saved_path", path=str(_dw_path)))
+            except OSError:
+                pass
+    update_transcribe_ui()
+
     def transcribe_tooltip_text() -> str:
         if transcribing_busy["v"]:
             return tr("journal.transcribe_tooltip_busy")
@@ -5461,7 +5494,10 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         lang_snap = _language_code_for_whisper()
 
         def work() -> None:
-            result = transcribe_audio_openai(p, lang_snap, temperature=0.0)
+            try:
+                result = transcribe_audio_openai(p, lang_snap, temperature=0.0)
+            except Exception as exc:
+                result = f"Whisper request failed: {exc}"
 
             def done() -> None:
                 transcribing_busy["v"] = False
@@ -5622,6 +5658,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 text=tr("journal.recording_copy_fail", dir=str(RECORDING_DIR)),
             )
         update_transcribe_ui()
+        save_draft()
 
     def record_worker_main(wav_path: Path) -> None:
         err = record_microphone_session_wav(
@@ -5834,6 +5871,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             "edit_target_sheet": edit_target_sheet,
             "edit_target_row": edit_target_row,
             "updated_at": datetime.now().isoformat(),
+            "journal_recording_wav": str(last_journal_wav["path"])
+            if last_journal_wav.get("path") is not None
+            else "",
         }
 
     def save_draft() -> None:
