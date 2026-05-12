@@ -128,6 +128,24 @@ From the main menu:
 - Automatically updated while editing
 - Reopen with `RESTORE`
 
+### Virtual Journal Reader (optional)
+
+When `virtual-journal-reader/dist/` is built and `virtual-journal-reader/serve_reader.py` is present next to the app, the **Virtual Reader** item on the **left nav rail (under Console)** starts a small local Python server (default port **8765**), opens your default browser, and loads the same data as `Journal.xlsx` (journal text, speech-to-text, AI report). If the addon is missing, the same control opens `Journal.xlsx` in the default browser via a `file:` URL (often downloads or opens in Excel depending on your browser).
+
+To build the web UI once (requires Node.js for development):
+
+```bash
+cd virtual-journal-reader
+npm install
+npm run build
+```
+
+The reader process Daily Logger **starts for you** stops when you **close the Journal window** or when the **Daily Logger Python process exits** (including `atexit`). If the server was already running on port 8765 before you opened it from Daily Logger (for example you started `serve_reader.py` manually), Daily Logger does **not** own that process and will **not** stop it when you close the app.
+
+If UI changes do not appear, end any old **Python** process still listening on port **8765** in Task Manager, run `npm run build` again, then open Virtual Reader (Daily Logger refuses an outdated server on that port and tells you to restart it).
+
+PyInstaller builds can bundle `virtual-journal-reader/dist` and `serve_reader.py` via `DailyLogger.spec` `datas`.
+
 ---
 
 ## OpenAI Features

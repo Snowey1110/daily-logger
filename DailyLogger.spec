@@ -5,7 +5,10 @@ a = Analysis(
     ['c:\\Users\\LixiaoKuang\\OneDrive - VisionNav Robotics USA inc\\Desktop\\Code\\daily_logger.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        ('virtual-journal-reader/dist', 'virtual-journal-reader/dist'),
+        ('virtual-journal-reader/serve_reader.py', 'virtual-journal-reader'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

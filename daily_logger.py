@@ -8,12 +8,14 @@ import ctypes
 import io
 import importlib
 import importlib.util
+import atexit
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import webbrowser
 import tempfile
 import threading
 import time
@@ -864,6 +866,248 @@ def update_journal_entry_at(sheet_name: str, row_index: int, row_values: List[st
     reorder_journal_sheets(wb)
     save_workbook_with_retry(wb, workbook_path)
     return True
+
+
+def _journal_cell_to_display_string(col_index_zero_based: int, value: object) -> str:
+    if value is None:
+        return ""
+    if col_index_zero_based == 0:
+        if isinstance(value, datetime):
+            return value.strftime("%m/%d/%Y")
+        if isinstance(value, date):
+            return value.strftime("%m/%d/%Y")
+        return str(value).strip()
+    if col_index_zero_based == 1:
+        if isinstance(value, datetime):
+            return value.strftime("%I:%M%p").lstrip("0")
+        return str(value).strip()
+    return "" if value is None else str(value)
+
+
+def load_journal_reader_entries() -> Tuple[List[Dict[str, object]], Optional[str]]:
+    """Load journal rows for the Virtual Reader API (non-interactive; no input() on lock)."""
+    module = MODULES["J"]
+    workbook_path = ensure_workbook(module)
+    try:
+        wb = load_workbook(workbook_path, read_only=True, data_only=True)
+    except PermissionError:
+        return [], "Journal.xlsx is locked or unavailable. Close it in Excel and try again."
+    out: List[Dict[str, object]] = []
+    try:
+        for sheet in wb.worksheets:
+            if sheet.title == MASTER_JOURNAL_SHEET:
+                continue
+            try:
+                datetime.strptime(sheet.title, "%Y-%m-%d")
+            except ValueError:
+                continue
+            for row_index in range(2, sheet.max_row + 1):
+                values = [
+                    sheet.cell(row=row_index, column=col).value
+                    for col in range(1, len(module.headers) + 1)
+                ]
+                if is_row_empty(values):
+                    continue
+                date_s = _journal_cell_to_display_string(0, values[0])
+                time_s = _journal_cell_to_display_string(1, values[1])
+                journal_s = "" if values[2] is None else str(values[2])
+                speech_s = "" if len(values) <= 3 or values[3] is None else str(values[3])
+                report_s = "" if len(values) <= 4 or values[4] is None else str(values[4])
+                out.append(
+                    {
+                        "id": f"{sheet.title}|{row_index}",
+                        "sheetName": sheet.title,
+                        "rowIndex": row_index,
+                        "isoDate": sheet.title,
+                        "date": date_s,
+                        "time": time_s,
+                        "journal": journal_s,
+                        "speechToText": speech_s,
+                        "aiReport": report_s,
+                    }
+                )
+    finally:
+        wb.close()
+    out.sort(key=lambda item: (str(item.get("isoDate", "")), int(item.get("rowIndex", 0))))
+    return out, None
+
+
+def patch_journal_reader_entry(
+    sheet_name: str,
+    row_index: int,
+    *,
+    journal: Optional[str] = None,
+    speech_to_text: Optional[str] = None,
+    ai_report: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Update selected columns on one journal row. Non-interactive (no input() on lock)."""
+    module = MODULES["J"]
+    workbook_path = ensure_workbook(module)
+    try:
+        wb = load_workbook(workbook_path)
+    except PermissionError:
+        return False, "Journal.xlsx is locked or unavailable. Close it in Excel and try again."
+    try:
+        if sheet_name not in wb.sheetnames:
+            return False, "Worksheet not found."
+        ws = wb[sheet_name]
+        if row_index < 2 or row_index > ws.max_row:
+            return False, "Row not found."
+        values = [ws.cell(row=row_index, column=col).value for col in range(1, len(module.headers) + 1)]
+        row_strs = [_journal_cell_to_display_string(i, v) for i, v in enumerate(values)]
+        while len(row_strs) < len(module.headers):
+            row_strs.append("")
+        row_strs = row_strs[: len(module.headers)]
+        if journal is not None:
+            row_strs[2] = journal
+        if speech_to_text is not None:
+            row_strs[3] = speech_to_text
+        if ai_report is not None:
+            row_strs[4] = ai_report
+        for col_index, value in enumerate(row_strs, start=1):
+            ws.cell(row=row_index, column=col_index, value=value)
+        rebuild_master_journal_from_daily_pages(wb, module)
+        reorder_journal_sheets(wb)
+        try:
+            wb.save(workbook_path)
+        except PermissionError:
+            return False, "Cannot save: Journal.xlsx is locked. Close it in Excel and try again."
+        return True, ""
+    finally:
+        wb.close()
+
+
+def virtual_journal_reader_addon_paths() -> Optional[Tuple[Path, Path]]:
+    """Return (serve_reader.py, dist_dir) if the Virtual Reader addon is present."""
+    roots: List[Path] = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            roots.append(Path(meipass) / "virtual-journal-reader")
+    roots.append(BASE_DIR / "virtual-journal-reader")
+    if getattr(sys, "frozen", False):
+        roots.append(Path(sys.executable).resolve().parent / "virtual-journal-reader")
+    for root in roots:
+        script = root / "serve_reader.py"
+        dist = root / "dist"
+        if script.is_file() and (dist / "index.html").is_file():
+            return script, dist
+    return None
+
+
+VIRTUAL_READER_REQUIRED_BUILD = 4
+
+_virtual_reader_child_proc: Optional[subprocess.Popen] = None
+
+
+def shutdown_virtual_reader_child_server() -> None:
+    """Stop the Virtual Reader HTTP server process we started from this Daily Logger session."""
+    global _virtual_reader_child_proc
+    proc = _virtual_reader_child_proc
+    _virtual_reader_child_proc = None
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+atexit.register(shutdown_virtual_reader_child_server)
+
+
+def _virtual_reader_health_info(port: int, timeout_sec: float = 0.35) -> Optional[Dict[str, Any]]:
+    try:
+        with request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=timeout_sec) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def open_virtual_journal_reader_in_browser() -> Tuple[bool, str]:
+    """Start the Virtual Reader local server if needed and open the default browser."""
+    paths = virtual_journal_reader_addon_paths()
+    if paths is None:
+        return False, "Virtual Reader addon not found (build virtual-journal-reader and ensure dist/ exists)."
+    script_path, dist_dir = paths
+    port = 8765
+
+    info = _virtual_reader_health_info(port)
+    if info and info.get("ok") is True:
+        bld = int(info.get("readerBuild", 0) or 0)
+        if bld < VIRTUAL_READER_REQUIRED_BUILD:
+            return (
+                False,
+                "Virtual Reader on port 8765 is still running an old version.\n\n"
+                "Fix: Task Manager → end the Python process using port 8765, then open Virtual Reader again.\n"
+                "Also run: cd virtual-journal-reader && npm run build",
+            )
+        url = f"http://127.0.0.1:{port}/?_cb={int(time.time() * 1000)}"
+        webbrowser.open(url)
+        return True, ""
+    env = os.environ.copy()
+    env["VIRTUAL_READER_DIST"] = str(dist_dir.resolve())
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    global _virtual_reader_child_proc
+    try:
+        _virtual_reader_child_proc = subprocess.Popen(
+            [sys.executable, str(script_path), "--port", str(port)],
+            cwd=str(script_path.resolve().parent),
+            env=env,
+            close_fds=sys.platform != "win32",
+            creationflags=creationflags,
+        )
+    except OSError as exc:
+        _virtual_reader_child_proc = None
+        return False, f"Could not start Virtual Reader server: {exc}"
+    for _ in range(50):
+        time.sleep(0.1)
+        info2 = _virtual_reader_health_info(port, timeout_sec=0.5)
+        if (
+            info2
+            and info2.get("ok") is True
+            and int(info2.get("readerBuild", 0) or 0) >= VIRTUAL_READER_REQUIRED_BUILD
+        ):
+            url = f"http://127.0.0.1:{port}/?_cb={int(time.time() * 1000)}"
+            webbrowser.open(url)
+            return True, ""
+    proc = _virtual_reader_child_proc
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    _virtual_reader_child_proc = None
+    return False, "Virtual Reader server did not become ready in time."
+
+
+def open_virtual_reader_nav_action() -> Tuple[bool, str]:
+    """Nav rail Virtual Reader: open reader in browser when addon exists; else open Journal.xlsx via file URI."""
+    paths = virtual_journal_reader_addon_paths()
+    if paths is not None:
+        ok, err = open_virtual_journal_reader_in_browser()
+        return ok, err
+    try:
+        jp = ensure_workbook(MODULES["J"])
+        uri = jp.resolve().as_uri()
+        webbrowser.open(uri)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
 
 
 def delete_journal_entry_at(sheet_name: str, row_index: int) -> bool:
@@ -2470,6 +2714,11 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             edit_target_row = 0
 
     root = tk.Tk()
+
+    def destroy_journal_window() -> None:
+        shutdown_virtual_reader_child_server()
+        root.destroy()
+
     root_prefs = load_preferences()
     ui_lang_holder: List[str] = [
         normalize_ui_language(str(root_prefs.get(UI_LANGUAGE_PREF_KEY, "en")))
@@ -2629,6 +2878,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     nav_title.grid(row=0, column=0, sticky="w", padx=(12, 0), pady=(14, 10))
 
     nav_buttons: Dict[str, Any] = {}
+    nav_extra_buttons: List[Any] = []
     active_page = {"key": "journal"}
     active_page_frame: Dict[str, Any] = {"frame": None}
     page_leave_reset_handlers: Dict[str, Callable[[], None]] = {}
@@ -2684,6 +2934,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                 btn.config(bg=th().accent, fg="white")
             else:
                 btn.config(bg=th().btn_secondary, fg=th().text)
+        for btn in nav_extra_buttons:
+            btn.config(bg=th().btn_secondary, fg=th().text)
 
     page_toggle_buttons: List[Any] = []
     nav_summon_btn = tk.Button(
@@ -2825,8 +3077,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     top = tk.Frame(journal_page, bg=t_init.panel, bd=0, highlightthickness=0)
     top.pack(fill="x", padx=t_init.pad_outer, pady=t_init.pad_top_y)
-    top.grid_columnconfigure(5, weight=1)
-    top.grid_columnconfigure(6, weight=0)
+    top.grid_columnconfigure(6, weight=1)
     _register_page_toggle(journal_page)
     date_lbl = tk.Label(
         top,
@@ -6556,7 +6807,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             saved["value"] = True
             if autosave_id["value"] is not None:
                 root.after_cancel(autosave_id["value"])
-            root.destroy()
+            destroy_journal_window()
             return
         if not text_value:
             text_value = "(no details entered)"
@@ -6581,7 +6832,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         saved["value"] = True
         if autosave_id["value"] is not None:
             root.after_cancel(autosave_id["value"])
-        root.destroy()
+        destroy_journal_window()
 
     def on_close(event=None) -> None:
         has_content = any(
@@ -6595,7 +6846,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             clear_journal_window_draft()
             if autosave_id["value"] is not None:
                 root.after_cancel(autosave_id["value"])
-            root.destroy()
+            destroy_journal_window()
             return
         save_choice = messagebox.askyesnocancel(
             "Close Journal Window",
@@ -6615,7 +6866,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         save_draft()
         if autosave_id["value"] is not None:
             root.after_cancel(autosave_id["value"])
-        root.destroy()
+        destroy_journal_window()
 
     console_history: List[str] = []
     console_hist_index = {"value": 0}
@@ -7221,6 +7472,13 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
                     activebackground=t.secondary_hover,
                     activeforeground=t.text,
                 )
+        for btn in nav_extra_buttons:
+            btn.config(
+                bg=t.btn_secondary,
+                fg=t.text,
+                activebackground=t.secondary_hover,
+                activeforeground=t.text,
+            )
         top.configure(bg=t.panel)
         top.pack_configure(padx=t.pad_outer, pady=t.pad_top_y)
         find_row.configure(bg=t.panel)
@@ -7513,6 +7771,43 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             lambda k=_key: th().hover_primary if active_page["key"] == k else th().secondary_hover,
             lambda k=_key: "white" if active_page["key"] == k else th().text,
         )
+
+    def on_virtual_reader_nav_clicked() -> None:
+        ok, err = open_virtual_reader_nav_action()
+        if not ok and err:
+            messagebox.showerror("Virtual Reader", err)
+
+    nav_virtual_reader_btn = tk.Button(
+        nav_rail,
+        text="Virtual Reader",
+        command=on_virtual_reader_nav_clicked,
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 10, "bold"),
+        padx=10,
+        pady=8,
+        anchor="w",
+        cursor="hand2",
+        bd=0,
+        highlightthickness=0,
+    )
+    nav_virtual_reader_btn.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 8))
+    nav_extra_buttons.append(nav_virtual_reader_btn)
+    bind_button_hover_if_enabled(
+        nav_virtual_reader_btn,
+        lambda: (
+            "normal",
+            th().btn_secondary,
+            th().text,
+            th().secondary_hover,
+            th().text,
+        ),
+        lambda: th().secondary_hover,
+        lambda: th().text,
+    )
 
     nav_settings_btn = tk.Button(
         nav_rail,

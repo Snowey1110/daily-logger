@@ -1,3 +1,7 @@
+# Local / agent NDJSON debug logs (never commit)
+debug.log
+debug-*.log
+
 settings/daily_logger_api_key.txt
 settings/daily_logger_prefs.json
 settings/wifi_warn_list.json
