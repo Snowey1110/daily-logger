@@ -185,6 +185,30 @@ class ReaderHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": "Invalid JSON"})
             return
 
+        if path == "/api/entry/create":
+            date_val = str(payload.get("date", "")).strip()
+            time_val = str(payload.get("time", "")).strip()
+            if not date_val or not time_val:
+                self._send_json(400, {"ok": False, "error": "Missing date or time"})
+                return
+            ok, msg, entry_id = dl.create_journal_reader_entry(date_val, time_val)
+            if ok:
+                self._send_json(200, {"ok": True, "id": entry_id})
+            else:
+                self._send_json(409, {"ok": False, "error": msg})
+            return
+
+        if path == "/api/entry/delete":
+            entry_id = str(payload.get("id", "")).strip()
+            parsed_id = _parse_id(entry_id)
+            if not parsed_id:
+                self._send_json(400, {"ok": False, "error": "Missing or invalid id"})
+                return
+            sheet_name, row_index = parsed_id
+            ok, msg = dl.delete_journal_reader_entry(sheet_name, row_index)
+            self._send_json(200 if ok else 409, {"ok": ok, "error": msg})
+            return
+
         if path == "/api/entry":
             entry_id = str(payload.get("id", "")).strip()
             parsed_id = _parse_id(entry_id)

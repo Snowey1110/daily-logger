@@ -983,6 +983,68 @@ def patch_journal_reader_entry(
         wb.close()
 
 
+def create_journal_reader_entry(
+    date_str: str,
+    time_str: str,
+) -> Tuple[bool, str, Optional[str]]:
+    """Create a blank journal entry. Returns (ok, error_msg, new_entry_id)."""
+    module = MODULES["J"]
+    workbook_path = ensure_workbook(module)
+    try:
+        wb = load_workbook(workbook_path)
+    except PermissionError:
+        return False, "Journal.xlsx is locked or unavailable. Close it in Excel and try again.", None
+    try:
+        daily_ws = get_or_create_journal_daily_sheet(wb, module, date_str)
+        target_row = find_first_empty_data_row(daily_ws, len(module.headers))
+        row_data = [date_str, time_str, "", "", ""]
+        for col_index, value in enumerate(row_data, start=1):
+            daily_ws.cell(row=target_row, column=col_index, value=value)
+        rebuild_master_journal_from_daily_pages(wb, module)
+        reorder_journal_sheets(wb)
+        try:
+            wb.save(workbook_path)
+        except PermissionError:
+            return False, "Cannot save: Journal.xlsx is locked. Close it in Excel and try again.", None
+        sheet_name = daily_ws.title
+        entry_id = f"{sheet_name}|{target_row}"
+        return True, "", entry_id
+    finally:
+        wb.close()
+
+
+def delete_journal_reader_entry(
+    sheet_name: str,
+    row_index: int,
+) -> Tuple[bool, str]:
+    """Delete a journal entry row. Returns (ok, error_msg)."""
+    module = MODULES["J"]
+    workbook_path = ensure_workbook(module)
+    try:
+        wb = load_workbook(workbook_path)
+    except PermissionError:
+        return False, "Journal.xlsx is locked or unavailable. Close it in Excel and try again."
+    try:
+        if sheet_name not in wb.sheetnames:
+            return False, "Worksheet not found."
+        ws = wb[sheet_name]
+        if row_index < 2 or row_index > ws.max_row:
+            return False, "Row not found."
+        ws.delete_rows(row_index, 1)
+        # If the sheet is now empty (only header), remove it
+        if ws.max_row <= 1:
+            del wb[sheet_name]
+        rebuild_master_journal_from_daily_pages(wb, module)
+        reorder_journal_sheets(wb)
+        try:
+            wb.save(workbook_path)
+        except PermissionError:
+            return False, "Cannot save: Journal.xlsx is locked. Close it in Excel and try again."
+        return True, ""
+    finally:
+        wb.close()
+
+
 def virtual_journal_reader_addon_paths() -> Optional[Tuple[Path, Path]]:
     """Return (serve_reader.py, dist_dir) if the Virtual Reader addon is present."""
     roots: List[Path] = []

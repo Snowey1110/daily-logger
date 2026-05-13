@@ -1,12 +1,14 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { cn, JournalEntry, JournalSection, PositionedSketch, RightPageSetting } from '../lib/utils';
+import { cn, JournalEntry, JournalSection, PositionedSketch } from '../lib/utils';
 import Cover from './Cover';
 import Navigation from './Navigation';
 import { DrawingCanvas } from './DrawingCanvas';
 import { SketchPlacer } from './SketchPlacer';
 import { ChevronLeft, ChevronRight, Type, MessageSquare, BrainCircuit } from 'lucide-react';
 import { useReaderT } from '../readerI18n';
+import { useTheme } from './ThemeProvider';
+import type { JournalTheme } from '../types/theme';
 
 export type JournalAction = 'sketch' | 'edit';
 
@@ -30,15 +32,11 @@ interface Spread {
   left: PageContent;
   right: PageContent;
   isFirstSpread: boolean;
-  rightAltContent?: PageContent;
-  rightHasTabs?: boolean;
-  rightTabDefault?: 'sketch' | 'secondary';
 }
 
 /* ──── localStorage helpers ──── */
 
 const READER_SORT_KEY = 'virtualJournalReader.sortOrder';
-const RIGHT_PAGE_KEY = 'virtualJournalReader.rightPageSetting';
 
 function readStored<T extends string>(key: string, allowed: T[], fallback: T): T {
   try {
@@ -79,18 +77,16 @@ function buildLeftPage(
     leftText = aiText;
   }
 
-  const left: PageContent = leftText
-    ? {
-        type: 'text',
-        content: leftText,
-        journalPage: 1,
-        sourceEntryId: entry.id,
-        sourceDate: displayDate,
-        sourceTime: displayTime,
-        showJournalEntryHeader: true,
-        leftFallbackSection: leftFallback !== 'journal' ? leftFallback : undefined,
-      }
-    : { type: 'empty' };
+  const left: PageContent = {
+    type: 'text',
+    content: leftText,
+    journalPage: 1,
+    sourceEntryId: entry.id,
+    sourceDate: displayDate,
+    sourceTime: displayTime,
+    showJournalEntryHeader: true,
+    leftFallbackSection: leftFallback !== 'journal' ? leftFallback : undefined,
+  };
 
   return { left, leftFallback };
 }
@@ -158,9 +154,6 @@ function applyPageBreaks(rawSpreads: Spread[]): Spread[] {
         left: newLeft,
         right: newRight,
         isFirstSpread: i === 0 ? spread.isFirstSpread : false,
-        rightHasTabs: i === 0 ? (spread.rightHasTabs ?? false) : false,
-        rightAltContent: i === 0 ? spread.rightAltContent : undefined,
-        rightTabDefault: spread.rightTabDefault,
       });
     }
   }
@@ -175,7 +168,7 @@ interface PageItem {
   entryId: string;
   date: string;
   time: string;
-  sketchContent?: PageContent;
+  sketchContents?: PageContent[];
 }
 
 function expandEntryToPages(
@@ -183,7 +176,7 @@ function expandEntryToPages(
   displayDate: string,
   displayTime: string,
   left: PageContent,
-  sketchPC?: PageContent,
+  sketchPCs: PageContent[],
 ): PageItem[] {
   const textPages: PageContent[] = [];
 
@@ -206,7 +199,7 @@ function expandEntryToPages(
     entryId: entry.id,
     date: displayDate,
     time: displayTime,
-    sketchContent: j === textPages.length - 1 ? sketchPC : undefined,
+    sketchContents: j === textPages.length - 1 && sketchPCs.length > 0 ? sketchPCs : undefined,
   }));
 }
 
@@ -215,11 +208,12 @@ function buildUnifiedSpreads(
   sketches: PositionedSketch[],
   activeSection: JournalSection,
 ): Spread[] {
-  const sketchByEntry = new Map<string, PositionedSketch>();
+  // Build a map from entryId -> ordered list of sketches
+  const sketchesByEntry = new Map<string, PositionedSketch[]>();
   for (const sk of sketches) {
-    if (!sketchByEntry.has(sk.afterEntryId)) {
-      sketchByEntry.set(sk.afterEntryId, sk);
-    }
+    const list = sketchesByEntry.get(sk.afterEntryId) ?? [];
+    list.push(sk);
+    sketchesByEntry.set(sk.afterEntryId, list);
   }
 
   const spreads: Spread[] = [];
@@ -229,16 +223,20 @@ function buildUnifiedSpreads(
     const items: PageItem[] = [];
 
     for (const entry of sortedEntries) {
-      const entrySketch = sketchByEntry.get(entry.id);
+      const entrySketches = sketchesByEntry.get(entry.id) ?? [];
       const displayDate = entryDisplayDate(entry);
       const displayTime = entry.time;
       const { left } = buildLeftPage(entry, displayDate, displayTime);
 
-      const sketchPC: PageContent | undefined = entrySketch
-        ? { type: 'sketch', content: entrySketch.dataUrl, sourceEntryId: entry.id, sourceDate: displayDate, sourceTime: displayTime }
-        : undefined;
+      const sketchPCs: PageContent[] = entrySketches.map((sk) => ({
+        type: 'sketch' as const,
+        content: sk.dataUrl,
+        sourceEntryId: entry.id,
+        sourceDate: displayDate,
+        sourceTime: displayTime,
+      }));
 
-      items.push(...expandEntryToPages(entry, displayDate, displayTime, left, sketchPC));
+      items.push(...expandEntryToPages(entry, displayDate, displayTime, left, sketchPCs));
     }
 
     // Pair page items into spreads
@@ -246,18 +244,31 @@ function buildUnifiedSpreads(
     while (i < items.length) {
       const item = items[i];
 
-      if (item.sketchContent) {
-        // This entry's last page has a sketch → sketch goes on the right
+      if (item.sketchContents && item.sketchContents.length > 0) {
+        // First sketch goes on the right of the text page
         spreads.push({
           entryId: item.entryId,
           date: item.date,
           time: item.time,
           left: item.content,
-          right: item.sketchContent,
+          right: item.sketchContents[0],
           isFirstSpread: true,
-          rightHasTabs: false,
-          rightTabDefault: 'sketch',
         });
+        // Remaining sketches: pair them two at a time (left + right)
+        let s = 1;
+        while (s < item.sketchContents.length) {
+          const leftSketch = item.sketchContents[s];
+          const rightSketch = s + 1 < item.sketchContents.length ? item.sketchContents[s + 1] : null;
+          spreads.push({
+            entryId: item.entryId,
+            date: item.date,
+            time: item.time,
+            left: leftSketch,
+            right: rightSketch ?? { type: 'empty' },
+            isFirstSpread: false,
+          });
+          s += rightSketch ? 2 : 1;
+        }
         i += 1;
       } else {
         // Pair with the next page item
@@ -269,31 +280,23 @@ function buildUnifiedSpreads(
           left: item.content,
           right: nextItem ? nextItem.content : { type: 'empty' },
           isFirstSpread: true,
-          rightHasTabs: false,
-          rightTabDefault: 'sketch',
         });
         i += nextItem ? 2 : 1;
       }
     }
   } else {
-    // STT or AI mode: one spread per entry.
-    // Literal \n is rendered as a regular newline (no page break).
+    // STT or AI mode: left page cycles through journal text then sketches,
+    // right page always shows the secondary content (STT or AI report).
     for (let i = 0; i < sortedEntries.length; i++) {
       const entry = sortedEntries[i];
-      const entrySketch = sketchByEntry.get(entry.id);
-      const hasSketch = !!entrySketch;
+      const entrySketches = sketchesByEntry.get(entry.id) ?? [];
       const displayDate = entryDisplayDate(entry);
       const displayTime = entry.time;
       const { left, leftFallback } = buildLeftPage(entry, displayDate, displayTime);
 
-      // Convert literal \n to real newlines in left page content
       const leftResolved: PageContent = left.type === 'text' && left.content
         ? { ...left, content: pageBreakToNewline(left.content) }
         : left;
-
-      let right: PageContent;
-      let rightAlt: PageContent | undefined;
-      let rightHasTabs = false;
 
       const secondaryField = activeSection === 'stt' ? 'speechToText' : 'aiReport';
       let secondaryText = (entry[secondaryField] || '').trim();
@@ -304,31 +307,36 @@ function buildUnifiedSpreads(
       }
       secondaryText = pageBreakToNewline(secondaryText);
 
-      if (hasSketch) {
-        right = {
-          type: 'sketch',
-          content: entrySketch!.dataUrl,
-          sourceEntryId: entry.id,
-          sourceDate: displayDate,
-          sourceTime: displayTime,
-        };
-        rightAlt = { type: 'text', content: secondaryText, secondaryPage: 1, sourceEntryId: entry.id, sourceDate: displayDate, sourceTime: displayTime };
-        rightHasTabs = true;
-      } else {
-        right = { type: 'text', content: secondaryText, secondaryPage: 1, sourceEntryId: entry.id, sourceDate: displayDate, sourceTime: displayTime };
-      }
+      const secondaryPC: PageContent = { type: 'text', content: secondaryText, secondaryPage: 1, sourceEntryId: entry.id, sourceDate: displayDate, sourceTime: displayTime };
 
+      // First spread: journal text on left, secondary on right
       spreads.push({
         entryId: entry.id,
         date: displayDate,
         time: displayTime,
         left: leftResolved,
-        right,
+        right: secondaryPC,
         isFirstSpread: true,
-        rightAltContent: rightAlt,
-        rightHasTabs,
-        rightTabDefault: 'sketch',
       });
+
+      // Each sketch gets its own spread with secondary content pinned on the right
+      for (const sk of entrySketches) {
+        const sketchPC: PageContent = {
+          type: 'sketch',
+          content: sk.dataUrl,
+          sourceEntryId: entry.id,
+          sourceDate: displayDate,
+          sourceTime: displayTime,
+        };
+        spreads.push({
+          entryId: entry.id,
+          date: displayDate,
+          time: displayTime,
+          left: sketchPC,
+          right: secondaryPC,
+          isFirstSpread: false,
+        });
+      }
     }
   }
 
@@ -394,6 +402,7 @@ async function fetchData(): Promise<{
 
 const JournalBook: React.FC = () => {
   const { t } = useReaderT();
+  const { coverTheme, bgTheme } = useTheme();
   const [entries, setEntries] = useState<JournalEntry[]>([]);
   const [sketches, setSketches] = useState<PositionedSketch[]>([]);
   const [appTitle, setAppTitle] = useState('Daily Logger');
@@ -401,12 +410,7 @@ const JournalBook: React.FC = () => {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(0);
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(() => readStored(READER_SORT_KEY, ['asc', 'desc'], 'asc'));
-  const [rightPageSetting, setRightPageSetting] = useState<RightPageSetting>(() => readStored(RIGHT_PAGE_KEY, ['none', 'ai', 'stt'], 'none'));
-  const [activeSection, setActiveSection] = useState<JournalSection>(() => {
-    const stored = readStored(RIGHT_PAGE_KEY, ['none', 'ai', 'stt'], 'none');
-    return stored === 'none' ? 'journal' : stored;
-  });
-  const [rightTabOverride, setRightTabOverride] = useState<'sketch' | 'secondary' | null>(null);
+  const [activeSection, setActiveSection] = useState<JournalSection>('journal');
 
   const [showSketchPlacer, setShowSketchPlacer] = useState(false);
   const [sketchingAfterEntryId, setSketchingAfterEntryId] = useState<string | null>(null);
@@ -549,7 +553,7 @@ const JournalBook: React.FC = () => {
       }
 
       // Right page (text only, not sketch/empty)
-      const rp = resolvedRight ?? spread.right;
+      const rp = spread.right;
       if (rp.type === 'text' && rp.sourceEntryId) {
         const rightEid = rp.sourceEntryId;
         const rightEntry = entries.find((e) => e.id === rightEid);
@@ -665,6 +669,38 @@ const JournalBook: React.FC = () => {
     setEditingSketchId(null);
   };
 
+  const handleDeleteEntry = async (entryId: string) => {
+    setSaveError(null);
+    try {
+      const res = await fetch('/api/entry/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: entryId }),
+      });
+      const data = await res.json();
+      if (!data.ok) { setSaveError(data.error || t('errDeleteEntry')); return; }
+      await reload();
+    } catch { setSaveError(t('errDeleteEntry')); }
+  };
+
+  const handleCreatePage = async (date: string, time: string, _afterEntryId: string) => {
+    setSaveError(null);
+    try {
+      const res = await fetch('/api/entry/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ date, time }),
+      });
+      const data = await res.json();
+      if (!data.ok) { setSaveError(data.error || t('errCreatePage')); return; }
+      setShowSketchPlacer(false);
+      await reload();
+      if (data.id) {
+        goToEntry(data.id);
+      }
+    } catch { setSaveError(t('errCreatePage')); }
+  };
+
   const isDrawing = sketchingAfterEntryId !== null || editingSketchId !== null;
   const drawingInitialData = editingSketchId ? sketches.find((s) => s.id === editingSketchId)?.dataUrl : undefined;
 
@@ -677,51 +713,18 @@ const JournalBook: React.FC = () => {
     setEditedRightText('');
   };
 
-  const handleRightPageSettingChange = (setting: RightPageSetting) => {
-    clearEditing();
-    setRightPageSetting(setting);
-    persistStored(RIGHT_PAGE_KEY, setting);
-    setActiveSection(setting === 'none' ? 'journal' : setting);
-  };
-
   const handleBookmarkClick = (section: JournalSection) => {
     clearEditing();
     setActiveSection(section);
-    const mapped: RightPageSetting = section === 'journal' ? 'none' : section;
-    setRightPageSetting(mapped);
-    persistStored(RIGHT_PAGE_KEY, mapped);
   };
 
-  /* ── right tab toggle for spreads with tabs ── */
-
-  useEffect(() => { setRightTabOverride(null); }, [currentPage]);
-
   const currentSpread = currentPage > 0 ? spreads[currentPage - 1] : undefined;
-  const effectiveRightTab = currentSpread?.rightHasTabs
-    ? (rightTabOverride ?? currentSpread.rightTabDefault ?? 'sketch')
-    : null;
-
-  const resolvedRight = useMemo(() => {
-    if (!currentSpread) return undefined;
-    if (effectiveRightTab === 'secondary' && currentSpread.rightAltContent) {
-      return currentSpread.rightAltContent;
-    }
-    return currentSpread.right;
-  }, [currentSpread, effectiveRightTab]);
-
-  const resolvedSpread = useMemo(() => {
-    if (!currentSpread) return undefined;
-    if (resolvedRight && resolvedRight !== currentSpread.right) {
-      return { ...currentSpread, right: resolvedRight };
-    }
-    return currentSpread;
-  }, [currentSpread, resolvedRight]);
 
   const isEditing = !!editingEntryId || !!editingRightEntryId;
 
   return (
-    <div className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-[#2c1e14] text-[#d9c5b2] select-none font-sans">
-      <div className="absolute top-6 left-8 text-[#d9c5b2] opacity-80 z-10">
+    <div className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden select-none font-sans transition-colors duration-500" style={{ backgroundColor: bgTheme.colors.bg }}>
+      <div className="absolute top-6 left-8 opacity-80 z-10" style={{ color: bgTheme.cover.accentText }}>
         <h1 className="text-2xl tracking-widest uppercase font-light font-serif">
           {appTitle}{' '}
           <span className="text-xs opacity-50 block tracking-normal font-sans">{t('readerSubtitle')}</span>
@@ -753,8 +756,6 @@ const JournalBook: React.FC = () => {
         onDateSelect={handleDateSelect}
         isEditTextOpen={isEditing}
         onSaveText={() => void handleSaveText()}
-        rightPageSetting={rightPageSetting}
-        onRightPageSettingChange={handleRightPageSettingChange}
       />
 
       <div className="flex-1 flex min-h-0 items-center justify-center p-3 md:p-5 perspective-[2000px]">
@@ -763,9 +764,10 @@ const JournalBook: React.FC = () => {
 
           <div
             className={cn(
-              'absolute left-1/2 -ml-0.5 top-0 bottom-0 w-px bg-black/10 z-20 shadow-[0_0_10px_rgba(0,0,0,0.1)]',
+              'absolute left-1/2 -ml-0.5 top-0 bottom-0 w-px z-20 shadow-[0_0_10px_rgba(0,0,0,0.1)]',
               currentPage === 0 && 'hidden',
             )}
+            style={{ backgroundColor: bgTheme.colors.spine }}
           />
 
           <AnimatePresence mode="wait">
@@ -781,6 +783,7 @@ const JournalBook: React.FC = () => {
               >
                 <Cover
                   title={appTitle}
+                  theme={coverTheme}
                   onClick={() => {
                     const first = sortedEntries[0];
                     if (first) goToEntry(first.id);
@@ -792,7 +795,8 @@ const JournalBook: React.FC = () => {
               <motion.div
                 ref={bookSpreadRef}
                 key={`page-pair-${currentPage}`}
-                className="relative flex h-full min-h-0 w-full overflow-hidden rounded-lg bg-[#fdfaf2] shadow-2xl"
+                className="relative flex h-full min-h-0 w-full overflow-hidden rounded-lg shadow-2xl transition-colors duration-500"
+                style={{ backgroundColor: bgTheme.colors.bookInner }}
                 initial={{ scale: 0.95, opacity: 0 }}
                 animate={{ scale: 1, opacity: 1 }}
                 transition={{ duration: 0.5 }}
@@ -818,27 +822,22 @@ const JournalBook: React.FC = () => {
                 )}
 
                 <Page
-                  spread={resolvedSpread}
+                  spread={currentSpread}
                   side="left"
-                  rightPageSetting={rightPageSetting}
                   activeSection={activeSection}
                   editingEntryId={editingEntryId}
                   editText={editedText}
                   onTextChange={setEditedText}
-                  rightTab={effectiveRightTab}
-                  onRightTabChange={setRightTabOverride}
+                  theme={bgTheme}
                 />
                 <Page
-                  spread={resolvedSpread}
+                  spread={currentSpread}
                   side="right"
-                  rightPageSetting={rightPageSetting}
                   activeSection={activeSection}
                   editingEntryId={editingRightEntryId}
                   editText={editedRightText}
                   onTextChange={setEditedRightText}
-                  rightTab={effectiveRightTab}
-                  onRightTabChange={setRightTabOverride}
-                  hasRightTabs={currentSpread?.rightHasTabs}
+                  theme={bgTheme}
                 />
               </motion.div>
             )}
@@ -853,6 +852,7 @@ const JournalBook: React.FC = () => {
                 icon={<Type size={16} />}
                 isActive={activeSection === 'journal'}
                 onClick={() => handleBookmarkClick('journal')}
+                colors={bgTheme.colors.tabs.journal}
               />
               <BookmarkTab
                 label={t('tabSpeech')}
@@ -860,6 +860,7 @@ const JournalBook: React.FC = () => {
                 icon={<MessageSquare size={16} />}
                 isActive={activeSection === 'stt'}
                 onClick={() => handleBookmarkClick('stt')}
+                colors={bgTheme.colors.tabs.stt}
               />
               <BookmarkTab
                 label={t('tabAi')}
@@ -867,21 +868,24 @@ const JournalBook: React.FC = () => {
                 icon={<BrainCircuit size={16} />}
                 isActive={activeSection === 'ai'}
                 onClick={() => handleBookmarkClick('ai')}
+                colors={bgTheme.colors.tabs.ai}
               />
             </div>
           )}
         </div>
       </div>
 
-      {/* Sketch placer modal */}
+      {/* Insert manager modal */}
       {showSketchPlacer && (
         <SketchPlacer
           entries={sortedEntries}
           sketches={sketches}
           sortOrder={sortOrder}
           onCreateSketch={handleCreateSketch}
+          onCreatePage={handleCreatePage}
           onEditSketch={handleEditSketch}
           onDeleteSketch={handleDeleteSketch}
+          onDeleteEntry={handleDeleteEntry}
           onClose={() => setShowSketchPlacer(false)}
         />
       )}
@@ -896,31 +900,31 @@ const JournalBook: React.FC = () => {
         />
       )}
 
-      <footer className="shrink-0 flex flex-col items-center gap-2 px-4 pb-4 pt-2 text-center">
-        <div className="flex items-center justify-center space-x-12 text-[#d9c5b2]/40">
+      <footer className="shrink-0 flex flex-col items-center gap-2 px-4 pb-4 pt-2 text-center" style={{ color: bgTheme.cover.accentText }}>
+        <div className="flex items-center justify-center space-x-12 opacity-40">
           <button
             type="button"
             onClick={handlePrev}
-            className="flex items-center space-x-2 group hover:text-[#d9c5b2] transition-colors"
+            className="flex items-center space-x-2 group hover:opacity-100 transition-opacity"
           >
             <ChevronLeft className="w-5 h-5 group-hover:-translate-x-1 transition-transform" />
             <span className="text-sm uppercase tracking-widest font-sans">{t('footerPrev')}</span>
           </button>
           <div className="flex items-center space-x-3">
-            <div className={cn('w-1 h-1 rounded-full', currentPage < 2 ? 'bg-white/50' : 'bg-white/20')} />
-            <div className={cn('w-1.5 h-1.5 rounded-full', currentPage >= 2 && currentPage < spreadCount ? 'bg-white/50' : 'bg-white/20')} />
-            <div className={cn('w-1 h-1 rounded-full', currentPage >= spreadCount ? 'bg-white/50' : 'bg-white/20')} />
+            <div className={cn('w-1 h-1 rounded-full', currentPage < 2 ? 'bg-current/50' : 'bg-current/20')} />
+            <div className={cn('w-1.5 h-1.5 rounded-full', currentPage >= 2 && currentPage < spreadCount ? 'bg-current/50' : 'bg-current/20')} />
+            <div className={cn('w-1 h-1 rounded-full', currentPage >= spreadCount ? 'bg-current/50' : 'bg-current/20')} />
           </div>
           <button
             type="button"
             onClick={handleNext}
-            className="flex items-center space-x-2 group hover:text-[#d9c5b2] transition-colors"
+            className="flex items-center space-x-2 group hover:opacity-100 transition-opacity"
           >
             <span className="text-sm uppercase tracking-widest font-sans">{t('footerNext')}</span>
             <ChevronRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
           </button>
         </div>
-        <div className="text-[10px] uppercase tracking-[0.3em] text-[#d9c5b2]/20 font-sans leading-relaxed">
+        <div className="text-[10px] uppercase tracking-[0.3em] opacity-20 font-sans leading-relaxed">
           {t('footerFlipHint')}
         </div>
       </footer>
@@ -933,25 +937,20 @@ const JournalBook: React.FC = () => {
 const Page: React.FC<{
   spread?: Spread;
   side: 'left' | 'right';
-  rightPageSetting: RightPageSetting;
   activeSection: JournalSection;
   editingEntryId: string | null;
   editText?: string;
   onTextChange?: (text: string) => void;
-  rightTab?: 'sketch' | 'secondary' | null;
-  onRightTabChange?: (tab: 'sketch' | 'secondary') => void;
-  hasRightTabs?: boolean;
-}> = ({ spread, side, rightPageSetting, activeSection, editingEntryId, editText, onTextChange, rightTab, onRightTabChange, hasRightTabs }) => {
+  theme: JournalTheme;
+}> = ({ spread, side, activeSection, editingEntryId, editText, onTextChange, theme }) => {
   const { t } = useReaderT();
   if (!spread) {
     return (
       <div
-        className={cn(
-          'flex-1 h-full min-h-0 p-8 pr-10 flex items-center justify-center font-serif',
-          side === 'right' && 'bg-[#fbf8ef] pl-10 pr-8',
-        )}
+        className="w-1/2 h-full min-h-0 p-8 pr-10 flex items-center justify-center font-serif"
+        style={side === 'right' ? { backgroundColor: theme.colors.bookInner, paddingLeft: '2.5rem', paddingRight: '2rem' } : undefined}
       >
-        <p className="text-zinc-400 italic tracking-widest uppercase text-xs opacity-40">{t('pageEmpty')}</p>
+        <p className="italic tracking-widest uppercase text-xs opacity-40" style={{ color: theme.colors.textMuted }}>{t('pageEmpty')}</p>
       </div>
     );
   }
@@ -962,24 +961,15 @@ const Page: React.FC<{
   if (pContent.type === 'sketch') {
     const capDate = pContent.sourceDate ?? spread.date;
     return (
-      <div className="flex-1 h-full min-h-0 bg-[#fbf8ef] relative group overflow-hidden flex flex-col">
-        {/* Mini-tabs for right page */}
-        {side === 'right' && hasRightTabs && (
-          <RightPageTabs
-            activeTab={rightTab ?? 'sketch'}
-            onTabChange={onRightTabChange!}
-            rightSetting={rightPageSetting}
-            activeSection={activeSection}
-          />
-        )}
+      <div className="w-1/2 h-full min-h-0 relative group overflow-hidden flex flex-col" style={{ backgroundColor: theme.colors.bookInner }}>
         <div className="flex-1 min-h-0 relative">
           <img
             src={pContent.content}
             alt={t('pageSketchAlt')}
-            className="w-full h-full object-contain opacity-90 mix-blend-multiply group-hover:opacity-100 transition-opacity bg-[#fbf8ef]"
+            className="w-full h-full object-contain opacity-90 group-hover:opacity-100 transition-opacity"
+            style={{ backgroundColor: theme.colors.bookInner }}
           />
-          <div className="absolute inset-0 border-l border-black/5 pointer-events-none" />
-          <div className="absolute bottom-12 right-12 text-black/10 text-[9px] font-sans font-bold uppercase tracking-[0.3em]">
+          <div className="absolute bottom-12 right-12 text-[9px] font-sans font-bold uppercase tracking-[0.3em] opacity-15" style={{ color: theme.colors.text }}>
             {capDate} · {t('pageSketchCaption')}
           </div>
         </div>
@@ -991,12 +981,13 @@ const Page: React.FC<{
   if (pContent.type === 'empty') {
     return (
       <div
-        className={cn(
-          'flex-1 h-full min-h-0 p-8 pr-10 flex items-center justify-center font-serif',
-          side === 'right' && 'bg-[#fbf8ef] pl-10 pr-8 border-l border-black/5',
-        )}
+        className="w-1/2 h-full min-h-0 p-8 flex items-center justify-center font-serif"
+        style={{
+          backgroundColor: theme.colors.bookInner,
+          ...(side === 'right' ? { paddingLeft: '2.5rem', paddingRight: '2rem', borderLeft: `1px solid ${theme.colors.border}` } : {}),
+        }}
       >
-        <p className="text-zinc-400 italic tracking-widest uppercase text-[10px] opacity-20">{t('pageBlank')}</p>
+        <p className="italic tracking-widest uppercase text-[10px] opacity-20" style={{ color: theme.colors.textMuted }}>{t('pageBlank')}</p>
       </div>
     );
   }
@@ -1005,8 +996,7 @@ const Page: React.FC<{
   const isRightSecondary = side === 'right' && pContent.secondaryPage !== undefined;
   const hasFallback = !!pContent.leftFallbackSection;
   const sectionTitle = isRightSecondary
-    ? (rightPageSetting === 'stt' || (rightPageSetting === 'none' && activeSection === 'stt')
-        ? t('pageVoiceTranscript') : t('pageIntelAnalysis'))
+    ? (activeSection === 'stt' ? t('pageVoiceTranscript') : t('pageIntelAnalysis'))
     : hasFallback
       ? (pContent.leftFallbackSection === 'stt' ? t('pageVoiceTranscript') : t('pageIntelAnalysis'))
       : t('pageDailyReflection');
@@ -1028,49 +1018,44 @@ const Page: React.FC<{
 
   return (
     <div
-      className={cn(
-        'flex-1 h-full min-h-0 p-8 pr-10 flex flex-col relative overflow-hidden font-serif',
-        side === 'right' ? 'pl-10 pr-8 bg-[#fbf8ef]' : 'bg-[#fdfaf2] border-r border-black/5',
-      )}
+      className="w-1/2 h-full min-h-0 p-8 pr-10 flex flex-col relative overflow-hidden font-serif transition-colors duration-500"
+      style={{
+        backgroundColor: theme.colors.bookInner,
+        color: theme.colors.text,
+        ...(side === 'right'
+          ? { paddingLeft: '2.5rem', paddingRight: '2rem' }
+          : { borderRight: `1px solid ${theme.colors.border}` }),
+      }}
     >
-      {/* Mini-tabs for right page with secondary text */}
-      {side === 'right' && hasRightTabs && (
-        <RightPageTabs
-          activeTab={rightTab ?? 'secondary'}
-          onTabChange={onRightTabChange!}
-          rightSetting={rightPageSetting}
-          activeSection={activeSection}
-        />
-      )}
-
       {showBigHeader && (
-        <div className="border-b border-black/5 pb-4 mb-6">
-          <span className="text-xs uppercase tracking-widest text-black/40 font-sans">
+        <div className="pb-4 mb-6" style={{ borderBottom: `1px solid ${theme.colors.border}` }}>
+          <span className="text-xs uppercase tracking-widest font-sans opacity-40" style={{ color: theme.colors.textMuted }}>
             {columnDate} · {pContent.sourceTime ?? spread.time}
           </span>
-          <h2 className="text-2xl font-light text-slate-800 leading-tight mt-1 font-serif">
+          <h2 className="text-2xl font-light leading-tight mt-1 font-serif" style={{ color: theme.colors.text }}>
             {bigHeaderTitle}
           </h2>
         </div>
       )}
 
       {showSubHeader && (
-        <div className="border-b border-black/10 border-dashed pb-2 mb-6 flex justify-between items-end">
-          <h3 className="text-sm font-light text-slate-400 font-serif italic tracking-wide">
+        <div className="pb-2 mb-6 flex justify-between items-end border-dashed" style={{ borderBottom: `1px dashed ${theme.colors.border}` }}>
+          <h3 className="text-sm font-light font-serif italic tracking-wide" style={{ color: theme.colors.textMuted }}>
             {pageLabel !== undefined && pageLabel > 1
               ? `${sectionTitle} ${t('pageContSuffix')}`
               : sectionTitle}
           </h3>
-          <span className="text-[10px] text-black/20 font-sans">{columnDate}</span>
+          <span className="text-[10px] font-sans opacity-30" style={{ color: theme.colors.textMuted }}>{columnDate}</span>
         </div>
       )}
 
-      <div className="flex-1 text-slate-700 leading-relaxed text-base space-y-3 overflow-y-auto pr-2">
+      <div className="flex-1 leading-relaxed text-base space-y-3 overflow-y-auto pr-2" style={{ color: theme.colors.text }}>
         {showEditor ? (
           <textarea
             value={editText}
             onChange={(e) => onTextChange?.(e.target.value)}
-            className="w-full min-h-[60%] bg-transparent border border-black/10 rounded-md p-2 focus:ring-1 focus:ring-amber-700/30 resize-y font-serif text-slate-800 leading-relaxed"
+            className="w-full min-h-[60%] bg-transparent rounded-md p-2 focus:ring-1 resize-y font-serif leading-relaxed"
+            style={{ border: `1px solid ${theme.colors.border}`, color: theme.colors.text }}
             placeholder={t('pagePlaceholderEdit')}
             autoFocus
           />
@@ -1080,48 +1065,8 @@ const Page: React.FC<{
       </div>
 
       <div className="mt-8 flex justify-center shrink-0">
-        <div className="w-16 h-1 bg-black/5 rounded-full" />
+        <div className="w-16 h-1 rounded-full" style={{ backgroundColor: theme.colors.border }} />
       </div>
-    </div>
-  );
-};
-
-/* ──── Right-page mini-tabs ──── */
-
-const RightPageTabs: React.FC<{
-  activeTab: 'sketch' | 'secondary';
-  onTabChange: (tab: 'sketch' | 'secondary') => void;
-  rightSetting: RightPageSetting;
-  activeSection?: JournalSection;
-}> = ({ activeTab, onTabChange, rightSetting, activeSection }) => {
-  const { t } = useReaderT();
-  const section = activeSection ?? (rightSetting === 'none' ? 'journal' : rightSetting);
-  const secLabel = section === 'stt' ? t('rightTabStt') : t('rightTabAi');
-
-  return (
-    <div className="flex gap-1 mb-3 shrink-0 font-sans">
-      <button
-        onClick={() => onTabChange('sketch')}
-        className={cn(
-          'px-3 py-1 text-[10px] font-bold uppercase tracking-wider rounded-t-md transition-colors',
-          activeTab === 'sketch'
-            ? 'bg-[#e8dccb] text-[#5c4a36]'
-            : 'bg-transparent text-black/30 hover:text-black/50 hover:bg-black/[0.03]',
-        )}
-      >
-        {t('rightTabSketch')}
-      </button>
-      <button
-        onClick={() => onTabChange('secondary')}
-        className={cn(
-          'px-3 py-1 text-[10px] font-bold uppercase tracking-wider rounded-t-md transition-colors',
-          activeTab === 'secondary'
-            ? 'bg-[#e8dccb] text-[#5c4a36]'
-            : 'bg-transparent text-black/30 hover:text-black/50 hover:bg-black/[0.03]',
-        )}
-      >
-        {secLabel}
-      </button>
     </div>
   );
 };
@@ -1134,17 +1079,22 @@ const BookmarkTab: React.FC<{
   icon: React.ReactNode;
   isActive: boolean;
   onClick: () => void;
-}> = ({ label, tabNumber, icon, isActive, onClick }) => {
+  colors: { bg: string; active: string };
+}> = ({ label, tabNumber, icon, isActive, onClick, colors }) => {
   return (
     <motion.button
       type="button"
       onClick={onClick}
       className={cn(
         'px-6 py-3 rounded-r-md shadow-sm border-l-4 flex flex-col cursor-pointer transition-all w-36 items-start font-sans',
-        isActive
-          ? 'bg-[#e8dccb] text-[#5c4a36] border-[#8c7a66] translate-x-2'
-          : 'bg-[#f4ead5]/80 text-[#8c7a66] border-[#8c7a66]/20 hover:bg-[#e8dccb] hover:translate-x-1',
+        isActive ? 'translate-x-2' : 'hover:translate-x-1',
       )}
+      style={{
+        backgroundColor: isActive ? colors.active : colors.bg,
+        color: isActive ? '#fff' : 'inherit',
+        borderLeftColor: isActive ? colors.active : `${colors.active}40`,
+        opacity: isActive ? 1 : 0.85,
+      }}
       whileTap={{ scale: 0.98 }}
     >
       <span className="text-[10px] font-bold uppercase tracking-tighter opacity-60">{tabNumber}</span>

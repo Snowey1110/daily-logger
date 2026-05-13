@@ -1,0 +1,6 @@
+{
+  "name": "Virtual Journal Reader",
+  "description": "A beautiful 3D-animated journal book reader for Daily Logger entries with STT, AI reports, and sketching support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
