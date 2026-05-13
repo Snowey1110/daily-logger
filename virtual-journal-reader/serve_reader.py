@@ -7,6 +7,8 @@ import argparse
 import json
 import os
 import sys
+import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,7 +20,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import daily_logger as dl  # noqa: E402
 
-READER_BUILD = 4
+READER_BUILD = 13
 
 
 def _dist_dir() -> Path:
@@ -28,23 +30,45 @@ def _dist_dir() -> Path:
     return Path(__file__).resolve().parent / "dist"
 
 
-def _load_sketches() -> Dict[str, str]:
-    path = dl.SETTINGS_DIR / "journal_reader_sketches.json"
+def _sketches_path() -> Path:
+    return dl.SETTINGS_DIR / "journal_reader_sketches.json"
+
+
+def _load_sketches_v2() -> List[Dict[str, str]]:
+    """Load sketches in v2 format (list of positioned sketches).  Auto-migrates v1."""
+    path = _sketches_path()
     if not path.is_file():
-        return {}
+        return []
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, dict):
-            return {str(k): str(v) for k, v in raw.items() if isinstance(v, str)}
     except (OSError, json.JSONDecodeError):
-        pass
-    return {}
+        return []
+    if isinstance(raw, dict) and raw.get("version") == 2:
+        return list(raw.get("sketches", []))
+    # v1 migration: flat { entryId: dataUrl } dict
+    if isinstance(raw, dict):
+        migrated: List[Dict[str, str]] = []
+        for entry_id, data_url in raw.items():
+            if entry_id == "version":
+                continue
+            if isinstance(data_url, str) and data_url.startswith("data:"):
+                migrated.append({
+                    "id": f"sk_{entry_id}",
+                    "afterEntryId": str(entry_id),
+                    "dataUrl": data_url,
+                    "createdAt": "1970-01-01T00:00:00Z",
+                })
+        _save_sketches_v2(migrated)
+        return migrated
+    return []
 
 
-def _save_sketches(data: Dict[str, str]) -> None:
+def _save_sketches_v2(sketches: List[Dict[str, str]]) -> None:
     dl.SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-    path = dl.SETTINGS_DIR / "journal_reader_sketches.json"
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = {"version": 2, "sketches": sketches}
+    _sketches_path().write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def _parse_id(entry_id: str) -> Optional[Tuple[str, int]]:
@@ -103,12 +127,8 @@ class ReaderHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/entries":
             entries, err = dl.load_journal_reader_entries()
-            sketches = _load_sketches()
-            for row in entries:
-                eid = str(row.get("id", ""))
-                if eid in sketches:
-                    row["sketch"] = sketches[eid]
-            payload: Dict[str, Any] = {"entries": entries}
+            sketches = _load_sketches_v2()
+            payload: Dict[str, Any] = {"entries": entries, "sketches": sketches}
             if err:
                 payload["error"] = err
             prefs = dl.load_preferences()
@@ -190,25 +210,58 @@ class ReaderHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/sketch":
-            entry_id = str(payload.get("id", "")).strip()
-            if not entry_id:
-                self._send_json(400, {"ok": False, "error": "Missing id"})
+            sketches = _load_sketches_v2()
+
+            if payload.get("delete"):
+                sketch_id = str(payload.get("id", "")).strip()
+                if not sketch_id:
+                    self._send_json(400, {"ok": False, "error": "Missing id for delete"})
+                    return
+                sketches = [s for s in sketches if s.get("id") != sketch_id]
+                try:
+                    _save_sketches_v2(sketches)
+                except OSError as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(200, {"ok": True})
                 return
+
+            sketch_id = str(payload.get("id", "")).strip()
             data_url = payload.get("dataUrl")
-            sketches = _load_sketches()
-            if isinstance(data_url, str) and data_url.strip() == "":
-                sketches.pop(entry_id, None)
-            elif isinstance(data_url, str) and data_url.startswith("data:"):
-                sketches[entry_id] = data_url
-            else:
-                self._send_json(400, {"ok": False, "error": "Missing dataUrl (use empty string to clear sketch)"})
+            if not isinstance(data_url, str) or not data_url.startswith("data:"):
+                self._send_json(400, {"ok": False, "error": "Missing or invalid dataUrl"})
                 return
+
+            if sketch_id:
+                found = False
+                for s in sketches:
+                    if s.get("id") == sketch_id:
+                        s["dataUrl"] = data_url
+                        found = True
+                        break
+                if not found:
+                    self._send_json(404, {"ok": False, "error": "Sketch not found"})
+                    return
+            else:
+                after_entry_id = str(payload.get("afterEntryId", "")).strip()
+                if not after_entry_id:
+                    self._send_json(400, {"ok": False, "error": "Missing afterEntryId for new sketch"})
+                    return
+                new_id = f"sk_{int(time.time() * 1000)}"
+                sketches.append({
+                    "id": new_id,
+                    "afterEntryId": after_entry_id,
+                    "dataUrl": data_url,
+                    "createdAt": datetime.now(timezone.utc).isoformat(),
+                })
+                sketch_id = new_id
+
             try:
-                _save_sketches(sketches)
+                _save_sketches_v2(sketches)
             except OSError as exc:
                 self._send_json(500, {"ok": False, "error": str(exc)})
                 return
-            self._send_json(200, {"ok": True})
+            self._send_json(200, {"ok": True, "id": sketch_id})
             return
 
         self._send_json(404, {"error": "Not found"})

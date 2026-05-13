@@ -1,6 +1,7 @@
 import React from 'react';
 import { motion } from 'motion/react';
 import { Book as BookIcon } from 'lucide-react';
+import { useReaderT } from '../readerI18n';
 
 interface CoverProps {
   title: string;
@@ -8,6 +9,7 @@ interface CoverProps {
 }
 
 const Cover: React.FC<CoverProps> = ({ title, onClick }) => {
+  const { t } = useReaderT();
   return (
     <motion.div
       onClick={onClick}
@@ -40,14 +42,14 @@ const Cover: React.FC<CoverProps> = ({ title, onClick }) => {
           </h1>
           <div className="h-[1px] w-24 bg-[#d9c5b2]/20 mx-auto" />
           <p className="text-[#d9c5b2]/40 font-serif italic text-xs tracking-[0.3em] uppercase">
-            Virtual Journal
+            {t('coverSubtitle')}
           </p>
         </div>
       </div>
 
       <div className="absolute bottom-12 right-0 left-0 text-center">
         <p className="text-[#d9c5b2]/20 font-sans text-[9px] tracking-[0.4em] uppercase">
-          Interact to begin
+          {t('coverBegin')}
         </p>
       </div>
       

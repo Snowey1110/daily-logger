@@ -12,10 +12,18 @@ export interface JournalEntry {
   journal: string;
   speechToText: string;
   aiReport: string;
-  sketch?: string; // Data URL for canvas sketch
   /** YYYY-MM-DD from sheet tab; used for stable sort */
   isoDate?: string;
   rowIndex?: number;
 }
+
+export interface PositionedSketch {
+  id: string;
+  afterEntryId: string;
+  dataUrl: string;
+  createdAt: string;
+}
+
+export type RightPageSetting = 'none' | 'ai' | 'stt';
 
 export type JournalSection = 'journal' | 'stt' | 'ai';

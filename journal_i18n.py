@@ -19,6 +19,7 @@ _EN: Dict[str, str] = {
     "nav.ai_recap": "AI Recap",
     "nav.chatbot": "Chatbot",
     "nav.console": "Console",
+    "nav.virtual_reader": "Virtual Reader",
     "nav.settings": "Settings",
     "settings.title": "Settings",
     "settings.language": "Language",
@@ -94,6 +95,18 @@ _EN: Dict[str, str] = {
         "No recording available. Record audio first, or add rcd*.wav files under:\n{dir}"
     ),
     "msg.journal_window": "Journal Window",
+    "msg.virtual_reader_title": "Virtual Reader",
+    "msg.virtual_reader_addon_missing": (
+        "Virtual Reader add-on not found. Build virtual-journal-reader and ensure dist/ exists."
+    ),
+    "msg.virtual_reader_stale_server": (
+        "The reader on port 8765 is an old version.\n\n"
+        "Fix: end the Python process using port 8765 in Task Manager, then open Virtual Reader again.\n"
+        "Also run: cd virtual-journal-reader && npm run build"
+    ),
+    "msg.virtual_reader_server_start_fail": "Could not start Virtual Reader server: {exc}",
+    "msg.virtual_reader_server_timeout": "Virtual Reader server did not become ready in time.",
+    "msg.virtual_reader_open_journal_fail": "Could not open the journal file: {err}",
     "msg.no_api_key_journal": (
         "No OpenAI API key. Use TOKEN ADD in the main menu or set OPENAI_API_KEY."
     ),
@@ -218,6 +231,7 @@ _ZH: Dict[str, str] = {
     "nav.ai_recap": "AI 回顾",
     "nav.chatbot": "聊天助手",
     "nav.console": "控制台",
+    "nav.virtual_reader": "阅读器",
     "nav.settings": "设置",
     "settings.title": "设置",
     "settings.language": "语言",
@@ -283,6 +297,18 @@ _ZH: Dict[str, str] = {
     ),
     "journal.transcribe_tooltip_no_recording": "没有可用录音。请先录音，或将 rcd*.wav 放到：\n{dir}",
     "msg.journal_window": "日记窗口",
+    "msg.virtual_reader_title": "阅读器",
+    "msg.virtual_reader_addon_missing": (
+        "未找到阅读器扩展。请先构建 virtual-journal-reader 并确保存在 dist/ 目录。"
+    ),
+    "msg.virtual_reader_stale_server": (
+        "端口 8765 上的阅读器仍是旧版本。\n\n"
+        "处理：在任务管理器中结束占用 8765 端口的 Python 进程，然后再次打开阅读器。\n"
+        "并执行：cd virtual-journal-reader && npm run build"
+    ),
+    "msg.virtual_reader_server_start_fail": "无法启动阅读器服务：{exc}",
+    "msg.virtual_reader_server_timeout": "阅读器服务在规定时间内未能就绪。",
+    "msg.virtual_reader_open_journal_fail": "无法打开日记文件：{err}",
     "msg.no_api_key_journal": "未设置 OpenAI 密钥。请在主菜单使用 TOKEN ADD 或设置环境变量 OPENAI_API_KEY。",
     "msg.ai_recap": "AI 回顾",
     "msg.chatbot": "聊天助手",

@@ -909,6 +909,12 @@ def load_journal_reader_entries() -> Tuple[List[Dict[str, object]], Optional[str
                 if is_row_empty(values):
                     continue
                 date_s = _journal_cell_to_display_string(0, values[0])
+                if not date_s:
+                    # Derive date from sheet name (YYYY-MM-DD) when cell is empty
+                    try:
+                        date_s = datetime.strptime(sheet.title, "%Y-%m-%d").strftime("%m/%d/%Y")
+                    except ValueError:
+                        pass
                 time_s = _journal_cell_to_display_string(1, values[1])
                 journal_s = "" if values[2] is None else str(values[2])
                 speech_s = "" if len(values) <= 3 or values[3] is None else str(values[3])
@@ -995,7 +1001,7 @@ def virtual_journal_reader_addon_paths() -> Optional[Tuple[Path, Path]]:
     return None
 
 
-VIRTUAL_READER_REQUIRED_BUILD = 4
+VIRTUAL_READER_REQUIRED_BUILD = 13
 
 _virtual_reader_child_proc: Optional[subprocess.Popen] = None
 
@@ -1032,11 +1038,24 @@ def _virtual_reader_health_info(port: int, timeout_sec: float = 0.35) -> Optiona
         return None
 
 
+def _virtual_reader_ui_lang() -> str:
+    return normalize_ui_language(str(load_preferences().get(UI_LANGUAGE_PREF_KEY, "en")))
+
+
+def _virtual_reader_browser_lang_param() -> str:
+    """Query param for Virtual Reader web UI (matches journal UI language)."""
+    return "zh" if _virtual_reader_ui_lang() == "zh" else "en"
+
+
+def _virtual_reader_tr(key: str, **kwargs: object) -> str:
+    return ui_translate(_virtual_reader_ui_lang(), key, **kwargs)
+
+
 def open_virtual_journal_reader_in_browser() -> Tuple[bool, str]:
     """Start the Virtual Reader local server if needed and open the default browser."""
     paths = virtual_journal_reader_addon_paths()
     if paths is None:
-        return False, "Virtual Reader addon not found (build virtual-journal-reader and ensure dist/ exists)."
+        return False, _virtual_reader_tr("msg.virtual_reader_addon_missing")
     script_path, dist_dir = paths
     port = 8765
 
@@ -1044,13 +1063,9 @@ def open_virtual_journal_reader_in_browser() -> Tuple[bool, str]:
     if info and info.get("ok") is True:
         bld = int(info.get("readerBuild", 0) or 0)
         if bld < VIRTUAL_READER_REQUIRED_BUILD:
-            return (
-                False,
-                "Virtual Reader on port 8765 is still running an old version.\n\n"
-                "Fix: Task Manager → end the Python process using port 8765, then open Virtual Reader again.\n"
-                "Also run: cd virtual-journal-reader && npm run build",
-            )
-        url = f"http://127.0.0.1:{port}/?_cb={int(time.time() * 1000)}"
+            return (False, _virtual_reader_tr("msg.virtual_reader_stale_server"))
+        _vr_lang = _virtual_reader_browser_lang_param()
+        url = f"http://127.0.0.1:{port}/?lang={_vr_lang}&_cb={int(time.time() * 1000)}"
         webbrowser.open(url)
         return True, ""
     env = os.environ.copy()
@@ -1069,7 +1084,7 @@ def open_virtual_journal_reader_in_browser() -> Tuple[bool, str]:
         )
     except OSError as exc:
         _virtual_reader_child_proc = None
-        return False, f"Could not start Virtual Reader server: {exc}"
+        return False, _virtual_reader_tr("msg.virtual_reader_server_start_fail", exc=str(exc))
     for _ in range(50):
         time.sleep(0.1)
         info2 = _virtual_reader_health_info(port, timeout_sec=0.5)
@@ -1078,7 +1093,8 @@ def open_virtual_journal_reader_in_browser() -> Tuple[bool, str]:
             and info2.get("ok") is True
             and int(info2.get("readerBuild", 0) or 0) >= VIRTUAL_READER_REQUIRED_BUILD
         ):
-            url = f"http://127.0.0.1:{port}/?_cb={int(time.time() * 1000)}"
+            _vr_lang = _virtual_reader_browser_lang_param()
+            url = f"http://127.0.0.1:{port}/?lang={_vr_lang}&_cb={int(time.time() * 1000)}"
             webbrowser.open(url)
             return True, ""
     proc = _virtual_reader_child_proc
@@ -1092,7 +1108,7 @@ def open_virtual_journal_reader_in_browser() -> Tuple[bool, str]:
             except Exception:
                 pass
     _virtual_reader_child_proc = None
-    return False, "Virtual Reader server did not become ready in time."
+    return False, _virtual_reader_tr("msg.virtual_reader_server_timeout")
 
 
 def open_virtual_reader_nav_action() -> Tuple[bool, str]:
@@ -1107,7 +1123,7 @@ def open_virtual_reader_nav_action() -> Tuple[bool, str]:
         webbrowser.open(uri)
         return True, ""
     except Exception as exc:
-        return False, str(exc)
+        return False, _virtual_reader_tr("msg.virtual_reader_open_journal_fail", err=str(exc))
 
 
 def delete_journal_entry_at(sheet_name: str, row_index: int) -> bool:
@@ -2879,6 +2895,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
 
     nav_buttons: Dict[str, Any] = {}
     nav_extra_buttons: List[Any] = []
+    _virtual_reader_nav_btn_slot: List[Any] = [None]
     active_page = {"key": "journal"}
     active_page_frame: Dict[str, Any] = {"frame": None}
     page_leave_reset_handlers: Dict[str, Callable[[], None]] = {}
@@ -7329,6 +7346,9 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         nav_buttons["ai_recap"].config(text=tr("nav.ai_recap"))
         nav_buttons["chatbot"].config(text=tr("nav.chatbot"))
         nav_buttons["console"].config(text=tr("nav.console"))
+        _vr_nav = _virtual_reader_nav_btn_slot[0]
+        if _vr_nav is not None:
+            _vr_nav.config(text=tr("nav.virtual_reader"))
         nav_settings_btn.config(text=tr("nav.settings"))
         date_lbl.config(text=tr("journal.date"))
         time_lbl.config(text=tr("journal.time"))
@@ -7482,7 +7502,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         top.configure(bg=t.panel)
         top.pack_configure(padx=t.pad_outer, pady=t.pad_top_y)
         find_row.configure(bg=t.panel)
-        find_row.pack_configure(padx=t.pad_outer, pady=(0, 6))
+        if str(find_row.winfo_manager()) == "pack":
+            find_row.pack_configure(padx=t.pad_outer, pady=(0, 6))
         find_lbl.configure(bg=t.panel, fg=t.muted)
         find_entry.config(
             bg=t.field,
@@ -7775,11 +7796,11 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     def on_virtual_reader_nav_clicked() -> None:
         ok, err = open_virtual_reader_nav_action()
         if not ok and err:
-            messagebox.showerror("Virtual Reader", err)
+            messagebox.showerror(tr("msg.virtual_reader_title"), err)
 
-    nav_virtual_reader_btn = tk.Button(
+    _vr_nav_btn = tk.Button(
         nav_rail,
-        text="Virtual Reader",
+        text=tr("nav.virtual_reader"),
         command=on_virtual_reader_nav_clicked,
         bg=t_init.btn_secondary,
         fg=t_init.text,
@@ -7794,10 +7815,11 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         bd=0,
         highlightthickness=0,
     )
-    nav_virtual_reader_btn.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 8))
-    nav_extra_buttons.append(nav_virtual_reader_btn)
+    _virtual_reader_nav_btn_slot[0] = _vr_nav_btn
+    _vr_nav_btn.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 8))
+    nav_extra_buttons.append(_vr_nav_btn)
     bind_button_hover_if_enabled(
-        nav_virtual_reader_btn,
+        _vr_nav_btn,
         lambda: (
             "normal",
             th().btn_secondary,

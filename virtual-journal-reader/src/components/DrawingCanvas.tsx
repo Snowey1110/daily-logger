@@ -1,10 +1,13 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { X, Eraser } from 'lucide-react';
+import { useReaderT } from '../readerI18n';
 
 interface DrawingCanvasProps {
-  onSave: (dataUrl: string) => void;
+  onSave: (dataUrl: string, sketchId?: string) => void;
   onClose: () => void;
   initialData?: string;
+  /** When editing an existing sketch, its ID is passed here. */
+  sketchId?: string;
 }
 
 function isCanvasUniformBlank(canvas: HTMLCanvasElement): boolean {
@@ -25,7 +28,8 @@ function isCanvasUniformBlank(canvas: HTMLCanvasElement): boolean {
   return true;
 }
 
-export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({ onSave, onClose, initialData }) => {
+export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({ onSave, onClose, initialData, sketchId }) => {
+  const { t } = useReaderT();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const contextRef = useRef<CanvasRenderingContext2D | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
@@ -140,10 +144,10 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({ onSave, onClose, i
     const canvas = canvasRef.current;
     if (!canvas) return;
     if (isCanvasUniformBlank(canvas)) {
-      onSave('');
+      onSave('', sketchId);
       return;
     }
-    onSave(canvas.toDataURL());
+    onSave(canvas.toDataURL(), sketchId);
   };
 
   const clearCanvas = () => {
@@ -158,7 +162,7 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({ onSave, onClose, i
       <div className="bg-[#fdfaf2] rounded-2xl shadow-[0_50px_100px_-20px_rgba(0,0,0,0.5)] w-full max-w-4xl flex flex-col overflow-hidden h-[80vh] border border-[#d9c5b2]/20">
         <div className="p-4 border-b border-[#d9c5b2]/10 flex items-center justify-between bg-[#fbf8ef]">
           <div className="flex items-center gap-4">
-            <h3 className="font-semibold text-slate-800 uppercase tracking-widest text-xs">Sketchpad</h3>
+            <h3 className="font-semibold text-slate-800 uppercase tracking-widest text-xs">{t('sketchpad')}</h3>
             <div className="flex items-center gap-2 border-l border-[#d9c5b2]/20 pl-4">
               <input 
                 type="color" 
@@ -180,7 +184,7 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({ onSave, onClose, i
             <button 
               onClick={clearCanvas}
               className="p-2 hover:bg-black/5 rounded-full text-slate-600 transition-colors"
-              title="Clear Canvas"
+              title={t('clearCanvas')}
             >
               <Eraser size={18} />
             </button>
@@ -188,7 +192,7 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({ onSave, onClose, i
               onClick={handleSave}
               className="px-6 py-2 bg-slate-800 text-[#d9c5b2] rounded-full hover:bg-slate-900 transition-all font-semibold text-xs tracking-widest uppercase shadow-lg shadow-black/10"
             >
-              Save Sketch
+              {t('saveSketch')}
             </button>
             <button 
               onClick={onClose}
