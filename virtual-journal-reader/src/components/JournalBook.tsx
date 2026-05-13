@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { cn, JournalEntry, JournalSection, PositionedSketch } from '../lib/utils';
+import { cn, JournalEntry, JournalSection, PositionedSketch, PageImage, PageOverlay } from '../lib/utils';
 import Cover from './Cover';
 import Navigation from './Navigation';
 import { DrawingCanvas } from './DrawingCanvas';
 import { SketchPlacer } from './SketchPlacer';
+import { CompositePageEditor } from './CompositePageEditor';
 import { ChevronLeft, ChevronRight, Type, MessageSquare, BrainCircuit } from 'lucide-react';
 import { useReaderT } from '../readerI18n';
 import { useTheme } from './ThemeProvider';
@@ -384,15 +385,28 @@ function firstSpreadIndexForEntry(spreads: Spread[], entryId: string): number {
 async function fetchData(): Promise<{
   entries: JournalEntry[];
   sketches: PositionedSketch[];
+  overlays: Record<string, PageOverlay>;
   error?: string;
   appName: string;
 }> {
   const res = await fetch('/api/entries');
   const data = await res.json();
   const appName = typeof data.appName === 'string' && data.appName.trim() ? data.appName.trim() : 'Daily Logger';
+  const rawOverlays = (typeof data.overlays === 'object' && data.overlays !== null) ? data.overlays : {};
+  const overlays: Record<string, PageOverlay> = {};
+  for (const [k, v] of Object.entries(rawOverlays)) {
+    const val = v as Record<string, unknown>;
+    overlays[k] = {
+      entryId: k,
+      sketchDataUrl: (typeof val.sketchDataUrl === 'string' ? val.sketchDataUrl : undefined),
+      images: Array.isArray(val.images) ? val.images as PageImage[] : [],
+      layerOrder: Array.isArray(val.layerOrder) ? val.layerOrder as ('text' | 'sketch' | 'images')[] : ['text', 'sketch', 'images'],
+    };
+  }
   return {
     entries: Array.isArray(data.entries) ? data.entries : [],
     sketches: Array.isArray(data.sketches) ? data.sketches : [],
+    overlays,
     error: typeof data.error === 'string' ? data.error : undefined,
     appName,
   };
@@ -405,6 +419,7 @@ const JournalBook: React.FC = () => {
   const { coverTheme, bgTheme } = useTheme();
   const [entries, setEntries] = useState<JournalEntry[]>([]);
   const [sketches, setSketches] = useState<PositionedSketch[]>([]);
+  const [overlays, setOverlays] = useState<Record<string, PageOverlay>>({});
   const [appTitle, setAppTitle] = useState('Daily Logger');
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -413,16 +428,9 @@ const JournalBook: React.FC = () => {
   const [activeSection, setActiveSection] = useState<JournalSection>('journal');
 
   const [showSketchPlacer, setShowSketchPlacer] = useState(false);
-  const [sketchingAfterEntryId, setSketchingAfterEntryId] = useState<string | null>(null);
   const [editingSketchId, setEditingSketchId] = useState<string | null>(null);
 
-  const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
-  const [editedText, setEditedText] = useState('');
-  const [editingLeftField, setEditingLeftField] = useState<'journal' | 'speechToText' | 'aiReport'>('journal');
-
-  const [editingRightEntryId, setEditingRightEntryId] = useState<string | null>(null);
-  const [editedRightText, setEditedRightText] = useState('');
-  const [editingRightField, setEditingRightField] = useState<'journal' | 'speechToText' | 'aiReport'>('journal');
+  const [compositeEditorEntry, setCompositeEditorEntry] = useState<{ entryId: string; defaultLayer: 'text' | 'sketch' | 'images'; pageWidth: number; pageHeight: number } | null>(null);
 
   const bookSpreadRef = useRef<HTMLDivElement>(null);
 
@@ -430,15 +438,17 @@ const JournalBook: React.FC = () => {
 
   const reload = useCallback(async () => {
     try {
-      const { entries: rows, sketches: sk, error, appName } = await fetchData();
+      const { entries: rows, sketches: sk, overlays: ov, error, appName } = await fetchData();
       setEntries(rows);
       setSketches(sk);
+      setOverlays(ov);
       setAppTitle(appName);
       setLoadError(error ?? null);
     } catch {
       setLoadError(t('errLoadData'));
       setEntries([]);
       setSketches([]);
+      setOverlays({});
     }
   }, [t]);
 
@@ -473,13 +483,6 @@ const JournalBook: React.FC = () => {
   useEffect(() => {
     if (spreadCount > 0 && currentPage > spreadCount) setCurrentPage(spreadCount);
   }, [spreadCount, currentPage]);
-
-  const currentEntry = useMemo(() => {
-    if (currentPage <= 0) return null;
-    const sp = spreads[currentPage - 1];
-    if (!sp) return null;
-    return sortedEntries.find((e) => e.id === spreadPrimaryEntryId(sp)) ?? null;
-  }, [currentPage, spreads, sortedEntries]);
 
   /* ── navigation ── */
 
@@ -519,16 +522,25 @@ const JournalBook: React.FC = () => {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (editingEntryId || editingRightEntryId) return;
+      if (compositeEditorEntry) return;
       const key = e.key.toLowerCase();
       if (key === 'd' || key === 'arrowright') handleNext();
       if (key === 'a' || key === 'arrowleft') handlePrev();
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleNext, handlePrev, editingEntryId, editingRightEntryId]);
+  }, [handleNext, handlePrev, compositeEditorEntry]);
 
   /* ── actions ── */
+
+  const measurePageDims = (): { pageWidth: number; pageHeight: number } => {
+    const el = bookSpreadRef.current;
+    if (el) {
+      const rect = el.getBoundingClientRect();
+      return { pageWidth: Math.round(rect.width / 2), pageHeight: Math.round(rect.height) };
+    }
+    return { pageWidth: 500, pageHeight: 650 };
+  };
 
   const handleAction = (action: JournalAction) => {
     if (action === 'sketch') {
@@ -537,90 +549,56 @@ const JournalBook: React.FC = () => {
       if (currentPage === 0) return;
       const spread = spreads[currentPage - 1];
       if (!spread) return;
-      setSaveError(null);
-
-      // Left page
       const leftEid = spread.left.sourceEntryId ?? spread.entryId;
-      const leftEntry = entries.find((e) => e.id === leftEid);
-      const leftFb = spread.left.leftFallbackSection;
-      const leftField: 'journal' | 'speechToText' | 'aiReport' =
-        leftFb === 'stt' ? 'speechToText' : leftFb === 'ai' ? 'aiReport' : 'journal';
-
-      if (leftEntry) {
-        setEditingEntryId(leftEid);
-        setEditingLeftField(leftField);
-        setEditedText(leftEntry[leftField] || '');
-      }
-
-      // Right page (text only, not sketch/empty)
-      const rp = spread.right;
-      if (rp.type === 'text' && rp.sourceEntryId) {
-        const rightEid = rp.sourceEntryId;
-        const rightEntry = entries.find((e) => e.id === rightEid);
-        if (rightEntry) {
-          let rightField: 'journal' | 'speechToText' | 'aiReport' = 'journal';
-          if (rp.secondaryPage !== undefined) {
-            rightField = activeSection === 'stt' ? 'speechToText' : 'aiReport';
-            if (spread.left.leftFallbackSection === activeSection) {
-              rightField = activeSection === 'stt' ? 'aiReport' : 'speechToText';
-            }
-          }
-          // Skip right editing when it's the same entry+field (page-break continuation)
-          if (rightEid !== leftEid || rightField !== leftField) {
-            setEditingRightEntryId(rightEid);
-            setEditingRightField(rightField);
-            setEditedRightText(rightEntry[rightField] || '');
-          }
-        }
+      if (leftEid) {
+        setCompositeEditorEntry({ entryId: leftEid, defaultLayer: 'text', ...measurePageDims() });
       }
     }
   };
 
-  const handleSaveText = async () => {
-    if (!editingEntryId) return;
+  /* ── composite editor ── */
+
+  const handleOpenCompositeEditor = (entryId: string, defaultLayer: 'text' | 'sketch') => {
+    setCompositeEditorEntry({ entryId, defaultLayer, ...measurePageDims() });
+  };
+
+  const handleSaveComposite = async (
+    text: string,
+    sketchDataUrl: string,
+    images: PageImage[],
+    layerOrder: ('text' | 'sketch' | 'images')[],
+  ) => {
+    if (!compositeEditorEntry) return;
+    const { entryId } = compositeEditorEntry;
     setSaveError(null);
     try {
-      // Save left page
-      const leftBody: Record<string, string> = { id: editingEntryId };
-      leftBody[editingLeftField] = editedText;
+      const entryBody: Record<string, string> = { id: entryId, journal: text };
       const res = await fetch('/api/entry', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(leftBody),
+        body: JSON.stringify(entryBody),
       });
       const data = await res.json();
       if (!data.ok) { setSaveError(data.error || t('errSaveFailed')); return; }
 
-      // Save right page if edited
-      if (editingRightEntryId) {
-        const rightBody: Record<string, string> = { id: editingRightEntryId };
-        rightBody[editingRightField] = editedRightText;
-        const res2 = await fetch('/api/entry', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(rightBody),
-        });
-        const data2 = await res2.json();
-        if (!data2.ok) { setSaveError(data2.error || t('errSaveFailed')); return; }
-      }
+      const overlayBody = { entryId, sketchDataUrl, images, layerOrder };
+      const res2 = await fetch('/api/page-overlay', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(overlayBody),
+      });
+      const data2 = await res2.json();
+      if (!data2.ok) { setSaveError(data2.error || t('errSaveFailed')); return; }
 
+      setCompositeEditorEntry(null);
       await reload();
-      setEditingEntryId(null);
-      setEditingRightEntryId(null);
     } catch { setSaveError(t('errNetworkSave')); }
   };
 
-  /* ── sketch CRUD ── */
-
-  const handleCreateSketch = (afterEntryId: string) => {
-    setSketchingAfterEntryId(afterEntryId);
-    setEditingSketchId(null);
-    setShowSketchPlacer(false);
-  };
+  /* ── sketch CRUD (backward compat for existing standalone sketches) ── */
 
   const handleEditSketch = (sketchId: string) => {
     setEditingSketchId(sketchId);
-    setSketchingAfterEntryId(null);
     setShowSketchPlacer(false);
   };
 
@@ -639,23 +617,14 @@ const JournalBook: React.FC = () => {
 
   const handleSaveSketchCanvas = async (dataUrl: string, existingId?: string) => {
     setSaveError(null);
-
     if (!dataUrl || !dataUrl.startsWith('data:')) {
-      if (existingId) {
-        await handleDeleteSketch(existingId);
-      }
-      setSketchingAfterEntryId(null);
+      if (existingId) await handleDeleteSketch(existingId);
       setEditingSketchId(null);
       return;
     }
-
     try {
       const body: Record<string, unknown> = { dataUrl };
-      if (existingId) {
-        body.id = existingId;
-      } else if (sketchingAfterEntryId) {
-        body.afterEntryId = sketchingAfterEntryId;
-      }
+      if (existingId) body.id = existingId;
       const res = await fetch('/api/sketch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -665,7 +634,6 @@ const JournalBook: React.FC = () => {
       if (!data.ok) { setSaveError(data.error || t('errSketchSave')); }
       await reload();
     } catch { setSaveError(t('errNetworkSketch')); }
-    setSketchingAfterEntryId(null);
     setEditingSketchId(null);
   };
 
@@ -683,7 +651,7 @@ const JournalBook: React.FC = () => {
     } catch { setSaveError(t('errDeleteEntry')); }
   };
 
-  const handleCreatePage = async (date: string, time: string, _afterEntryId: string) => {
+  const handleCreatePage = async (date: string, time: string, _afterEntryId: string): Promise<string | null> => {
     setSaveError(null);
     try {
       const res = await fetch('/api/entry/create', {
@@ -692,35 +660,24 @@ const JournalBook: React.FC = () => {
         body: JSON.stringify({ date, time }),
       });
       const data = await res.json();
-      if (!data.ok) { setSaveError(data.error || t('errCreatePage')); return; }
-      setShowSketchPlacer(false);
+      if (!data.ok) { setSaveError(data.error || t('errCreatePage')); return null; }
       await reload();
       if (data.id) {
         goToEntry(data.id);
+        return data.id as string;
       }
     } catch { setSaveError(t('errCreatePage')); }
+    return null;
   };
 
-  const isDrawing = sketchingAfterEntryId !== null || editingSketchId !== null;
+  const isDrawing = editingSketchId !== null;
   const drawingInitialData = editingSketchId ? sketches.find((s) => s.id === editingSketchId)?.dataUrl : undefined;
 
-  /* ── right page setting ── */
-
-  const clearEditing = () => {
-    setEditingEntryId(null);
-    setEditedText('');
-    setEditingRightEntryId(null);
-    setEditedRightText('');
-  };
-
   const handleBookmarkClick = (section: JournalSection) => {
-    clearEditing();
     setActiveSection(section);
   };
 
   const currentSpread = currentPage > 0 ? spreads[currentPage - 1] : undefined;
-
-  const isEditing = !!editingEntryId || !!editingRightEntryId;
 
   return (
     <div className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden select-none font-sans transition-colors duration-500" style={{ backgroundColor: bgTheme.colors.bg }}>
@@ -732,7 +689,7 @@ const JournalBook: React.FC = () => {
       </div>
 
       {(loadError || saveError) && (
-        <div className="absolute top-20 left-8 right-8 z-50 max-w-xl rounded-lg border border-amber-500/40 bg-black/50 px-4 py-2 text-sm text-amber-100 font-sans">
+        <div className="fixed top-6 left-1/2 -translate-x-1/2 z-[200] max-w-xl rounded-lg border border-amber-500/40 bg-black/80 px-6 py-3 text-sm text-amber-100 font-sans shadow-2xl backdrop-blur-sm">
           {loadError && <p>{loadError}</p>}
           {saveError && <p>{saveError}</p>}
         </div>
@@ -754,8 +711,8 @@ const JournalBook: React.FC = () => {
         }
         sortOrder={sortOrder}
         onDateSelect={handleDateSelect}
-        isEditTextOpen={isEditing}
-        onSaveText={() => void handleSaveText()}
+        isEditTextOpen={false}
+        onSaveText={() => {}}
       />
 
       <div className="flex-1 flex min-h-0 items-center justify-center p-3 md:p-5 perspective-[2000px]">
@@ -804,40 +761,34 @@ const JournalBook: React.FC = () => {
                 <div className="absolute inset-0 opacity-10 pointer-events-none bg-[url('https://www.transparenttextures.com/patterns/natural-paper.png')]" />
 
                 {/* Click zones for page flip */}
-                {!editingEntryId && (
-                  <>
-                    <button
-                      type="button"
-                      aria-label={t('ariaPrevPage')}
-                      className="absolute left-0 top-0 bottom-0 w-[12%] z-40 cursor-pointer opacity-0 hover:opacity-100 hover:bg-black/[0.03]"
-                      onClick={handlePrev}
-                    />
-                    <button
-                      type="button"
-                      aria-label={t('ariaNextPage')}
-                      className="absolute right-0 top-0 bottom-0 w-[12%] z-40 cursor-pointer opacity-0 hover:opacity-100 hover:bg-black/[0.03]"
-                      onClick={handleNext}
-                    />
-                  </>
-                )}
+                <>
+                  <button
+                    type="button"
+                    aria-label={t('ariaPrevPage')}
+                    className="absolute left-0 top-0 bottom-0 w-[12%] z-40 cursor-pointer opacity-0 hover:opacity-100 hover:bg-black/[0.03]"
+                    onClick={handlePrev}
+                  />
+                  <button
+                    type="button"
+                    aria-label={t('ariaNextPage')}
+                    className="absolute right-0 top-0 bottom-0 w-[12%] z-40 cursor-pointer opacity-0 hover:opacity-100 hover:bg-black/[0.03]"
+                    onClick={handleNext}
+                  />
+                </>
 
                 <Page
                   spread={currentSpread}
                   side="left"
                   activeSection={activeSection}
-                  editingEntryId={editingEntryId}
-                  editText={editedText}
-                  onTextChange={setEditedText}
                   theme={bgTheme}
+                  overlay={currentSpread?.left.sourceEntryId ? overlays[currentSpread.left.sourceEntryId] : undefined}
                 />
                 <Page
                   spread={currentSpread}
                   side="right"
                   activeSection={activeSection}
-                  editingEntryId={editingRightEntryId}
-                  editText={editedRightText}
-                  onTextChange={setEditedRightText}
                   theme={bgTheme}
+                  overlay={currentSpread?.right.sourceEntryId ? overlays[currentSpread.right.sourceEntryId] : undefined}
                 />
               </motion.div>
             )}
@@ -881,8 +832,8 @@ const JournalBook: React.FC = () => {
           entries={sortedEntries}
           sketches={sketches}
           sortOrder={sortOrder}
-          onCreateSketch={handleCreateSketch}
           onCreatePage={handleCreatePage}
+          onOpenCompositeEditor={handleOpenCompositeEditor}
           onEditSketch={handleEditSketch}
           onDeleteSketch={handleDeleteSketch}
           onDeleteEntry={handleDeleteEntry}
@@ -890,15 +841,37 @@ const JournalBook: React.FC = () => {
         />
       )}
 
-      {/* Drawing canvas */}
+      {/* Drawing canvas (backward compat for editing existing standalone sketches) */}
       {isDrawing && (
         <DrawingCanvas
           onSave={handleSaveSketchCanvas}
-          onClose={() => { setSketchingAfterEntryId(null); setEditingSketchId(null); }}
+          onClose={() => setEditingSketchId(null)}
           initialData={drawingInitialData}
           sketchId={editingSketchId ?? undefined}
         />
       )}
+
+      {/* Composite page editor */}
+      {compositeEditorEntry && (() => {
+        const entry = entries.find((e) => e.id === compositeEditorEntry.entryId);
+        const ov = overlays[compositeEditorEntry.entryId];
+        return (
+          <CompositePageEditor
+            entryId={compositeEditorEntry.entryId}
+            entryDate={entry?.date ?? ''}
+            entryTime={entry?.time ?? ''}
+            pageWidth={compositeEditorEntry.pageWidth}
+            pageHeight={compositeEditorEntry.pageHeight}
+            initialText={entry?.journal ?? ''}
+            initialSketchDataUrl={ov?.sketchDataUrl}
+            initialImages={ov?.images ?? []}
+            initialLayerOrder={ov?.layerOrder ?? ['text', 'sketch', 'images']}
+            defaultLayer={compositeEditorEntry.defaultLayer}
+            onSave={handleSaveComposite}
+            onClose={() => setCompositeEditorEntry(null)}
+          />
+        );
+      })()}
 
       <footer className="shrink-0 flex flex-col items-center gap-2 px-4 pb-4 pt-2 text-center" style={{ color: bgTheme.cover.accentText }}>
         <div className="flex items-center justify-center space-x-12 opacity-40">
@@ -938,11 +911,9 @@ const Page: React.FC<{
   spread?: Spread;
   side: 'left' | 'right';
   activeSection: JournalSection;
-  editingEntryId: string | null;
-  editText?: string;
-  onTextChange?: (text: string) => void;
   theme: JournalTheme;
-}> = ({ spread, side, activeSection, editingEntryId, editText, onTextChange, theme }) => {
+  overlay?: PageOverlay;
+}> = ({ spread, side, activeSection, theme, overlay }) => {
   const { t } = useReaderT();
   if (!spread) {
     return (
@@ -957,7 +928,7 @@ const Page: React.FC<{
 
   const pContent = side === 'left' ? spread.left : spread.right;
 
-  /* ── sketch page ── */
+  /* ── sketch page (standalone) ── */
   if (pContent.type === 'sketch') {
     const capDate = pContent.sourceDate ?? spread.date;
     return (
@@ -1006,15 +977,16 @@ const Page: React.FC<{
     : t('pageJournalEntry');
 
   const pageLabel = isRightSecondary ? pContent.secondaryPage : pContent.journalPage;
-  const columnOwner = pContent.sourceEntryId ?? spread.entryId;
   const columnDate = pContent.sourceDate ?? spread.date;
 
   const showBigHeader = pContent.type === 'text' && !!pContent.showJournalEntryHeader;
   const showSubHeader = !showBigHeader && pContent.type === 'text' && pageLabel !== undefined;
 
-  const showEditor =
-    editingEntryId === columnOwner &&
-    pContent.type === 'text';
+  const layerZIndex = (kind: 'text' | 'sketch' | 'images') => {
+    if (!overlay) return 0;
+    const order = overlay.layerOrder ?? ['text', 'sketch', 'images'];
+    return order.indexOf(kind) + 1;
+  };
 
   return (
     <div
@@ -1028,7 +1000,7 @@ const Page: React.FC<{
       }}
     >
       {showBigHeader && (
-        <div className="pb-4 mb-6" style={{ borderBottom: `1px solid ${theme.colors.border}` }}>
+        <div className="pb-4 mb-6 relative" style={{ borderBottom: `1px solid ${theme.colors.border}` }}>
           <span className="text-xs uppercase tracking-widest font-sans opacity-40" style={{ color: theme.colors.textMuted }}>
             {columnDate} · {pContent.sourceTime ?? spread.time}
           </span>
@@ -1039,7 +1011,7 @@ const Page: React.FC<{
       )}
 
       {showSubHeader && (
-        <div className="pb-2 mb-6 flex justify-between items-end border-dashed" style={{ borderBottom: `1px dashed ${theme.colors.border}` }}>
+        <div className="pb-2 mb-6 flex justify-between items-end border-dashed relative" style={{ borderBottom: `1px dashed ${theme.colors.border}` }}>
           <h3 className="text-sm font-light font-serif italic tracking-wide" style={{ color: theme.colors.textMuted }}>
             {pageLabel !== undefined && pageLabel > 1
               ? `${sectionTitle} ${t('pageContSuffix')}`
@@ -1049,20 +1021,48 @@ const Page: React.FC<{
         </div>
       )}
 
-      <div className="flex-1 leading-relaxed text-base space-y-3 overflow-y-auto pr-2" style={{ color: theme.colors.text }}>
-        {showEditor ? (
-          <textarea
-            value={editText}
-            onChange={(e) => onTextChange?.(e.target.value)}
-            className="w-full min-h-[60%] bg-transparent rounded-md p-2 focus:ring-1 resize-y font-serif leading-relaxed"
-            style={{ border: `1px solid ${theme.colors.border}`, color: theme.colors.text }}
-            placeholder={t('pagePlaceholderEdit')}
-            autoFocus
-          />
-        ) : (
-          (pContent.content || '').split('\n').map((para, i) => <p key={i}>{para}</p>)
-        )}
+      <div className="flex-1 relative min-h-0 overflow-hidden">
+        {/* Text content */}
+        <div
+          className={`absolute inset-0 leading-relaxed text-base overflow-y-auto pr-2 ${overlay ? 'whitespace-pre-wrap' : 'space-y-3'}`}
+          style={{ color: theme.colors.text, zIndex: overlay ? layerZIndex('text') : 'auto' }}
+        >
+          {overlay
+            ? (pContent.content || '')
+            : (pContent.content || '').split('\n').map((para, i) => <p key={i}>{para}</p>)
+          }
+        </div>
       </div>
+
+      {/* Overlay sketch layer – rendered at full page level to match editor canvas coordinates */}
+      {overlay?.sketchDataUrl && (
+        <img
+          src={overlay.sketchDataUrl}
+          alt=""
+          className="absolute inset-0 w-full h-full pointer-events-none"
+          style={{ zIndex: layerZIndex('sketch') }}
+        />
+      )}
+
+      {/* Overlay image layer – rendered at full page level */}
+      {overlay && overlay.images.length > 0 && (
+        <div className="absolute inset-0 pointer-events-none" style={{ zIndex: layerZIndex('images') }}>
+          {overlay.images.map((img) => (
+            <img
+              key={img.id}
+              src={img.dataUrl}
+              alt=""
+              className="absolute object-contain"
+              style={{
+                left: `${img.x * 100}%`,
+                top: `${img.y * 100}%`,
+                width: `${img.width * 100}%`,
+                height: `${img.height * 100}%`,
+              }}
+            />
+          ))}
+        </div>
+      )}
 
       <div className="mt-8 flex justify-center shrink-0">
         <div className="w-16 h-1 rounded-full" style={{ backgroundColor: theme.colors.border }} />

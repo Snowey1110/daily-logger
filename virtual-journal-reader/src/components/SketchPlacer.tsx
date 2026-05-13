@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { X, Trash2, Plus, FileText, PenTool } from 'lucide-react';
-import { cn, type JournalEntry, type PositionedSketch } from '../lib/utils';
+import { X, Trash2, Plus } from 'lucide-react';
+import { type JournalEntry, type PositionedSketch } from '../lib/utils';
 import { useReaderT } from '../readerI18n';
 import { useTheme } from './ThemeProvider';
 
@@ -8,8 +8,8 @@ interface SketchPlacerProps {
   entries: JournalEntry[];
   sketches: PositionedSketch[];
   sortOrder: 'asc' | 'desc';
-  onCreateSketch: (afterEntryId: string) => void;
-  onCreatePage: (date: string, time: string, afterEntryId: string) => void;
+  onCreatePage: (date: string, time: string, afterEntryId: string) => Promise<string | null>;
+  onOpenCompositeEditor: (entryId: string, defaultLayer: 'text' | 'sketch') => void;
   onEditSketch: (sketchId: string) => void;
   onDeleteSketch: (sketchId: string) => void;
   onDeleteEntry: (entryId: string) => void;
@@ -78,8 +78,8 @@ export const SketchPlacer: React.FC<SketchPlacerProps> = ({
   entries,
   sketches,
   sortOrder,
-  onCreateSketch,
   onCreatePage,
+  onOpenCompositeEditor,
   onEditSketch,
   onDeleteSketch,
   onDeleteEntry,
@@ -90,9 +90,9 @@ export const SketchPlacer: React.FC<SketchPlacerProps> = ({
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [confirmDeleteEntryId, setConfirmDeleteEntryId] = useState<string | null>(null);
   const [expandedDivider, setExpandedDivider] = useState<number | null>(null);
-  const [pageFormDivider, setPageFormDivider] = useState<number | null>(null);
   const [pageDate, setPageDate] = useState(nowDateStr);
   const [pageTime, setPageTime] = useState(nowTimeStr);
+  const [creating, setCreating] = useState(false);
 
   const items = buildTimeline(entries, sketches, sortOrder);
 
@@ -116,24 +116,19 @@ export const SketchPlacer: React.FC<SketchPlacerProps> = ({
 
   const handleDividerClick = (dividerIdx: number) => {
     setExpandedDivider(expandedDivider === dividerIdx ? null : dividerIdx);
-    setPageFormDivider(null);
-  };
-
-  const handleChooseSketch = (dividerIdx: number) => {
-    const eid = nearestEntryId(items, dividerIdx);
-    if (eid) onCreateSketch(eid);
-  };
-
-  const handleChoosePage = (dividerIdx: number) => {
-    setPageFormDivider(dividerIdx);
     setPageDate(nowDateStr());
     setPageTime(nowTimeStr());
   };
 
-  const handleSubmitPage = (dividerIdx: number) => {
+  const handleSubmitPage = async (dividerIdx: number) => {
     const eid = nearestEntryId(items, dividerIdx);
-    if (eid && pageDate && pageTime) {
-      onCreatePage(pageDate, pageTime, eid);
+    if (!eid || !pageDate || !pageTime) return;
+    setCreating(true);
+    const newId = await onCreatePage(pageDate, pageTime, eid);
+    setCreating(false);
+    if (newId) {
+      onClose();
+      onOpenCompositeEditor(newId, 'sketch');
     }
   };
 
@@ -174,12 +169,13 @@ export const SketchPlacer: React.FC<SketchPlacerProps> = ({
               <div key={item.kind === 'entry' ? `e-${item.entry.id}` : `s-${item.sketch.id}`} className={item.kind === 'entry' ? 'group/entry' : undefined}>
                 {item.kind === 'entry' ? (
                   <div
-                    className="py-3 px-3 text-sm font-medium font-serif flex items-center justify-between"
+                    className="py-3 px-3 text-sm font-medium font-serif flex items-center justify-between cursor-pointer hover:bg-black/[0.03] rounded transition-colors"
                     style={{ color: bgTheme.colors.text }}
+                    onClick={() => { onClose(); onOpenCompositeEditor(item.entry.id, 'text'); }}
                   >
                     <span>{item.entry.date} {item.entry.time}</span>
                     {confirmDeleteEntryId === item.entry.id ? (
-                      <div className="flex items-center gap-1 shrink-0">
+                      <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
                         <button
                           onClick={() => handleDeleteEntry(item.entry.id)}
                           className="px-2 py-1 text-xs font-semibold text-red-600 bg-red-50 hover:bg-red-100 rounded transition-colors"
@@ -196,7 +192,7 @@ export const SketchPlacer: React.FC<SketchPlacerProps> = ({
                       </div>
                     ) : (
                       <button
-                        onClick={() => handleDeleteEntry(item.entry.id)}
+                        onClick={(e) => { e.stopPropagation(); handleDeleteEntry(item.entry.id); }}
                         className="p-1.5 hover:bg-red-50 rounded hover:text-red-500 transition-colors shrink-0 opacity-0 group-hover/entry:opacity-100"
                         style={{ color: bgTheme.colors.textMuted }}
                         title={t('deleteEntry')}
@@ -253,77 +249,49 @@ export const SketchPlacer: React.FC<SketchPlacerProps> = ({
                 {!isLast && (
                   <div className="px-3">
                     {expandedDivider === dividerIdx ? (
-                      pageFormDivider === dividerIdx ? (
-                        /* Inline date/time form */
-                        <div
-                          className="flex flex-wrap items-center gap-2 py-2 px-3 rounded-lg border"
-                          style={{ borderColor: bgTheme.colors.border, backgroundColor: `${bgTheme.colors.textMuted}10` }}
+                      /* Inline date/time form */
+                      <div
+                        className="flex flex-wrap items-center gap-2 py-2 px-3 rounded-lg border"
+                        style={{ borderColor: bgTheme.colors.border, backgroundColor: `${bgTheme.colors.textMuted}10` }}
+                      >
+                        <label className="text-[10px] uppercase tracking-wider font-bold" style={{ color: bgTheme.colors.textMuted }}>
+                          {t('insertPageDateLabel')}
+                        </label>
+                        <input
+                          type="text"
+                          value={pageDate}
+                          onChange={(e) => setPageDate(e.target.value)}
+                          className="w-28 px-2 py-1 text-xs rounded border bg-transparent focus:outline-none"
+                          style={{ borderColor: bgTheme.colors.border, color: bgTheme.colors.text }}
+                          placeholder="MM/DD/YYYY"
+                        />
+                        <label className="text-[10px] uppercase tracking-wider font-bold" style={{ color: bgTheme.colors.textMuted }}>
+                          {t('insertPageTimeLabel')}
+                        </label>
+                        <input
+                          type="text"
+                          value={pageTime}
+                          onChange={(e) => setPageTime(e.target.value)}
+                          className="w-24 px-2 py-1 text-xs rounded border bg-transparent focus:outline-none"
+                          style={{ borderColor: bgTheme.colors.border, color: bgTheme.colors.text }}
+                          placeholder="HH:MM AM"
+                        />
+                        <button
+                          onClick={() => handleSubmitPage(dividerIdx)}
+                          disabled={creating}
+                          className="px-3 py-1 text-xs font-semibold rounded transition-colors text-white disabled:opacity-50"
+                          style={{ backgroundColor: bgTheme.colors.tabs.journal.active }}
                         >
-                          <label className="text-[10px] uppercase tracking-wider font-bold" style={{ color: bgTheme.colors.textMuted }}>
-                            {t('insertPageDateLabel')}
-                          </label>
-                          <input
-                            type="text"
-                            value={pageDate}
-                            onChange={(e) => setPageDate(e.target.value)}
-                            className="w-28 px-2 py-1 text-xs rounded border bg-transparent focus:outline-none"
-                            style={{ borderColor: bgTheme.colors.border, color: bgTheme.colors.text }}
-                            placeholder="MM/DD/YYYY"
-                          />
-                          <label className="text-[10px] uppercase tracking-wider font-bold" style={{ color: bgTheme.colors.textMuted }}>
-                            {t('insertPageTimeLabel')}
-                          </label>
-                          <input
-                            type="text"
-                            value={pageTime}
-                            onChange={(e) => setPageTime(e.target.value)}
-                            className="w-24 px-2 py-1 text-xs rounded border bg-transparent focus:outline-none"
-                            style={{ borderColor: bgTheme.colors.border, color: bgTheme.colors.text }}
-                            placeholder="HH:MM AM"
-                          />
-                          <button
-                            onClick={() => handleSubmitPage(dividerIdx)}
-                            className="px-3 py-1 text-xs font-semibold rounded transition-colors text-white"
-                            style={{ backgroundColor: bgTheme.colors.tabs.journal.active }}
-                          >
-                            {t('insertPageCreate')}
-                          </button>
-                          <button
-                            onClick={() => { setPageFormDivider(null); setExpandedDivider(null); }}
-                            className="px-2 py-1 text-xs font-semibold rounded transition-colors"
-                            style={{ color: bgTheme.colors.textMuted }}
-                          >
-                            {t('sketchCancelBtn')}
-                          </button>
-                        </div>
-                      ) : (
-                        /* Choice: New Page / New Sketch */
-                        <div className="flex items-center justify-center gap-3 py-2">
-                          <button
-                            onClick={() => handleChoosePage(dividerIdx)}
-                            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md border transition-colors hover:opacity-80"
-                            style={{ borderColor: bgTheme.colors.border, color: bgTheme.colors.text }}
-                          >
-                            <FileText size={14} />
-                            {t('insertChoicePage')}
-                          </button>
-                          <button
-                            onClick={() => handleChooseSketch(dividerIdx)}
-                            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md border transition-colors hover:opacity-80"
-                            style={{ borderColor: bgTheme.colors.border, color: bgTheme.colors.text }}
-                          >
-                            <PenTool size={14} />
-                            {t('insertChoiceSketch')}
-                          </button>
-                          <button
-                            onClick={() => setExpandedDivider(null)}
-                            className="px-2 py-1 text-xs rounded transition-colors"
-                            style={{ color: bgTheme.colors.textMuted }}
-                          >
-                            {t('sketchCancelBtn')}
-                          </button>
-                        </div>
-                      )
+                          {t('insertPageCreate')}
+                        </button>
+                        <button
+                          onClick={() => setExpandedDivider(null)}
+                          className="px-2 py-1 text-xs font-semibold rounded transition-colors"
+                          style={{ color: bgTheme.colors.textMuted }}
+                        >
+                          {t('sketchCancelBtn')}
+                        </button>
+                      </div>
                     ) : (
                       /* Collapsed divider with + icon */
                       <button

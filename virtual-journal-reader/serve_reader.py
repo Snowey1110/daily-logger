@@ -34,17 +34,21 @@ def _sketches_path() -> Path:
     return dl.SETTINGS_DIR / "journal_reader_sketches.json"
 
 
-def _load_sketches_v2() -> List[Dict[str, str]]:
-    """Load sketches in v2 format (list of positioned sketches).  Auto-migrates v1."""
+def _load_data() -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    """Load sketches + overlays (v3).  Auto-migrates v1/v2."""
     path = _sketches_path()
     if not path.is_file():
-        return []
+        return [], {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return []
+        return [], {}
+    if isinstance(raw, dict) and raw.get("version") == 3:
+        return list(raw.get("sketches", [])), dict(raw.get("overlays", {}))
     if isinstance(raw, dict) and raw.get("version") == 2:
-        return list(raw.get("sketches", []))
+        sketches = list(raw.get("sketches", []))
+        _save_data(sketches, {})
+        return sketches, {}
     # v1 migration: flat { entryId: dataUrl } dict
     if isinstance(raw, dict):
         migrated: List[Dict[str, str]] = []
@@ -58,14 +62,14 @@ def _load_sketches_v2() -> List[Dict[str, str]]:
                     "dataUrl": data_url,
                     "createdAt": "1970-01-01T00:00:00Z",
                 })
-        _save_sketches_v2(migrated)
-        return migrated
-    return []
+        _save_data(migrated, {})
+        return migrated, {}
+    return [], {}
 
 
-def _save_sketches_v2(sketches: List[Dict[str, str]]) -> None:
+def _save_data(sketches: List[Dict[str, str]], overlays: Dict[str, Any]) -> None:
     dl.SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"version": 2, "sketches": sketches}
+    payload = {"version": 3, "sketches": sketches, "overlays": overlays}
     _sketches_path().write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -127,8 +131,8 @@ class ReaderHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/entries":
             entries, err = dl.load_journal_reader_entries()
-            sketches = _load_sketches_v2()
-            payload: Dict[str, Any] = {"entries": entries, "sketches": sketches}
+            sketches, overlays = _load_data()
+            payload: Dict[str, Any] = {"entries": entries, "sketches": sketches, "overlays": overlays}
             if err:
                 payload["error"] = err
             prefs = dl.load_preferences()
@@ -206,6 +210,14 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 return
             sheet_name, row_index = parsed_id
             ok, msg = dl.delete_journal_reader_entry(sheet_name, row_index)
+            if ok:
+                sketches, overlays = _load_data()
+                if entry_id in overlays:
+                    del overlays[entry_id]
+                    try:
+                        _save_data(sketches, overlays)
+                    except OSError:
+                        pass
             self._send_json(200 if ok else 409, {"ok": ok, "error": msg})
             return
 
@@ -233,8 +245,34 @@ class ReaderHandler(BaseHTTPRequestHandler):
             self._send_json(200 if ok else 409, {"ok": ok, "error": msg})
             return
 
+        if path == "/api/page-overlay":
+            entry_id = str(payload.get("entryId", "")).strip()
+            if not entry_id:
+                self._send_json(400, {"ok": False, "error": "Missing entryId"})
+                return
+            sketch_data = payload.get("sketchDataUrl") or ""
+            images = payload.get("images") or []
+            layer_order = payload.get("layerOrder") or ["text", "sketch", "images"]
+            sketches, overlays = _load_data()
+            has_content = bool(sketch_data) or bool(images)
+            if has_content:
+                overlays[entry_id] = {
+                    "sketchDataUrl": sketch_data,
+                    "images": images,
+                    "layerOrder": layer_order,
+                }
+            else:
+                overlays.pop(entry_id, None)
+            try:
+                _save_data(sketches, overlays)
+            except OSError as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+                return
+            self._send_json(200, {"ok": True})
+            return
+
         if path == "/api/sketch":
-            sketches = _load_sketches_v2()
+            sketches, overlays = _load_data()
 
             if payload.get("delete"):
                 sketch_id = str(payload.get("id", "")).strip()
@@ -243,7 +281,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
                     return
                 sketches = [s for s in sketches if s.get("id") != sketch_id]
                 try:
-                    _save_sketches_v2(sketches)
+                    _save_data(sketches, overlays)
                 except OSError as exc:
                     self._send_json(500, {"ok": False, "error": str(exc)})
                     return
@@ -281,7 +319,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 sketch_id = new_id
 
             try:
-                _save_sketches_v2(sketches)
+                _save_data(sketches, overlays)
             except OSError as exc:
                 self._send_json(500, {"ok": False, "error": str(exc)})
                 return

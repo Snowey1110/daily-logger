@@ -24,6 +24,20 @@ export interface PositionedSketch {
   createdAt: string;
 }
 
-export type RightPageSetting = 'none' | 'ai' | 'stt';
+export interface PageImage {
+  id: string;
+  dataUrl: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface PageOverlay {
+  entryId: string;
+  sketchDataUrl?: string;
+  images: PageImage[];
+  layerOrder: ('text' | 'sketch' | 'images')[];
+}
 
 export type JournalSection = 'journal' | 'stt' | 'ai';
