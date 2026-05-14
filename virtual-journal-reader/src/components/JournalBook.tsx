@@ -8,7 +8,8 @@ import { DrawingCanvas } from './DrawingCanvas';
 import { SketchPlacer } from './SketchPlacer';
 import { EditorSidebar } from './EditorSidebar';
 import { useInlineEditor, type LayerKind } from '../hooks/useInlineEditor';
-import { ChevronLeft, ChevronRight, Type, MessageSquare, BrainCircuit, X, GripVertical } from 'lucide-react';
+import { useIsMobile } from '../hooks/useIsMobile';
+import { ChevronLeft, ChevronRight, Type, MessageSquare, BrainCircuit, X, GripVertical, Pencil } from 'lucide-react';
 import { useReaderT } from '../readerI18n';
 import { useTheme } from './ThemeProvider';
 import type { JournalTheme } from '../types/theme';
@@ -482,6 +483,9 @@ async function fetchData(): Promise<{
 const JournalBook: React.FC = () => {
   const { t } = useReaderT();
   const { coverTheme, bgTheme } = useTheme();
+  const { isMobile, isLandscape } = useIsMobile();
+  const [forceSinglePage, setForceSinglePage] = useState(false);
+  const singlePage = (isMobile && !isLandscape) || forceSinglePage;
   const [entries, setEntries] = useState<JournalEntry[]>([]);
   const [sketches, setSketches] = useState<PositionedSketch[]>([]);
   const [overlays, setOverlays] = useState<Record<string, PageOverlay>>({});
@@ -489,6 +493,7 @@ const JournalBook: React.FC = () => {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(0);
+  const [mobileSide, setMobileSide] = useState<'left' | 'right'>('left');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(() => readStored(READER_SORT_KEY, ['asc', 'desc'], 'asc'));
   const [activeSection, setActiveSection] = useState<JournalSection>('journal');
 
@@ -522,6 +527,21 @@ const JournalBook: React.FC = () => {
   useEffect(() => { void reload(); }, [reload]);
 
   useEffect(() => {
+    fetch('/api/reader-settings')
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.sortOrder === 'asc' || data.sortOrder === 'desc') {
+          setSortOrder(data.sortOrder);
+          persistStored(READER_SORT_KEY, data.sortOrder);
+        }
+        if (typeof data.singlePageMode === 'boolean') {
+          setForceSinglePage(data.singlePageMode);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
     document.title = `${appTitle} — ${t('docTitleSuffix')}`;
   }, [appTitle, t]);
 
@@ -541,8 +561,8 @@ const JournalBook: React.FC = () => {
   /* ── spreads ── */
 
   const spreads = useMemo(
-    () => buildUnifiedSpreads(sortedEntries, sketches, activeSection),
-    [sortedEntries, sketches, activeSection],
+    () => buildUnifiedSpreads(sortedEntries, sketches, singlePage ? 'journal' : activeSection),
+    [sortedEntries, sketches, activeSection, singlePage],
   );
 
   const spreadCount = spreads.length;
@@ -568,14 +588,46 @@ const JournalBook: React.FC = () => {
   }, [spreads]);
 
   const handleNext = useCallback(() => {
-    if (currentPage >= spreadCount) return;
-    setCurrentPage((p) => p + 1);
-  }, [currentPage, spreadCount]);
+    if (singlePage) {
+      if (activeSection !== 'journal') setActiveSection('journal');
+      if (mobileSide === 'left') {
+        const spread = currentPage > 0 ? spreads[currentPage - 1] : undefined;
+        if (spread && spread.right.type !== 'empty') {
+          setMobileSide('right');
+          return;
+        }
+      }
+      if (currentPage >= spreadCount) return;
+      setCurrentPage((p) => p + 1);
+      setMobileSide('left');
+    } else {
+      if (currentPage >= spreadCount) return;
+      setCurrentPage((p) => p + 1);
+    }
+  }, [currentPage, spreadCount, singlePage, mobileSide, spreads, activeSection]);
 
   const handlePrev = useCallback(() => {
-    if (currentPage <= 0) return;
-    setCurrentPage((p) => Math.max(0, p - 1));
-  }, [currentPage]);
+    if (singlePage) {
+      if (activeSection !== 'journal') setActiveSection('journal');
+      if (mobileSide === 'right') {
+        setMobileSide('left');
+        return;
+      }
+      if (currentPage <= 0) return;
+      const prevPage = currentPage - 1;
+      if (prevPage > 0) {
+        const prevSpread = spreads[prevPage - 1];
+        setCurrentPage(prevPage);
+        setMobileSide(prevSpread && prevSpread.right.type !== 'empty' ? 'right' : 'left');
+      } else {
+        setCurrentPage(0);
+        setMobileSide('left');
+      }
+    } else {
+      if (currentPage <= 0) return;
+      setCurrentPage((p) => Math.max(0, p - 1));
+    }
+  }, [currentPage, singlePage, mobileSide, spreads]);
 
   const handleDateSelect = (date: Date) => {
     const dateStr = date.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' });
@@ -597,6 +649,49 @@ const JournalBook: React.FC = () => {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleNext, handlePrev, inlineEditEntry]);
+
+  /* ── swipe nav (mobile) ── */
+
+  const touchStartX = useRef(0);
+  const touchStartY = useRef(0);
+
+  const onTouchStart = useCallback((e: React.TouchEvent) => {
+    touchStartX.current = e.touches[0].clientX;
+    touchStartY.current = e.touches[0].clientY;
+  }, []);
+
+  const onTouchEnd = useCallback((e: React.TouchEvent) => {
+    if (inlineEditEntry) return;
+    const dx = e.changedTouches[0].clientX - touchStartX.current;
+    const dy = e.changedTouches[0].clientY - touchStartY.current;
+    if (Math.abs(dx) < 50 || Math.abs(dy) > Math.abs(dx)) return;
+    if (dx < 0) handleNext();
+    else handlePrev();
+  }, [handleNext, handlePrev, inlineEditEntry]);
+
+  /* ── mobile page count (individual pages vs spreads) ── */
+
+  const mobilePageTotal = useMemo(() => {
+    if (!singlePage) return spreadCount;
+    let count = 0;
+    for (const s of spreads) {
+      count += 1;
+      if (s.right.type !== 'empty') count += 1;
+    }
+    return count;
+  }, [singlePage, spreads, spreadCount]);
+
+  const mobilePageCurrent = useMemo(() => {
+    if (!singlePage || currentPage === 0) return currentPage;
+    let count = 0;
+    for (let i = 0; i < currentPage - 1 && i < spreads.length; i++) {
+      count += 1;
+      if (spreads[i].right.type !== 'empty') count += 1;
+    }
+    count += 1;
+    if (mobileSide === 'right') count += 1;
+    return count;
+  }, [singlePage, currentPage, mobileSide, spreads]);
 
   /* ── actions ── */
 
@@ -756,9 +851,39 @@ const JournalBook: React.FC = () => {
   const isDrawing = editingSketchId !== null;
   const drawingInitialData = editingSketchId ? sketches.find((s) => s.id === editingSketchId)?.dataUrl : undefined;
 
+  /* ── bookmark page editing (speech/AI) ── */
+
+  const [bookmarkEdit, setBookmarkEdit] = useState<{ entryId: string; field: 'speechToText' | 'aiReport'; text: string } | null>(null);
+
+  const handleEditBookmarkPage = (entryId: string, field: 'speechToText' | 'aiReport', currentText: string) => {
+    setBookmarkEdit({ entryId, field, text: currentText });
+  };
+
+  const handleSaveBookmarkEdit = async () => {
+    if (!bookmarkEdit) return;
+    setSaveError(null);
+    try {
+      const body: Record<string, string> = { id: bookmarkEdit.entryId };
+      body[bookmarkEdit.field] = bookmarkEdit.text;
+      const res = await fetch('/api/entry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!data.ok) { setSaveError(data.error || t('errSaveFailed')); return; }
+      await reload();
+      setBookmarkEdit(null);
+    } catch { setSaveError(t('errNetworkSave')); }
+  };
+
   const handleBookmarkClick = (section: JournalSection) => {
     if (section !== 'journal' && inlineEditEntry) {
       setInlineEditEntry(null);
+    }
+    if (singlePage) {
+      setActiveSection(section);
+      return;
     }
     // Remember the entry the user is currently viewing so we can stay on
     // it after the spreads rebuild with a different page count.
@@ -774,14 +899,45 @@ const JournalBook: React.FC = () => {
 
   const currentSpread = currentPage > 0 ? spreads[currentPage - 1] : undefined;
 
+  /* In single-page mode, figure out the entry shown on the current page
+     and whether it has STT/AI content.  When a bookmark tab is active,
+     we swap the page content instead of rebuilding spreads. */
+  const singlePageEntry = useMemo(() => {
+    if (!singlePage || !currentSpread) return undefined;
+    const page = mobileSide === 'left' ? currentSpread.left : currentSpread.right;
+    const eid = page.sourceEntryId ?? currentSpread.entryId;
+    return entries.find((e) => e.id === eid);
+  }, [singlePage, currentSpread, mobileSide, entries]);
+
+  const singlePageHasStt = !!(singlePageEntry?.speechToText?.trim());
+  const singlePageHasAi = !!(singlePageEntry?.aiReport?.trim());
+  const singlePageHasBookmark = singlePageHasStt || singlePageHasAi;
+
+  const singlePageBookmarkContent = useMemo<PageContent | undefined>(() => {
+    if (!singlePage || !singlePageEntry || activeSection === 'journal') return undefined;
+    const field = activeSection === 'stt' ? 'speechToText' : 'aiReport';
+    const text = (singlePageEntry[field] || '').trim();
+    if (!text) return undefined;
+    return {
+      type: 'text',
+      content: text,
+      secondaryPage: 1,
+      sourceEntryId: singlePageEntry.id,
+      sourceDate: singlePageEntry.date,
+      sourceTime: singlePageEntry.time,
+    };
+  }, [singlePage, singlePageEntry, activeSection]);
+
   return (
     <div className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden select-none font-sans transition-colors duration-500" style={{ backgroundColor: bgTheme.colors.bg }}>
-      <div className="absolute top-6 left-8 opacity-80 z-10" style={{ color: bgTheme.cover.accentText }}>
-        <h1 className="text-2xl tracking-widest uppercase font-light font-serif">
-          {appTitle}{' '}
-          <span className="text-xs opacity-50 block tracking-normal font-sans">{t('readerSubtitle')}</span>
-        </h1>
-      </div>
+      {!singlePage && (
+        <div className="absolute top-6 left-8 opacity-80 z-10" style={{ color: bgTheme.cover.accentText }}>
+          <h1 className="text-2xl tracking-widest uppercase font-light font-serif">
+            {appTitle}{' '}
+            <span className="text-xs opacity-50 block tracking-normal font-sans">{t('readerSubtitle')}</span>
+          </h1>
+        </div>
+      )}
 
       {(loadError || saveError) && (
         <div className="fixed top-6 left-1/2 -translate-x-1/2 z-[200] max-w-xl rounded-lg border border-amber-500/40 bg-black/80 px-6 py-3 text-sm text-amber-100 font-sans shadow-2xl backdrop-blur-sm">
@@ -791,8 +947,8 @@ const JournalBook: React.FC = () => {
       )}
 
       <Navigation
-        currentPage={currentPage}
-        totalPages={spreadCount}
+        currentPage={singlePage ? mobilePageCurrent : currentPage}
+        totalPages={singlePage ? mobilePageTotal : spreadCount}
         onPageJump={handlePageJump}
         onPrev={handlePrev}
         onNext={handleNext}
@@ -801,6 +957,11 @@ const JournalBook: React.FC = () => {
           setSortOrder((prev) => {
             const next = prev === 'asc' ? 'desc' : 'asc';
             persistStored(READER_SORT_KEY, next);
+            fetch('/api/reader-settings', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sortOrder: next }),
+            }).catch(() => {});
             return next;
           })
         }
@@ -808,22 +969,46 @@ const JournalBook: React.FC = () => {
         onDateSelect={handleDateSelect}
         isEditTextOpen={false}
         onSaveText={() => {}}
+        isMobile={singlePage}
+        singlePageMode={forceSinglePage}
+        onToggleSinglePage={() => {
+          const next = !forceSinglePage;
+          setForceSinglePage(next);
+          setMobileSide('left');
+          fetch('/api/reader-settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ singlePageMode: next }),
+          }).catch(() => {});
+        }}
       />
 
-      <div className="flex-1 flex min-h-0 items-center justify-center p-3 md:p-5 perspective-[2000px]">
+      <div
+        className="flex-1 flex min-h-0 items-center justify-center p-2 md:p-5 perspective-[2000px]"
+        onTouchStart={onTouchStart}
+        onTouchEnd={onTouchEnd}
+        style={{ touchAction: 'manipulation' }}
+      >
         <div
-          className="relative mx-auto flex aspect-[1.4/1] h-auto max-h-full min-h-0 w-[min(100%,72rem,92vw)] max-w-full shrink shadow-[0_50px_100px_-20px_rgba(0,0,0,0.5)] rounded-xl"
-          style={{ transform: inlineEditEntry ? 'translateX(7rem)' : 'none', transition: 'transform 0.3s ease' }}
+          className={cn(
+            'relative mx-auto flex h-auto max-h-full min-h-0 max-w-full shrink rounded-xl',
+            singlePage
+              ? 'aspect-[0.7/1] w-[min(100%,24rem,92vw)] shadow-[0_20px_60px_-10px_rgba(0,0,0,0.5)]'
+              : 'aspect-[1.4/1] w-[min(100%,72rem,92vw)] shadow-[0_50px_100px_-20px_rgba(0,0,0,0.5)]',
+          )}
+          style={{ transform: inlineEditEntry && !singlePage ? 'translateX(7rem)' : 'none', transition: 'transform 0.3s ease' }}
         >
           <div className="absolute inset-0 bg-black/40 -z-10 rounded-xl translate-x-2 translate-y-2 blur-2xl" />
 
-          <div
-            className={cn(
-              'absolute left-1/2 -ml-0.5 top-0 bottom-0 w-px z-20 shadow-[0_0_10px_rgba(0,0,0,0.1)]',
-              currentPage === 0 && 'hidden',
-            )}
-            style={{ backgroundColor: bgTheme.colors.spine }}
-          />
+          {!singlePage && (
+            <div
+              className={cn(
+                'absolute left-1/2 -ml-0.5 top-0 bottom-0 w-px z-20 shadow-[0_0_10px_rgba(0,0,0,0.1)]',
+                currentPage === 0 && 'hidden',
+              )}
+              style={{ backgroundColor: bgTheme.colors.spine }}
+            />
+          )}
 
           <AnimatePresence mode="wait">
             {currentPage === 0 ? (
@@ -876,22 +1061,58 @@ const JournalBook: React.FC = () => {
                   </>
                 )}
 
-                <Page
-                  ref={leftPageRef}
-                  spread={currentSpread}
-                  side="left"
-                  activeSection={activeSection}
-                  theme={bgTheme}
-                  overlay={currentSpread?.left.sourceEntryId ? overlays[currentSpread.left.sourceEntryId] : undefined}
-                />
-                <Page
-                  ref={rightPageRef}
-                  spread={currentSpread}
-                  side="right"
-                  activeSection={activeSection}
-                  theme={bgTheme}
-                  overlay={currentSpread?.right.sourceEntryId && currentSpread.right.sourceEntryId !== currentSpread.left.sourceEntryId ? overlays[currentSpread.right.sourceEntryId] : undefined}
-                />
+                {singlePage ? (
+                  singlePageBookmarkContent ? (
+                    <Page
+                      ref={leftPageRef}
+                      spread={currentSpread ? {
+                        ...currentSpread,
+                        left: singlePageBookmarkContent,
+                        right: { type: 'empty' },
+                      } : undefined}
+                      side="left"
+                      activeSection={activeSection}
+                      theme={bgTheme}
+                      fullWidth
+                      onEditBookmark={handleEditBookmarkPage}
+                    />
+                  ) : (
+                    <Page
+                      ref={mobileSide === 'left' ? leftPageRef : rightPageRef}
+                      spread={currentSpread}
+                      side={mobileSide}
+                      activeSection={activeSection}
+                      theme={bgTheme}
+                      overlay={(() => {
+                        const eid = mobileSide === 'left' ? currentSpread?.left.sourceEntryId : currentSpread?.right.sourceEntryId;
+                        return eid ? overlays[eid] : undefined;
+                      })()}
+                      fullWidth
+                      onEditBookmark={handleEditBookmarkPage}
+                    />
+                  )
+                ) : (
+                  <>
+                    <Page
+                      ref={leftPageRef}
+                      spread={currentSpread}
+                      side="left"
+                      activeSection={activeSection}
+                      theme={bgTheme}
+                      overlay={currentSpread?.left.sourceEntryId ? overlays[currentSpread.left.sourceEntryId] : undefined}
+                      onEditBookmark={handleEditBookmarkPage}
+                    />
+                    <Page
+                      ref={rightPageRef}
+                      spread={currentSpread}
+                      side="right"
+                      activeSection={activeSection}
+                      theme={bgTheme}
+                      overlay={currentSpread?.right.sourceEntryId && currentSpread.right.sourceEntryId !== currentSpread.left.sourceEntryId ? overlays[currentSpread.right.sourceEntryId] : undefined}
+                      onEditBookmark={handleEditBookmarkPage}
+                    />
+                  </>
+                )}
 
                 {/* Inline editor layers inside the book spread — absolute positioning for zoom-proof alignment.
                    Only the in-book layers go here; sidebar + file input are rendered outside (see below)
@@ -910,11 +1131,12 @@ const JournalBook: React.FC = () => {
                       defaultLayer={inlineEditEntry.defaultLayer}
                       side={inlineEditEntry.side}
                       pageRef={inlineEditEntry.side === 'left' ? leftPageRef : rightPageRef}
-                      otherEntryId={editOtherEntryId}
+                      otherEntryId={singlePage ? undefined : editOtherEntryId}
                       otherSide={editOtherSide}
                       onSave={handleSaveInline}
                       onSwitchSide={handleSwitchSide}
                       onClose={() => setInlineEditEntry(null)}
+                      isMobile={singlePage}
                     />
                   );
                 })()}
@@ -922,33 +1144,48 @@ const JournalBook: React.FC = () => {
             )}
           </AnimatePresence>
 
-          {/* Bookmark tabs — always visible */}
-          {currentPage > 0 && (
-            <div className="absolute left-full ml-1 top-20 flex flex-col space-y-1 z-30">
-              <BookmarkTab
-                label={t('tabJournal')}
-                tabNumber="01"
-                icon={<Type size={16} />}
-                isActive={activeSection === 'journal'}
-                onClick={() => handleBookmarkClick('journal')}
-                colors={bgTheme.colors.tabs.journal}
-              />
-              <BookmarkTab
-                label={t('tabSpeech')}
-                tabNumber="02"
-                icon={<MessageSquare size={16} />}
-                isActive={activeSection === 'stt'}
-                onClick={() => handleBookmarkClick('stt')}
-                colors={bgTheme.colors.tabs.stt}
-              />
-              <BookmarkTab
-                label={t('tabAi')}
-                tabNumber="03"
-                icon={<BrainCircuit size={16} />}
-                isActive={activeSection === 'ai'}
-                onClick={() => handleBookmarkClick('ai')}
-                colors={bgTheme.colors.tabs.ai}
-              />
+          {/* Bookmark tabs */}
+          {currentPage > 0 && (singlePage ? singlePageHasBookmark : true) && (
+            <div className={cn(
+              'absolute z-30',
+              singlePage
+                ? 'left-0 right-0 top-full mt-1 flex flex-row justify-center space-x-1'
+                : 'left-full ml-1 top-20 flex flex-col space-y-1',
+            )}>
+              {/* Journal tab — in single page only show when viewing a bookmark */}
+              {(!singlePage || activeSection !== 'journal') && (
+                <BookmarkTab
+                  label={t('tabJournal')}
+                  tabNumber="01"
+                  icon={<Type size={singlePage ? 14 : 16} />}
+                  isActive={activeSection === 'journal'}
+                  onClick={() => handleBookmarkClick('journal')}
+                  colors={bgTheme.colors.tabs.journal}
+                  compact={singlePage}
+                />
+              )}
+              {(!singlePage || singlePageHasStt) && (
+                <BookmarkTab
+                  label={t('tabSpeech')}
+                  tabNumber="02"
+                  icon={<MessageSquare size={singlePage ? 14 : 16} />}
+                  isActive={activeSection === 'stt'}
+                  onClick={() => handleBookmarkClick('stt')}
+                  colors={bgTheme.colors.tabs.stt}
+                  compact={singlePage}
+                />
+              )}
+              {(!singlePage || singlePageHasAi) && (
+                <BookmarkTab
+                  label={t('tabAi')}
+                  tabNumber="03"
+                  icon={<BrainCircuit size={singlePage ? 14 : 16} />}
+                  isActive={activeSection === 'ai'}
+                  onClick={() => handleBookmarkClick('ai')}
+                  colors={bgTheme.colors.tabs.ai}
+                  compact={singlePage}
+                />
+              )}
             </div>
           )}
         </div>
@@ -979,15 +1216,54 @@ const JournalBook: React.FC = () => {
         />
       )}
 
-      <footer className="shrink-0 flex flex-col items-center gap-2 px-4 pb-4 pt-2 text-center" style={{ color: bgTheme.cover.accentText }}>
-        <div className="flex items-center justify-center space-x-12 opacity-40">
+      {/* Bookmark page edit modal (speech/AI) */}
+      {bookmarkEdit && (
+        <div className="fixed inset-0 z-[200] bg-black/60 flex items-center justify-center p-4 backdrop-blur-sm font-sans">
+          <div
+            className="rounded-2xl shadow-2xl w-full max-w-2xl flex flex-col overflow-hidden"
+            style={{ backgroundColor: bgTheme.colors.bookInner, maxHeight: '80vh' }}
+          >
+            <div className="flex items-center justify-between px-4 md:px-6 py-3 shrink-0" style={{ borderBottom: `1px solid ${bgTheme.colors.border}` }}>
+              <h3 className="font-semibold uppercase tracking-widest text-xs" style={{ color: bgTheme.colors.text }}>
+                {bookmarkEdit.field === 'speechToText' ? t('tabSpeech') : t('tabAi')}
+              </h3>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleSaveBookmarkEdit}
+                  className="px-4 py-1.5 rounded-lg text-white text-xs font-semibold uppercase tracking-widest min-h-[36px]"
+                  style={{ backgroundColor: bgTheme.cover.isDark ? '#4f46e5' : '#334155' }}
+                >
+                  {t('compositeEditorSave')}
+                </button>
+                <button
+                  onClick={() => setBookmarkEdit(null)}
+                  className="p-1.5 rounded-full hover:bg-black/5 transition-colors"
+                  style={{ color: bgTheme.colors.textMuted }}
+                >
+                  <X size={18} />
+                </button>
+              </div>
+            </div>
+            <textarea
+              className="flex-1 min-h-[200px] p-4 md:p-6 resize-none focus:outline-none font-serif text-base leading-relaxed"
+              style={{ backgroundColor: bgTheme.colors.bookInner, color: bgTheme.colors.text }}
+              value={bookmarkEdit.text}
+              onChange={(e) => setBookmarkEdit((prev) => prev ? { ...prev, text: e.target.value } : prev)}
+              autoFocus
+            />
+          </div>
+        </div>
+      )}
+
+      <footer className="shrink-0 flex flex-col items-center gap-1 md:gap-2 px-4 pb-2 md:pb-4 pt-1 md:pt-2 text-center" style={{ color: bgTheme.cover.accentText }}>
+        <div className={cn('flex items-center justify-center opacity-40', singlePage ? 'space-x-6' : 'space-x-12')}>
           <button
             type="button"
             onClick={handlePrev}
-            className="flex items-center space-x-2 group hover:opacity-100 transition-opacity"
+            className="flex items-center space-x-1 md:space-x-2 group hover:opacity-100 transition-opacity min-h-[44px] min-w-[44px] justify-center"
           >
             <ChevronLeft className="w-5 h-5 group-hover:-translate-x-1 transition-transform" />
-            <span className="text-sm uppercase tracking-widest font-sans">{t('footerPrev')}</span>
+            {!singlePage && <span className="text-sm uppercase tracking-widest font-sans">{t('footerPrev')}</span>}
           </button>
           <div className="flex items-center space-x-3">
             <div className={cn('w-1 h-1 rounded-full', currentPage < 2 ? 'bg-current/50' : 'bg-current/20')} />
@@ -997,15 +1273,17 @@ const JournalBook: React.FC = () => {
           <button
             type="button"
             onClick={handleNext}
-            className="flex items-center space-x-2 group hover:opacity-100 transition-opacity"
+            className="flex items-center space-x-1 md:space-x-2 group hover:opacity-100 transition-opacity min-h-[44px] min-w-[44px] justify-center"
           >
-            <span className="text-sm uppercase tracking-widest font-sans">{t('footerNext')}</span>
+            {!singlePage && <span className="text-sm uppercase tracking-widest font-sans">{t('footerNext')}</span>}
             <ChevronRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
           </button>
         </div>
-        <div className="text-[10px] uppercase tracking-[0.3em] opacity-20 font-sans leading-relaxed">
-          {t('footerFlipHint')}
-        </div>
+        {!singlePage && (
+          <div className="text-[10px] uppercase tracking-[0.3em] opacity-20 font-sans leading-relaxed">
+            {t('footerFlipHint')}
+          </div>
+        )}
       </footer>
     </div>
   );
@@ -1028,7 +1306,8 @@ const InlineEditorOverlay: React.FC<{
     targetSide: 'left' | 'right',
   ) => void;
   onClose: () => void;
-}> = ({ entry, overlay: ov, defaultLayer, side, pageRef, otherEntryId, otherSide, onSave, onSwitchSide, onClose }) => {
+  isMobile?: boolean;
+}> = ({ entry, overlay: ov, defaultLayer, side, pageRef, otherEntryId, otherSide, onSave, onSwitchSide, onClose, isMobile }) => {
   const { t } = useReaderT();
   const { bgTheme } = useTheme();
   const editor = useInlineEditor({
@@ -1058,8 +1337,9 @@ const InlineEditorOverlay: React.FC<{
     );
   };
 
-  const padClass = side === 'right' ? 'p-8 pl-10' : 'p-8 pr-10';
-  const pagePosition = side === 'left' ? 'left-0' : 'left-1/2';
+  const padClass = isMobile ? 'p-4' : (side === 'right' ? 'p-8 pl-10' : 'p-8 pr-10');
+  const overlayWidth = isMobile ? 'w-full' : 'w-1/2';
+  const pagePosition = isMobile ? 'left-0' : (side === 'left' ? 'left-0' : 'left-1/2');
 
   return (
     <>
@@ -1088,6 +1368,7 @@ const InlineEditorOverlay: React.FC<{
             onClose={onClose}
             entryDate={editDate}
             entryTime={editTime}
+            isMobile={isMobile}
           />
           <input ref={editor.fileInputRef} type="file" accept="image/*" className="hidden" onChange={editor.handleFileChange} />
         </>,
@@ -1097,7 +1378,7 @@ const InlineEditorOverlay: React.FC<{
       {/* Click-to-switch overlay on the opposite page */}
       {otherEntryId && (
         <div
-          className={`absolute top-0 bottom-0 w-1/2 z-[60] cursor-pointer hover:bg-blue-400/10 transition-colors ${otherSide === 'left' ? 'left-0' : 'left-1/2'}`}
+          className={`absolute top-0 bottom-0 ${overlayWidth} z-[60] cursor-pointer hover:bg-blue-400/10 transition-colors ${otherSide === 'left' ? 'left-0' : 'left-1/2'}`}
           onClick={handleClickOtherPage}
           title="Click to edit this page"
         />
@@ -1106,7 +1387,7 @@ const InlineEditorOverlay: React.FC<{
       {/* Sketch canvas — absolute within book spread, covers the active page */}
       <canvas
         ref={editor.canvasRef}
-        className={`absolute top-0 bottom-0 w-1/2 touch-none ${pagePosition}`}
+        className={`absolute top-0 bottom-0 ${overlayWidth} touch-none ${pagePosition}`}
         style={{
           zIndex: 50 + editor.zIndex('sketch'),
           pointerEvents: editor.activeLayer === 'sketch' ? 'auto' : 'none',
@@ -1122,7 +1403,7 @@ const InlineEditorOverlay: React.FC<{
       />
 
       {/* Text + image editing layers — absolute within book spread, covers the active page */}
-      <div className={`absolute top-0 bottom-0 w-1/2 ${pagePosition}`} style={{ zIndex: 50 }}>
+      <div className={`absolute top-0 bottom-0 ${overlayWidth} ${pagePosition}`} style={{ zIndex: 50 }}>
         {/* Text layer — opaque background to hide rendered page text underneath */}
         <div
           className={`absolute inset-0 ${padClass} flex flex-col font-serif`}
@@ -1221,12 +1502,15 @@ const Page = React.forwardRef<HTMLDivElement, {
   activeSection: JournalSection;
   theme: JournalTheme;
   overlay?: PageOverlay;
-}>(({ spread, side, activeSection, theme, overlay }, ref) => {
+  fullWidth?: boolean;
+  onEditBookmark?: (entryId: string, field: 'speechToText' | 'aiReport', text: string) => void;
+}>(({ spread, side, activeSection, theme, overlay, fullWidth, onEditBookmark }, ref) => {
   const { t } = useReaderT();
+  const widthCls = fullWidth ? 'w-full' : 'w-1/2';
   if (!spread) {
     return (
       <div
-        className="w-1/2 h-full min-h-0 p-8 pr-10 flex items-center justify-center font-serif"
+        className={`${widthCls} h-full min-h-0 p-4 md:p-8 md:pr-10 flex items-center justify-center font-serif`}
         style={side === 'right' ? { backgroundColor: theme.colors.bookInner, paddingLeft: '2.5rem', paddingRight: '2rem' } : undefined}
       >
         <p className="italic tracking-widest uppercase text-xs opacity-40" style={{ color: theme.colors.textMuted }}>{t('pageEmpty')}</p>
@@ -1240,7 +1524,7 @@ const Page = React.forwardRef<HTMLDivElement, {
   if (pContent.type === 'sketch') {
     const capDate = pContent.sourceDate ?? spread.date;
     return (
-      <div className="w-1/2 h-full min-h-0 relative group overflow-hidden flex flex-col" style={{ backgroundColor: theme.colors.bookInner }}>
+      <div className={`${widthCls} h-full min-h-0 relative group overflow-hidden flex flex-col`} style={{ backgroundColor: theme.colors.bookInner }}>
         <div className="flex-1 min-h-0 relative">
           <img
             src={pContent.content}
@@ -1260,10 +1544,10 @@ const Page = React.forwardRef<HTMLDivElement, {
   if (pContent.type === 'empty') {
     return (
       <div
-        className="w-1/2 h-full min-h-0 p-8 flex items-center justify-center font-serif"
+        className={`${widthCls} h-full min-h-0 p-4 md:p-8 flex items-center justify-center font-serif`}
         style={{
           backgroundColor: theme.colors.bookInner,
-          ...(side === 'right' ? { paddingLeft: '2.5rem', paddingRight: '2rem', borderLeft: `1px solid ${theme.colors.border}` } : {}),
+          ...(side === 'right' && !fullWidth ? { paddingLeft: '2.5rem', paddingRight: '2rem', borderLeft: `1px solid ${theme.colors.border}` } : {}),
         }}
       >
         <p className="italic tracking-widest uppercase text-[10px] opacity-20" style={{ color: theme.colors.textMuted }}>{t('pageBlank')}</p>
@@ -1299,7 +1583,7 @@ const Page = React.forwardRef<HTMLDivElement, {
   return (
     <div
       ref={ref}
-      className="w-1/2 h-full min-h-0 p-8 pr-10 flex flex-col relative overflow-hidden font-serif transition-colors duration-500"
+      className={`${widthCls} h-full min-h-0 p-4 md:p-8 md:pr-10 flex flex-col relative overflow-hidden font-serif transition-colors duration-500`}
       style={{
         backgroundColor: theme.colors.bookInner,
         color: theme.colors.text,
@@ -1326,7 +1610,24 @@ const Page = React.forwardRef<HTMLDivElement, {
               ? `${sectionTitle} ${t('pageContSuffix')}`
               : sectionTitle}
           </h3>
-          <span className="text-[10px] font-sans opacity-30" style={{ color: theme.colors.textMuted }}>{columnDate}</span>
+          <div className="flex items-center gap-2">
+            {isRightSecondary && onEditBookmark && pContent.sourceEntryId && (
+              <button
+                type="button"
+                onClick={() => onEditBookmark(
+                  pContent.sourceEntryId!,
+                  activeSection === 'stt' ? 'speechToText' : 'aiReport',
+                  pContent.content || '',
+                )}
+                className="p-1 rounded-full hover:bg-black/10 transition-colors z-50 min-h-[36px] min-w-[36px] flex items-center justify-center"
+                style={{ color: theme.colors.textMuted }}
+                title="Edit"
+              >
+                <Pencil size={14} />
+              </button>
+            )}
+            <span className="text-[10px] font-sans opacity-30" style={{ color: theme.colors.textMuted }}>{columnDate}</span>
+          </div>
         </div>
       )}
 
@@ -1389,7 +1690,31 @@ const BookmarkTab: React.FC<{
   isActive: boolean;
   onClick: () => void;
   colors: { bg: string; active: string };
-}> = ({ label, tabNumber, icon, isActive, onClick, colors }) => {
+  compact?: boolean;
+}> = ({ label, tabNumber, icon, isActive, onClick, colors, compact }) => {
+  if (compact) {
+    return (
+      <motion.button
+        type="button"
+        onClick={onClick}
+        className={cn(
+          'px-3 py-2 rounded-b-md shadow-sm border-t-2 flex items-center gap-1.5 cursor-pointer transition-all font-sans min-h-[40px]',
+          isActive && 'translate-y-0.5',
+        )}
+        style={{
+          backgroundColor: isActive ? colors.active : colors.bg,
+          color: isActive ? '#fff' : 'inherit',
+          borderTopColor: isActive ? colors.active : `${colors.active}40`,
+          opacity: isActive ? 1 : 0.85,
+        }}
+        whileTap={{ scale: 0.97 }}
+      >
+        {icon}
+        <span className="text-[10px] font-bold tracking-tight uppercase whitespace-nowrap">{label}</span>
+      </motion.button>
+    );
+  }
+
   return (
     <motion.button
       type="button"

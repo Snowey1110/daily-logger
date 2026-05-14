@@ -32,6 +32,7 @@ interface EditorSidebarProps {
   /* display info */
   entryDate: string;
   entryTime: string;
+  isMobile?: boolean;
 }
 
 const LAYER_ICON: Record<LayerKind, React.ReactNode> = {
@@ -44,10 +45,11 @@ export const EditorSidebar: React.FC<EditorSidebarProps> = ({
   activeLayer, onLayerChange, layerOrder, onMoveLayer, onReorderLayers,
   color, lineWidth, isErasing, eraserSize,
   onColorChange, onLineWidthChange, onSetErasing, onEraserSizeChange, onClearCanvas,
-  onUploadImage, onSave, onClose, entryDate, entryTime,
+  onUploadImage, onSave, onClose, entryDate, entryTime, isMobile,
 }) => {
   const { t } = useReaderT();
   const { bgTheme } = useTheme();
+  const [expanded, setExpanded] = React.useState(false);
 
   const layerLabel = (kind: LayerKind) => {
     switch (kind) {
@@ -61,6 +63,108 @@ export const EditorSidebar: React.FC<EditorSidebarProps> = ({
   const [overIdx, setOverIdx] = React.useState<number | null>(null);
 
   const saveBtnBg = bgTheme.cover.isDark ? '#4f46e5' : '#334155';
+
+  if (isMobile) {
+    return (
+      <div
+        className="fixed left-0 right-0 bottom-0 z-[110] flex flex-col shadow-2xl font-sans"
+        style={{
+          backgroundColor: bgTheme.colors.bookInner,
+          borderTop: `1px solid ${bgTheme.colors.border}`,
+          maxHeight: expanded ? '60vh' : 'auto',
+          transition: 'max-height 0.3s ease',
+        }}
+      >
+        {/* Compact toolbar row */}
+        <div className="flex items-center gap-1 px-2 py-1.5 shrink-0">
+          {/* Layer tabs */}
+          {layerOrder.map((kind) => (
+            <button
+              key={kind}
+              onClick={() => { onLayerChange(kind); setExpanded(true); }}
+              className="flex items-center gap-1 px-3 py-2 rounded-lg text-xs font-semibold transition-colors min-h-[40px]"
+              style={{
+                backgroundColor: activeLayer === kind ? `${bgTheme.colors.tabs.journal.active}20` : 'transparent',
+                color: activeLayer === kind ? bgTheme.colors.text : bgTheme.colors.textMuted,
+                borderBottom: activeLayer === kind ? `2px solid ${bgTheme.colors.tabs.journal.active}` : '2px solid transparent',
+              }}
+            >
+              {LAYER_ICON[kind]}
+              {layerLabel(kind)}
+            </button>
+          ))}
+          <div className="flex-1" />
+          <button
+            onClick={onSave}
+            className="flex items-center gap-1 px-3 py-2 rounded-lg text-white font-semibold text-xs min-h-[40px]"
+            style={{ backgroundColor: saveBtnBg }}
+          >
+            <Save size={14} />
+            {t('compositeEditorSave')}
+          </button>
+          <button onClick={onClose} className="p-2 rounded-full min-h-[40px] min-w-[40px] flex items-center justify-center" style={{ color: bgTheme.colors.textMuted }}>
+            <X size={18} />
+          </button>
+        </div>
+
+        {/* Expandable tools area */}
+        {expanded && (
+          <div className="px-3 py-2 overflow-y-auto" style={{ borderTop: `1px solid ${bgTheme.colors.border}` }}>
+            {activeLayer === 'sketch' && (
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  onClick={() => onSetErasing(false)}
+                  className="flex items-center gap-1 px-3 py-2 rounded-lg border text-xs font-semibold min-h-[40px]"
+                  style={{
+                    backgroundColor: !isErasing ? `${bgTheme.colors.tabs.journal.active}20` : 'transparent',
+                    borderColor: !isErasing ? bgTheme.colors.tabs.journal.active : bgTheme.colors.border,
+                    color: !isErasing ? bgTheme.colors.text : bgTheme.colors.textMuted,
+                  }}
+                >
+                  <PenTool size={14} /> Draw
+                </button>
+                <button
+                  onClick={() => onSetErasing(true)}
+                  className="flex items-center gap-1 px-3 py-2 rounded-lg border text-xs font-semibold min-h-[40px]"
+                  style={{
+                    backgroundColor: isErasing ? '#ef444420' : 'transparent',
+                    borderColor: isErasing ? '#ef4444' : bgTheme.colors.border,
+                    color: isErasing ? '#ef4444' : bgTheme.colors.textMuted,
+                  }}
+                >
+                  <Eraser size={14} /> Eraser
+                </button>
+                {isErasing ? (
+                  <input type="range" min="5" max="50" value={eraserSize} onChange={(e) => onEraserSizeChange(parseInt(e.target.value))} className="w-24 accent-red-500" />
+                ) : (
+                  <>
+                    <input type="color" value={color} onChange={(e) => onColorChange(e.target.value)} className="w-8 h-8 rounded-full cursor-pointer border-0 p-0" />
+                    <input type="range" min="1" max="20" value={lineWidth} onChange={(e) => onLineWidthChange(parseInt(e.target.value))} className="w-24 accent-slate-600" />
+                  </>
+                )}
+                <button onClick={onClearCanvas} className="flex items-center gap-1 px-2 py-2 text-xs rounded-lg border min-h-[40px]" style={{ borderColor: bgTheme.colors.border, color: bgTheme.colors.textMuted }}>
+                  <Trash2 size={14} /> {t('clearCanvas')}
+                </button>
+              </div>
+            )}
+            {activeLayer === 'images' && (
+              <div className="flex items-center gap-3">
+                <button onClick={onUploadImage} className="flex items-center gap-2 px-3 py-2 text-xs font-semibold rounded-lg border min-h-[40px]" style={{ borderColor: bgTheme.colors.border, color: bgTheme.colors.text }}>
+                  <Upload size={14} /> {t('imageUpload')}
+                </button>
+                <span className="text-[10px] opacity-50" style={{ color: bgTheme.colors.textMuted }}>{t('imagePaste')}</span>
+              </div>
+            )}
+            {activeLayer === 'text' && (
+              <p className="text-[10px] opacity-50" style={{ color: bgTheme.colors.textMuted }}>
+                Tap on the page to edit text directly.
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div

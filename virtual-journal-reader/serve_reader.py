@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 from datetime import datetime, timezone
@@ -22,6 +23,9 @@ import daily_logger as dl  # noqa: E402
 
 READER_BUILD = 13
 
+_lan_access = False
+_lan_ip = "127.0.0.1"
+
 
 def _dist_dir() -> Path:
     override = os.environ.get("VIRTUAL_READER_DIST", "").strip()
@@ -32,6 +36,27 @@ def _dist_dir() -> Path:
 
 def _sketches_path() -> Path:
     return dl.SETTINGS_DIR / "journal_reader_sketches.json"
+
+
+def _reader_settings_path() -> Path:
+    return dl.SETTINGS_DIR / "journal_reader_settings.json"
+
+
+def _load_reader_settings() -> Dict[str, Any]:
+    path = _reader_settings_path()
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_reader_settings(settings: Dict[str, Any]) -> None:
+    dl.SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    _reader_settings_path().write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def _load_data() -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
@@ -95,6 +120,17 @@ class ReaderHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         return
 
+    def _is_local(self) -> bool:
+        client_ip = self.client_address[0]
+        return client_ip in ("127.0.0.1", "::1", "localhost")
+
+    def _gate_lan(self) -> bool:
+        """Return True if the request should be blocked (non-local + LAN disabled)."""
+        if _lan_access or self._is_local():
+            return False
+        self._send_json(403, {"ok": False, "error": "LAN access is disabled"})
+        return True
+
     def _send(
         self,
         code: int,
@@ -117,6 +153,8 @@ class ReaderHandler(BaseHTTPRequestHandler):
         self._send(code, data, "application/json; charset=utf-8", cache_control="no-store, max-age=0")
 
     def do_GET(self) -> None:
+        if self._gate_lan():
+            return
         parsed = urlparse(self.path)
         path = parsed.path or "/"
 
@@ -128,6 +166,12 @@ class ReaderHandler(BaseHTTPRequestHandler):
             except OSError:
                 dist_mtime = 0
             self._send_json(200, {"ok": True, "readerBuild": READER_BUILD, "distMtime": dist_mtime})
+            return
+        if path == "/api/lan-status":
+            self._send_json(200, {"enabled": _lan_access, "ip": _lan_ip, "port": self.server.server_address[1]})
+            return
+        if path == "/api/reader-settings":
+            self._send_json(200, _load_reader_settings())
             return
         if path == "/api/entries":
             entries, err = dl.load_journal_reader_entries()
@@ -175,8 +219,22 @@ class ReaderHandler(BaseHTTPRequestHandler):
         self._send(200, data, ctype, cache_control=cc)
 
     def do_POST(self) -> None:
+        if self._gate_lan():
+            return
         parsed = urlparse(self.path)
         path = parsed.path or "/"
+
+        if path == "/api/lan-toggle":
+            if not self._is_local():
+                self._send_json(403, {"ok": False, "error": "Only the host machine can toggle LAN access"})
+                return
+            global _lan_access
+            _lan_access = not _lan_access
+            state = "enabled" if _lan_access else "disabled"
+            print(f"  LAN access {state}", flush=True)
+            self._send_json(200, {"ok": True, "enabled": _lan_access, "ip": _lan_ip, "port": self.server.server_address[1]})
+            return
+
         length_s = self.headers.get("Content-Length", "0")
         try:
             length = int(length_s)
@@ -187,6 +245,16 @@ class ReaderHandler(BaseHTTPRequestHandler):
             payload = json.loads(body.decode("utf-8"))
         except json.JSONDecodeError:
             self._send_json(400, {"ok": False, "error": "Invalid JSON"})
+            return
+
+        if path == "/api/reader-settings":
+            allowed_keys = {"coverTheme", "bgTheme", "sortOrder", "singlePageMode"}
+            current = _load_reader_settings()
+            for k in allowed_keys:
+                if k in payload:
+                    current[k] = payload[k]
+            _save_reader_settings(current)
+            self._send_json(200, {"ok": True, **current})
             return
 
         if path == "/api/entry/create":
@@ -335,16 +403,34 @@ class ReaderHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "Not found"})
 
 
+def _get_lan_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--host", type=str, default="0.0.0.0",
+                        help="Bind address (default 0.0.0.0 for LAN access, use 127.0.0.1 for localhost only)")
     args = parser.parse_args()
     ReaderHandler.dist = _dist_dir()
     if not (ReaderHandler.dist / "index.html").is_file():
         print(f"Missing dist: {ReaderHandler.dist / 'index.html'} — run npm run build", file=sys.stderr)
         sys.exit(1)
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), ReaderHandler)
-    print(f"Virtual Journal Reader at http://127.0.0.1:{args.port}/", flush=True)
+    global _lan_ip
+    server = ThreadingHTTPServer((args.host, args.port), ReaderHandler)
+    _lan_ip = _get_lan_ip()
+    print(f"Virtual Journal Reader:", flush=True)
+    print(f"  Local:   http://127.0.0.1:{args.port}/", flush=True)
+    if args.host == "0.0.0.0":
+        print(f"  Network: http://{_lan_ip}:{args.port}/  (enable LAN access in settings)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
