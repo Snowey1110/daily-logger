@@ -1,12 +1,14 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn, JournalEntry, JournalSection, PositionedSketch, PageImage, PageOverlay } from '../lib/utils';
 import Cover from './Cover';
 import Navigation from './Navigation';
 import { DrawingCanvas } from './DrawingCanvas';
 import { SketchPlacer } from './SketchPlacer';
-import { CompositePageEditor } from './CompositePageEditor';
-import { ChevronLeft, ChevronRight, Type, MessageSquare, BrainCircuit } from 'lucide-react';
+import { EditorSidebar } from './EditorSidebar';
+import { useInlineEditor, type LayerKind } from '../hooks/useInlineEditor';
+import { ChevronLeft, ChevronRight, Type, MessageSquare, BrainCircuit, X, GripVertical } from 'lucide-react';
 import { useReaderT } from '../readerI18n';
 import { useTheme } from './ThemeProvider';
 import type { JournalTheme } from '../types/theme';
@@ -170,6 +172,7 @@ interface PageItem {
   date: string;
   time: string;
   sketchContents?: PageContent[];
+  bookmarkContent?: PageContent;
 }
 
 function expandEntryToPages(
@@ -286,57 +289,119 @@ function buildUnifiedSpreads(
       }
     }
   } else {
-    // STT or AI mode: left page cycles through journal text then sketches,
-    // right page always shows the secondary content (STT or AI report).
-    for (let i = 0; i < sortedEntries.length; i++) {
-      const entry = sortedEntries[i];
+    // STT or AI mode: same as journal but insert a bookmark page after
+    // each entry that has speech/AI content.  Pair everything 2-at-a-time.
+    const secondaryField = activeSection === 'stt' ? 'speechToText' : 'aiReport';
+    const items: PageItem[] = [];
+
+    for (const entry of sortedEntries) {
       const entrySketches = sketchesByEntry.get(entry.id) ?? [];
       const displayDate = entryDisplayDate(entry);
       const displayTime = entry.time;
-      const { left, leftFallback } = buildLeftPage(entry, displayDate, displayTime);
+      const { left } = buildLeftPage(entry, displayDate, displayTime);
 
-      const leftResolved: PageContent = left.type === 'text' && left.content
-        ? { ...left, content: pageBreakToNewline(left.content) }
-        : left;
+      const sketchPCs: PageContent[] = entrySketches.map((sk) => ({
+        type: 'sketch' as const,
+        content: sk.dataUrl,
+        sourceEntryId: entry.id,
+        sourceDate: displayDate,
+        sourceTime: displayTime,
+      }));
 
-      const secondaryField = activeSection === 'stt' ? 'speechToText' : 'aiReport';
-      let secondaryText = (entry[secondaryField] || '').trim();
-      if (leftFallback === activeSection) {
-        secondaryText = activeSection === 'stt'
-          ? (entry.aiReport || '').trim()
-          : (entry.speechToText || '').trim();
-      }
-      secondaryText = pageBreakToNewline(secondaryText);
+      items.push(...expandEntryToPages(entry, displayDate, displayTime, left, sketchPCs));
 
-      const secondaryPC: PageContent = { type: 'text', content: secondaryText, secondaryPage: 1, sourceEntryId: entry.id, sourceDate: displayDate, sourceTime: displayTime };
-
-      // First spread: journal text on left, secondary on right
-      spreads.push({
-        entryId: entry.id,
-        date: displayDate,
-        time: displayTime,
-        left: leftResolved,
-        right: secondaryPC,
-        isFirstSpread: true,
-      });
-
-      // Each sketch gets its own spread with secondary content pinned on the right
-      for (const sk of entrySketches) {
-        const sketchPC: PageContent = {
-          type: 'sketch',
-          content: sk.dataUrl,
-          sourceEntryId: entry.id,
-          sourceDate: displayDate,
-          sourceTime: displayTime,
-        };
-        spreads.push({
+      const secondaryText = (entry[secondaryField] || '').trim();
+      if (secondaryText) {
+        items.push({
+          content: {
+            type: 'text',
+            content: pageBreakToNewline(secondaryText),
+            secondaryPage: 1,
+            sourceEntryId: entry.id,
+            sourceDate: displayDate,
+            sourceTime: displayTime,
+          },
           entryId: entry.id,
           date: displayDate,
           time: displayTime,
-          left: sketchPC,
-          right: secondaryPC,
+        });
+      }
+    }
+
+    // Pair items into spreads. Bookmark pages (secondaryPage) always go
+    // on the RIGHT side of a spread.
+    const isBm = (it: PageItem) => !!it.content.secondaryPage;
+    let i = 0;
+    while (i < items.length) {
+      const item = items[i];
+
+      if (item.sketchContents && item.sketchContents.length > 0) {
+        spreads.push({
+          entryId: item.entryId,
+          date: item.date,
+          time: item.time,
+          left: item.content,
+          right: item.sketchContents[0],
+          isFirstSpread: true,
+        });
+        let s = 1;
+        while (s < item.sketchContents.length) {
+          const leftSketch = item.sketchContents[s];
+          const rightSketch = s + 1 < item.sketchContents.length ? item.sketchContents[s + 1] : null;
+          spreads.push({
+            entryId: item.entryId,
+            date: item.date,
+            time: item.time,
+            left: leftSketch,
+            right: rightSketch ?? { type: 'empty' },
+            isFirstSpread: false,
+          });
+          s += rightSketch ? 2 : 1;
+        }
+        i += 1;
+      } else if (isBm(item)) {
+        // Current item is a bookmark — put it on the right, show the
+        // entry's journal text on the left so it doesn't disappear.
+        let journalLeft: PageContent = { type: 'empty' };
+        for (let j = i - 1; j >= 0; j--) {
+          if (items[j].entryId === item.entryId && !isBm(items[j])) {
+            journalLeft = items[j].content;
+            break;
+          }
+        }
+        spreads.push({
+          entryId: item.entryId,
+          date: item.date,
+          time: item.time,
+          left: journalLeft,
+          right: item.content,
           isFirstSpread: false,
         });
+        i += 1;
+      } else {
+        const nextItem = i + 1 < items.length ? items[i + 1] : null;
+        if (nextItem && isBm(nextItem)) {
+          // Next item is a bookmark — pair journal (left) + bookmark (right)
+          spreads.push({
+            entryId: item.entryId,
+            date: item.date,
+            time: item.time,
+            left: item.content,
+            right: nextItem.content,
+            isFirstSpread: true,
+          });
+          i += 2;
+        } else {
+          spreads.push({
+            entryId: item.entryId,
+            date: item.date,
+            time: item.time,
+            left: item.content,
+            right: nextItem ? nextItem.content : { type: 'empty' },
+            isFirstSpread: true,
+          });
+          i += nextItem ? 2 : 1;
+        }
       }
     }
   }
@@ -430,9 +495,11 @@ const JournalBook: React.FC = () => {
   const [showSketchPlacer, setShowSketchPlacer] = useState(false);
   const [editingSketchId, setEditingSketchId] = useState<string | null>(null);
 
-  const [compositeEditorEntry, setCompositeEditorEntry] = useState<{ entryId: string; defaultLayer: 'text' | 'sketch' | 'images'; pageWidth: number; pageHeight: number } | null>(null);
+  const [inlineEditEntry, setInlineEditEntry] = useState<{ entryId: string; defaultLayer: LayerKind; side: 'left' | 'right' } | null>(null);
 
   const bookSpreadRef = useRef<HTMLDivElement>(null);
+  const leftPageRef = useRef<HTMLDivElement>(null);
+  const rightPageRef = useRef<HTMLDivElement>(null);
 
   /* ── load data ── */
 
@@ -522,25 +589,16 @@ const JournalBook: React.FC = () => {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (compositeEditorEntry) return;
+      if (inlineEditEntry) return;
       const key = e.key.toLowerCase();
       if (key === 'd' || key === 'arrowright') handleNext();
       if (key === 'a' || key === 'arrowleft') handlePrev();
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleNext, handlePrev, compositeEditorEntry]);
+  }, [handleNext, handlePrev, inlineEditEntry]);
 
   /* ── actions ── */
-
-  const measurePageDims = (): { pageWidth: number; pageHeight: number } => {
-    const el = bookSpreadRef.current;
-    if (el) {
-      const rect = el.getBoundingClientRect();
-      return { pageWidth: Math.round(rect.width / 2), pageHeight: Math.round(rect.height) };
-    }
-    return { pageWidth: 500, pageHeight: 650 };
-  };
 
   const handleAction = (action: JournalAction) => {
     if (action === 'sketch') {
@@ -551,35 +609,38 @@ const JournalBook: React.FC = () => {
       if (!spread) return;
       const leftEid = spread.left.sourceEntryId ?? spread.entryId;
       if (leftEid) {
-        setCompositeEditorEntry({ entryId: leftEid, defaultLayer: 'text', ...measurePageDims() });
+        setInlineEditEntry({ entryId: leftEid, defaultLayer: 'text', side: 'left' });
       }
     }
   };
 
-  /* ── composite editor ── */
+  /* ── inline editor ── */
 
-  const handleOpenCompositeEditor = (entryId: string, defaultLayer: 'text' | 'sketch') => {
-    setCompositeEditorEntry({ entryId, defaultLayer, ...measurePageDims() });
+  const handleOpenInlineEditor = (entryId: string, defaultLayer: 'text' | 'sketch') => {
+    setInlineEditEntry({ entryId, defaultLayer, side: 'left' });
   };
 
-  const handleSaveComposite = async (
+  const doSaveEntry = async (
+    entryId: string,
     text: string,
     sketchDataUrl: string,
     images: PageImage[],
     layerOrder: ('text' | 'sketch' | 'images')[],
-  ) => {
-    if (!compositeEditorEntry) return;
-    const { entryId } = compositeEditorEntry;
+    date?: string,
+    time?: string,
+  ): Promise<boolean> => {
     setSaveError(null);
     try {
       const entryBody: Record<string, string> = { id: entryId, journal: text };
+      if (date !== undefined) entryBody.date = date;
+      if (time !== undefined) entryBody.time = time;
       const res = await fetch('/api/entry', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(entryBody),
       });
       const data = await res.json();
-      if (!data.ok) { setSaveError(data.error || t('errSaveFailed')); return; }
+      if (!data.ok) { setSaveError(data.error || t('errSaveFailed')); return false; }
 
       const overlayBody = { entryId, sketchDataUrl, images, layerOrder };
       const res2 = await fetch('/api/page-overlay', {
@@ -588,11 +649,33 @@ const JournalBook: React.FC = () => {
         body: JSON.stringify(overlayBody),
       });
       const data2 = await res2.json();
-      if (!data2.ok) { setSaveError(data2.error || t('errSaveFailed')); return; }
+      if (!data2.ok) { setSaveError(data2.error || t('errSaveFailed')); return false; }
 
-      setCompositeEditorEntry(null);
       await reload();
-    } catch { setSaveError(t('errNetworkSave')); }
+      return true;
+    } catch { setSaveError(t('errNetworkSave')); return false; }
+  };
+
+  const handleSaveInline = async (
+    text: string,
+    sketchDataUrl: string,
+    images: PageImage[],
+    layerOrder: ('text' | 'sketch' | 'images')[],
+    date?: string,
+    time?: string,
+  ) => {
+    if (!inlineEditEntry) return;
+    const ok = await doSaveEntry(inlineEditEntry.entryId, text, sketchDataUrl, images, layerOrder, date, time);
+    if (ok) setInlineEditEntry(null);
+  };
+
+  const handleSwitchSide = async (
+    currentPayload: { entryId: string; text: string; sketchDataUrl: string; images: PageImage[]; layerOrder: LayerKind[]; activeLayer: LayerKind; date: string; time: string },
+    targetEntryId: string,
+    targetSide: 'left' | 'right',
+  ) => {
+    await doSaveEntry(currentPayload.entryId, currentPayload.text, currentPayload.sketchDataUrl, currentPayload.images, currentPayload.layerOrder, currentPayload.date, currentPayload.time);
+    setInlineEditEntry({ entryId: targetEntryId, defaultLayer: currentPayload.activeLayer, side: targetSide });
   };
 
   /* ── sketch CRUD (backward compat for existing standalone sketches) ── */
@@ -674,7 +757,19 @@ const JournalBook: React.FC = () => {
   const drawingInitialData = editingSketchId ? sketches.find((s) => s.id === editingSketchId)?.dataUrl : undefined;
 
   const handleBookmarkClick = (section: JournalSection) => {
+    if (section !== 'journal' && inlineEditEntry) {
+      setInlineEditEntry(null);
+    }
+    // Remember the entry the user is currently viewing so we can stay on
+    // it after the spreads rebuild with a different page count.
+    const viewingEntryId = currentSpread?.entryId;
     setActiveSection(section);
+    if (viewingEntryId) {
+      const newSpreads = buildUnifiedSpreads(sortedEntries, sketches, section);
+      let ix = firstSpreadIndexForEntry(newSpreads, viewingEntryId);
+      if (ix < 0) ix = newSpreads.findIndex((s) => spreadTouchesEntryId(s, viewingEntryId));
+      if (ix >= 0) setCurrentPage(ix + 1);
+    }
   };
 
   const currentSpread = currentPage > 0 ? spreads[currentPage - 1] : undefined;
@@ -716,7 +811,10 @@ const JournalBook: React.FC = () => {
       />
 
       <div className="flex-1 flex min-h-0 items-center justify-center p-3 md:p-5 perspective-[2000px]">
-        <div className="relative mx-auto flex aspect-[1.4/1] h-auto max-h-full min-h-0 w-[min(100%,72rem,92vw)] max-w-full shrink shadow-[0_50px_100px_-20px_rgba(0,0,0,0.5)] rounded-xl">
+        <div
+          className="relative mx-auto flex aspect-[1.4/1] h-auto max-h-full min-h-0 w-[min(100%,72rem,92vw)] max-w-full shrink shadow-[0_50px_100px_-20px_rgba(0,0,0,0.5)] rounded-xl"
+          style={{ transform: inlineEditEntry ? 'translateX(7rem)' : 'none', transition: 'transform 0.3s ease' }}
+        >
           <div className="absolute inset-0 bg-black/40 -z-10 rounded-xl translate-x-2 translate-y-2 blur-2xl" />
 
           <div
@@ -760,23 +858,26 @@ const JournalBook: React.FC = () => {
               >
                 <div className="absolute inset-0 opacity-10 pointer-events-none bg-[url('https://www.transparenttextures.com/patterns/natural-paper.png')]" />
 
-                {/* Click zones for page flip */}
-                <>
-                  <button
-                    type="button"
-                    aria-label={t('ariaPrevPage')}
-                    className="absolute left-0 top-0 bottom-0 w-[12%] z-40 cursor-pointer opacity-0 hover:opacity-100 hover:bg-black/[0.03]"
-                    onClick={handlePrev}
-                  />
-                  <button
-                    type="button"
-                    aria-label={t('ariaNextPage')}
-                    className="absolute right-0 top-0 bottom-0 w-[12%] z-40 cursor-pointer opacity-0 hover:opacity-100 hover:bg-black/[0.03]"
-                    onClick={handleNext}
-                  />
-                </>
+                {/* Click zones for page flip – hidden during inline editing */}
+                {!inlineEditEntry && (
+                  <>
+                    <button
+                      type="button"
+                      aria-label={t('ariaPrevPage')}
+                      className="absolute left-0 top-0 bottom-0 w-[12%] z-40 cursor-pointer opacity-0 hover:opacity-100 hover:bg-black/[0.03]"
+                      onClick={handlePrev}
+                    />
+                    <button
+                      type="button"
+                      aria-label={t('ariaNextPage')}
+                      className="absolute right-0 top-0 bottom-0 w-[12%] z-40 cursor-pointer opacity-0 hover:opacity-100 hover:bg-black/[0.03]"
+                      onClick={handleNext}
+                    />
+                  </>
+                )}
 
                 <Page
+                  ref={leftPageRef}
                   spread={currentSpread}
                   side="left"
                   activeSection={activeSection}
@@ -784,17 +885,44 @@ const JournalBook: React.FC = () => {
                   overlay={currentSpread?.left.sourceEntryId ? overlays[currentSpread.left.sourceEntryId] : undefined}
                 />
                 <Page
+                  ref={rightPageRef}
                   spread={currentSpread}
                   side="right"
                   activeSection={activeSection}
                   theme={bgTheme}
-                  overlay={currentSpread?.right.sourceEntryId ? overlays[currentSpread.right.sourceEntryId] : undefined}
+                  overlay={currentSpread?.right.sourceEntryId && currentSpread.right.sourceEntryId !== currentSpread.left.sourceEntryId ? overlays[currentSpread.right.sourceEntryId] : undefined}
                 />
+
+                {/* Inline editor layers inside the book spread — absolute positioning for zoom-proof alignment.
+                   Only the in-book layers go here; sidebar + file input are rendered outside (see below)
+                   because motion.div's transform creates a containing block that traps fixed elements. */}
+                {inlineEditEntry && (() => {
+                  const editEntry = entries.find((e) => e.id === inlineEditEntry.entryId);
+                  const editOv = overlays[inlineEditEntry.entryId];
+                  const editOtherSide = inlineEditEntry.side === 'left' ? 'right' : 'left';
+                  const editOtherPage = currentSpread ? (editOtherSide === 'left' ? currentSpread.left : currentSpread.right) : undefined;
+                  const editOtherEntryId = editOtherPage?.sourceEntryId ?? currentSpread?.entryId;
+                  return (
+                    <InlineEditorOverlay
+                      key={`${inlineEditEntry.entryId}-${inlineEditEntry.side}`}
+                      entry={editEntry}
+                      overlay={editOv}
+                      defaultLayer={inlineEditEntry.defaultLayer}
+                      side={inlineEditEntry.side}
+                      pageRef={inlineEditEntry.side === 'left' ? leftPageRef : rightPageRef}
+                      otherEntryId={editOtherEntryId}
+                      otherSide={editOtherSide}
+                      onSave={handleSaveInline}
+                      onSwitchSide={handleSwitchSide}
+                      onClose={() => setInlineEditEntry(null)}
+                    />
+                  );
+                })()}
               </motion.div>
             )}
           </AnimatePresence>
 
-          {/* Bookmark tabs on the right edge of the book */}
+          {/* Bookmark tabs — always visible */}
           {currentPage > 0 && (
             <div className="absolute left-full ml-1 top-20 flex flex-col space-y-1 z-30">
               <BookmarkTab
@@ -833,7 +961,7 @@ const JournalBook: React.FC = () => {
           sketches={sketches}
           sortOrder={sortOrder}
           onCreatePage={handleCreatePage}
-          onOpenCompositeEditor={handleOpenCompositeEditor}
+          onOpenCompositeEditor={handleOpenInlineEditor}
           onEditSketch={handleEditSketch}
           onDeleteSketch={handleDeleteSketch}
           onDeleteEntry={handleDeleteEntry}
@@ -850,28 +978,6 @@ const JournalBook: React.FC = () => {
           sketchId={editingSketchId ?? undefined}
         />
       )}
-
-      {/* Composite page editor */}
-      {compositeEditorEntry && (() => {
-        const entry = entries.find((e) => e.id === compositeEditorEntry.entryId);
-        const ov = overlays[compositeEditorEntry.entryId];
-        return (
-          <CompositePageEditor
-            entryId={compositeEditorEntry.entryId}
-            entryDate={entry?.date ?? ''}
-            entryTime={entry?.time ?? ''}
-            pageWidth={compositeEditorEntry.pageWidth}
-            pageHeight={compositeEditorEntry.pageHeight}
-            initialText={entry?.journal ?? ''}
-            initialSketchDataUrl={ov?.sketchDataUrl}
-            initialImages={ov?.images ?? []}
-            initialLayerOrder={ov?.layerOrder ?? ['text', 'sketch', 'images']}
-            defaultLayer={compositeEditorEntry.defaultLayer}
-            onSave={handleSaveComposite}
-            onClose={() => setCompositeEditorEntry(null)}
-          />
-        );
-      })()}
 
       <footer className="shrink-0 flex flex-col items-center gap-2 px-4 pb-4 pt-2 text-center" style={{ color: bgTheme.cover.accentText }}>
         <div className="flex items-center justify-center space-x-12 opacity-40">
@@ -905,15 +1011,217 @@ const JournalBook: React.FC = () => {
   );
 };
 
+/* ──── Inline editor overlay — sidebar + canvas/textarea/images on the active page ──── */
+
+const InlineEditorOverlay: React.FC<{
+  entry?: JournalEntry;
+  overlay?: PageOverlay;
+  defaultLayer: LayerKind;
+  side: 'left' | 'right';
+  pageRef: React.RefObject<HTMLDivElement | null>;
+  otherEntryId?: string;
+  otherSide: 'left' | 'right';
+  onSave: (text: string, sketchDataUrl: string, images: PageImage[], layerOrder: LayerKind[], date?: string, time?: string) => void;
+  onSwitchSide: (
+    currentPayload: { entryId: string; text: string; sketchDataUrl: string; images: PageImage[]; layerOrder: LayerKind[]; activeLayer: LayerKind; date: string; time: string },
+    targetEntryId: string,
+    targetSide: 'left' | 'right',
+  ) => void;
+  onClose: () => void;
+}> = ({ entry, overlay: ov, defaultLayer, side, pageRef, otherEntryId, otherSide, onSave, onSwitchSide, onClose }) => {
+  const { t } = useReaderT();
+  const { bgTheme } = useTheme();
+  const editor = useInlineEditor({
+    initialText: entry?.journal ?? '',
+    initialSketchDataUrl: ov?.sketchDataUrl,
+    initialImages: ov?.images ?? [],
+    initialLayerOrder: ov?.layerOrder ?? ['text', 'sketch', 'images'],
+    defaultLayer,
+    pageAreaRef: pageRef,
+  });
+
+  const [editDate, setEditDate] = React.useState(entry?.date ?? '');
+  const [editTime, setEditTime] = React.useState(entry?.time ?? '');
+
+  const handleSave = () => {
+    const payload = editor.getSavePayload();
+    onSave(payload.text, payload.sketchDataUrl, payload.images, payload.layerOrder, editDate, editTime);
+  };
+
+  const handleClickOtherPage = () => {
+    if (!otherEntryId || !entry) return;
+    const payload = editor.getSavePayload();
+    onSwitchSide(
+      { entryId: entry.id, text: payload.text, sketchDataUrl: payload.sketchDataUrl, images: payload.images, layerOrder: payload.layerOrder, activeLayer: editor.activeLayer, date: editDate, time: editTime },
+      otherEntryId,
+      otherSide,
+    );
+  };
+
+  const padClass = side === 'right' ? 'p-8 pl-10' : 'p-8 pr-10';
+  const pagePosition = side === 'left' ? 'left-0' : 'left-1/2';
+
+  return (
+    <>
+      {/* Sidebar + file input portalled to document.body so they escape the
+          motion.div's CSS transform (which creates a containing block and
+          traps position:fixed elements inside the book spread). */}
+      {createPortal(
+        <>
+          <EditorSidebar
+            activeLayer={editor.activeLayer}
+            onLayerChange={editor.setActiveLayer}
+            layerOrder={editor.layerOrder}
+            onMoveLayer={editor.moveLayer}
+            onReorderLayers={editor.reorderLayers}
+            color={editor.color}
+            lineWidth={editor.lineWidth}
+            isErasing={editor.isErasing}
+            eraserSize={editor.eraserSize}
+            onColorChange={editor.setColor}
+            onLineWidthChange={editor.setLineWidth}
+            onSetErasing={editor.setIsErasing}
+            onEraserSizeChange={editor.setEraserSize}
+            onClearCanvas={editor.clearCanvas}
+            onUploadImage={editor.handleUpload}
+            onSave={handleSave}
+            onClose={onClose}
+            entryDate={editDate}
+            entryTime={editTime}
+          />
+          <input ref={editor.fileInputRef} type="file" accept="image/*" className="hidden" onChange={editor.handleFileChange} />
+        </>,
+        document.body,
+      )}
+
+      {/* Click-to-switch overlay on the opposite page */}
+      {otherEntryId && (
+        <div
+          className={`absolute top-0 bottom-0 w-1/2 z-[60] cursor-pointer hover:bg-blue-400/10 transition-colors ${otherSide === 'left' ? 'left-0' : 'left-1/2'}`}
+          onClick={handleClickOtherPage}
+          title="Click to edit this page"
+        />
+      )}
+
+      {/* Sketch canvas — absolute within book spread, covers the active page */}
+      <canvas
+        ref={editor.canvasRef}
+        className={`absolute top-0 bottom-0 w-1/2 touch-none ${pagePosition}`}
+        style={{
+          zIndex: 50 + editor.zIndex('sketch'),
+          pointerEvents: editor.activeLayer === 'sketch' ? 'auto' : 'none',
+          cursor: editor.activeLayer === 'sketch' ? editor.eraserCursor : 'default',
+        }}
+        onMouseDown={editor.startDrawing}
+        onMouseMove={editor.draw}
+        onMouseUp={editor.stopDrawing}
+        onMouseOut={editor.stopDrawing}
+        onTouchStart={editor.startDrawing}
+        onTouchMove={editor.draw}
+        onTouchEnd={editor.stopDrawing}
+      />
+
+      {/* Text + image editing layers — absolute within book spread, covers the active page */}
+      <div className={`absolute top-0 bottom-0 w-1/2 ${pagePosition}`} style={{ zIndex: 50 }}>
+        {/* Text layer — opaque background to hide rendered page text underneath */}
+        <div
+          className={`absolute inset-0 ${padClass} flex flex-col font-serif`}
+          style={{ zIndex: editor.zIndex('text'), pointerEvents: editor.activeLayer === 'text' ? 'auto' : 'none', backgroundColor: bgTheme.colors.bookInner }}
+        >
+          <div className="pb-4 mb-6" style={{ borderBottom: `1px solid ${bgTheme.colors.border}` }}>
+            <div className="flex items-center gap-2">
+              <input
+                value={editDate}
+                onChange={(e) => setEditDate(e.target.value)}
+                className="text-xs uppercase tracking-widest font-sans opacity-60 bg-transparent border-none focus:outline-none focus:opacity-100 transition-opacity w-24"
+                style={{ color: bgTheme.colors.textMuted }}
+                placeholder="MM/DD/YYYY"
+              />
+              <span className="text-xs opacity-40" style={{ color: bgTheme.colors.textMuted }}>·</span>
+              <input
+                value={editTime}
+                onChange={(e) => setEditTime(e.target.value)}
+                className="text-xs uppercase tracking-widest font-sans opacity-60 bg-transparent border-none focus:outline-none focus:opacity-100 transition-opacity w-20"
+                style={{ color: bgTheme.colors.textMuted }}
+                placeholder="HH:MM"
+              />
+            </div>
+            <h2 className="text-2xl font-light leading-tight mt-1 font-serif" style={{ color: bgTheme.colors.text }}>
+              {t('pageJournalEntry')}
+            </h2>
+          </div>
+          <div className="flex-1 relative min-h-0">
+            <textarea
+              value={editor.text}
+              onChange={(e) => editor.setText(e.target.value)}
+              className="absolute inset-0 w-full h-full bg-transparent resize-none font-serif text-base leading-relaxed focus:outline-none overflow-auto pr-2"
+              style={{ color: bgTheme.colors.text }}
+              placeholder="Type here..."
+            />
+          </div>
+          <div className="mt-8 shrink-0 h-1 pointer-events-none" />
+        </div>
+
+        {/* Image layer */}
+        <div
+          className="absolute inset-0"
+          style={{ zIndex: editor.zIndex('images'), pointerEvents: editor.activeLayer === 'images' ? 'auto' : 'none' }}
+          onMouseDown={(e) => { if (e.target === e.currentTarget) editor.setSelectedImgId(null); }}
+        >
+          {editor.images.map((img) => {
+            const isSelected = editor.selectedImgId === img.id;
+            return (
+              <div
+                key={img.id}
+                className="absolute"
+                style={{
+                  left: `${img.x * 100}%`,
+                  top: `${img.y * 100}%`,
+                  width: `${img.width * 100}%`,
+                  height: `${img.height * 100}%`,
+                  outline: isSelected ? '2px solid #3b82f6' : 'none',
+                  cursor: editor.activeLayer === 'images' ? 'move' : 'default',
+                }}
+                onMouseDown={(e) => editor.handleImageMouseDown(e, img)}
+              >
+                <img src={img.dataUrl} alt="" className="w-full h-full object-contain select-none pointer-events-none" draggable={false} />
+                {isSelected && editor.activeLayer === 'images' && (
+                  <>
+                    <button
+                      className="absolute -top-3 -right-3 w-6 h-6 bg-red-500 text-white rounded-full flex items-center justify-center shadow hover:bg-red-600 transition-colors"
+                      onClick={(e) => { e.stopPropagation(); editor.deleteImage(img.id); }}
+                    >
+                      <X size={14} />
+                    </button>
+                    <div
+                      className="absolute -bottom-2 -right-2 w-5 h-5 bg-blue-500 rounded-sm cursor-se-resize flex items-center justify-center shadow"
+                      onMouseDown={(e) => { e.stopPropagation(); editor.handleResizeMouseDown(e, img); }}
+                    >
+                      <GripVertical size={10} className="text-white rotate-45" />
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Subtle editing border */}
+        <div className="absolute inset-0 border-2 border-blue-400/30 rounded-lg pointer-events-none" style={{ zIndex: 10 }} />
+      </div>
+    </>
+  );
+};
+
 /* ──── Page sub-component ──── */
 
-const Page: React.FC<{
+const Page = React.forwardRef<HTMLDivElement, {
   spread?: Spread;
   side: 'left' | 'right';
   activeSection: JournalSection;
   theme: JournalTheme;
   overlay?: PageOverlay;
-}> = ({ spread, side, activeSection, theme, overlay }) => {
+}>(({ spread, side, activeSection, theme, overlay }, ref) => {
   const { t } = useReaderT();
   if (!spread) {
     return (
@@ -990,6 +1298,7 @@ const Page: React.FC<{
 
   return (
     <div
+      ref={ref}
       className="w-1/2 h-full min-h-0 p-8 pr-10 flex flex-col relative overflow-hidden font-serif transition-colors duration-500"
       style={{
         backgroundColor: theme.colors.bookInner,
@@ -1034,7 +1343,7 @@ const Page: React.FC<{
         </div>
       </div>
 
-      {/* Overlay sketch layer – rendered at full page level to match editor canvas coordinates */}
+      {/* Overlay sketch layer */}
       {overlay?.sketchDataUrl && (
         <img
           src={overlay.sketchDataUrl}
@@ -1044,7 +1353,7 @@ const Page: React.FC<{
         />
       )}
 
-      {/* Overlay image layer – rendered at full page level */}
+      {/* Overlay image layer */}
       {overlay && overlay.images.length > 0 && (
         <div className="absolute inset-0 pointer-events-none" style={{ zIndex: layerZIndex('images') }}>
           {overlay.images.map((img) => (
@@ -1069,7 +1378,7 @@ const Page: React.FC<{
       </div>
     </div>
   );
-};
+});
 
 /* ──── Bookmark tab on the right edge of the book ──── */
 

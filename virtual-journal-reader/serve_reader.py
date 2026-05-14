@@ -228,10 +228,16 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": False, "error": "Missing or invalid id"})
                 return
             sheet_name, row_index = parsed_id
+            date_val = payload.get("date")
+            time_val = payload.get("time")
             journal = payload.get("journal")
             speech = payload.get("speechToText")
             ai_rep = payload.get("aiReport")
             kwargs = {}
+            if date_val is not None:
+                kwargs["date"] = str(date_val)
+            if time_val is not None:
+                kwargs["time"] = str(time_val)
             if journal is not None:
                 kwargs["journal"] = str(journal)
             if speech is not None:

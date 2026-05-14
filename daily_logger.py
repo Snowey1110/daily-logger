@@ -942,6 +942,8 @@ def patch_journal_reader_entry(
     sheet_name: str,
     row_index: int,
     *,
+    date: Optional[str] = None,
+    time: Optional[str] = None,
     journal: Optional[str] = None,
     speech_to_text: Optional[str] = None,
     ai_report: Optional[str] = None,
@@ -964,6 +966,10 @@ def patch_journal_reader_entry(
         while len(row_strs) < len(module.headers):
             row_strs.append("")
         row_strs = row_strs[: len(module.headers)]
+        if date is not None:
+            row_strs[0] = date
+        if time is not None:
+            row_strs[1] = time
         if journal is not None:
             row_strs[2] = journal
         if speech_to_text is not None:
