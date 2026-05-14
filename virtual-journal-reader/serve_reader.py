@@ -415,10 +415,14 @@ def _get_lan_ip() -> str:
 
 
 def main() -> None:
+    import webbrowser
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--host", type=str, default="0.0.0.0",
                         help="Bind address (default 0.0.0.0 for LAN access, use 127.0.0.1 for localhost only)")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="Don't auto-open the browser on startup")
     args = parser.parse_args()
     ReaderHandler.dist = _dist_dir()
     if not (ReaderHandler.dist / "index.html").is_file():
@@ -427,10 +431,13 @@ def main() -> None:
     global _lan_ip
     server = ThreadingHTTPServer((args.host, args.port), ReaderHandler)
     _lan_ip = _get_lan_ip()
+    url = f"http://127.0.0.1:{args.port}/"
     print(f"Virtual Journal Reader:", flush=True)
-    print(f"  Local:   http://127.0.0.1:{args.port}/", flush=True)
+    print(f"  Local:   {url}", flush=True)
     if args.host == "0.0.0.0":
         print(f"  Network: http://{_lan_ip}:{args.port}/  (enable LAN access in settings)", flush=True)
+    if not args.no_browser:
+        webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

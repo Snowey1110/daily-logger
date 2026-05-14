@@ -1857,6 +1857,28 @@ def sb_create_journal_search_shortcut() -> bool:
     return ok
 
 
+def sb_create_reader_search_shortcut() -> bool:
+    programs = get_start_menu_programs_dir()
+    if programs is None:
+        return False
+    bat_path = BASE_DIR / "launch_journal_reader.bat"
+    if not bat_path.exists():
+        print(f"Missing launcher file: {bat_path}")
+        return False
+    folder = programs / "Daily Logger"
+    shortcut_path = folder / "Virtual Journal Reader.lnk"
+    ok = create_start_menu_search_shortcut(
+        shortcut_path,
+        bat_path,
+        BASE_DIR,
+        "Virtual Journal Reader - search: Virtual Reader, Journal Reader, Daily Logger",
+    )
+    if ok:
+        print(f"Search shortcut created: {shortcut_path}")
+        print("Try Windows search for: Virtual Journal Reader.")
+    return ok
+
+
 def load_wifi_warn_list() -> List[str]:
     if not WIFI_WARN_FILE.exists():
         return []
@@ -5375,7 +5397,21 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         pady=6,
         cursor="hand2",
     )
-    start_menu_journal_btn.pack(side="left")
+    start_menu_journal_btn.pack(side="left", padx=(0, 8))
+    start_menu_reader_btn = tk.Button(
+        start_menu_row,
+        text=tr("settings.start_menu_reader"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+    )
+    start_menu_reader_btn.pack(side="left")
     bind_hover_tooltip(
         start_menu_app_btn,
         lambda: tr("tip.start_menu_app"),
@@ -5383,6 +5419,10 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     bind_hover_tooltip(
         start_menu_journal_btn,
         lambda: tr("tip.start_menu_journal"),
+    )
+    bind_hover_tooltip(
+        start_menu_reader_btn,
+        lambda: tr("tip.start_menu_reader"),
     )
 
     def _refresh_token_entry_mask() -> None:
@@ -5498,6 +5538,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     def _on_start_menu_button(selected: str) -> None:
         if selected == "journal":
             ok = sb_create_journal_search_shortcut()
+        elif selected == "reader":
+            ok = sb_create_reader_search_shortcut()
         else:
             ok = sb_create_bat_search_shortcut()
         if ok:
@@ -5513,6 +5555,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
     token_copy_btn.config(command=_on_token_copy)
     start_menu_app_btn.config(command=lambda: _on_start_menu_button("app"))
     start_menu_journal_btn.config(command=lambda: _on_start_menu_button("journal"))
+    start_menu_reader_btn.config(command=lambda: _on_start_menu_button("reader"))
     token_entry.bind("<FocusIn>", _on_token_focus_in, add="+")
 
     def _goto_settings_token_field() -> None:
@@ -5542,6 +5585,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         token_copy_btn,
         start_menu_app_btn,
         start_menu_journal_btn,
+        start_menu_reader_btn,
     ):
         bind_button_hover_if_enabled(
             _btn,
@@ -7410,6 +7454,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         token_copy_btn.config(text=tr("settings.copy"))
         start_menu_app_btn.config(text=tr("settings.start_menu_app"))
         start_menu_journal_btn.config(text=tr("settings.start_menu_journal"))
+        start_menu_reader_btn.config(text=tr("settings.start_menu_reader"))
         nav_buttons["journal"].config(text=tr("nav.journal"))
         nav_buttons["ai_recap"].config(text=tr("nav.ai_recap"))
         nav_buttons["chatbot"].config(text=tr("nav.chatbot"))
@@ -7531,6 +7576,7 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
             token_copy_btn,
             start_menu_app_btn,
             start_menu_journal_btn,
+            start_menu_reader_btn,
         ):
             _btn.configure(
                 bg=t.btn_secondary,
@@ -9073,6 +9119,7 @@ def print_main_help() -> None:
     print("  LAN cn | LAN en | LANGUAGE Chinese | LANGUAGE English - UI language")
     print("  SB bat     - Start Menu shortcut so Windows Search finds the .bat launcher")
     print("  SB journal - Start Menu shortcut so Windows Search finds Journal.xlsx")
+    print("  SB reader  - Start Menu shortcut for Virtual Journal Reader")
     print("  Enter  - Continue/Exit")
     print("  X      - Exit")
     print("  TS     - take screenshot now (not attached outside chat mode)")
@@ -9325,8 +9372,11 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
         elif sub == "JOURNAL":
             if not sb_create_journal_search_shortcut():
                 print("Could not create Journal search shortcut.")
+        elif sub == "READER":
+            if not sb_create_reader_search_shortcut():
+                print("Could not create Reader search shortcut.")
         else:
-            print('Usage: SB bat   or   SB journal')
+            print('Usage: SB bat   or   SB journal   or   SB reader')
         return True, app_name
     if key.startswith("RT "):
         recap_range, file_context, file_path, recap_err = resolve_recap_target(
