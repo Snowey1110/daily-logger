@@ -1,140 +1,78 @@
 # Daily Logger
 
-A Windows-first personal logging app that combines a fast terminal workflow with a modern Journal Window UI, Excel-backed storage, and optional AI-powered recap/chat features.
+Daily Logger is a Windows-first personal journal for fast daily capture, rich review, and Excel-backed storage. It opens into a desktop Journal Window, saves entries locally, and can optionally use OpenAI features for recap, chat, transcription, and AI reports.
 
-## Overview
+<p align="center">
+  <a href="https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLogger.exe"><strong>Download the latest DailyLogger.exe</strong></a>
+</p>
 
-Daily Logger helps you quickly capture daily notes and review them later.
+## Highlights
 
-- Terminal command interface for fast entry and control
-- Journal Window UI with light/dark theme switching
-- Excel-based storage (`daily_logs/Journal.xlsx`)
-- Optional speech-to-text and AI report generation
-- Recap and chatbot modes powered by OpenAI API
-
----
-
-## Download EXE
-
-If you just want to run the app on Windows, use the packaged executable:
-
-- [Download DailyLogger.exe](https://github.com/Snowey1110/daily-logger/releases/download/v1.0.0/DailyLogger.exe)
-
-> If your browser warns about downloading an `.exe`, confirm that the file comes from your trusted project source.
-
----
+- Journal Window for quick writing, recording, transcription, and AI report generation.
+- Virtual Journal Reader for browsing entries as a book in the browser.
+- Editable reader pages with text, sketch, image, and layer-order controls.
+- Excel storage in `Journal.xlsx` with per-day sheets and a rebuilt `Master Journal`.
+- Background daily backup after the journal UI finishes loading.
+- Optional OpenAI recap/chat tools; normal journaling works without an API key.
 
 ## Screenshots
 
-### Terminal Interface
-<img src="images/Terminal.png" alt="Daily Logger terminal interface" width="1100" />
+| Journal Window - Dark Theme | Journal Window - Light Theme |
+| --- | --- |
+| <img src="images/Dark%20Theme.png" alt="Daily Logger current dark theme journal window" width="520" /> | <img src="images/Light%20Theme.png" alt="Daily Logger current light theme journal window" width="520" /> |
 
-### Journal Window - Dark Theme
-<img src="images/Dark%20Theme.png" alt="Daily Logger dark theme journal window" width="1100" />
+| Virtual Reader Cover | Virtual Reader Double-Page Journal |
+| --- | --- |
+| <img src="images/Virtual%20Reader%20Cover.png" alt="Actual Virtual Reader cover page" width="520" /> | <img src="images/Virtual%20Reader%20Spread.png" alt="Actual Virtual Reader double-page journal spread with text, sketch, and image layers" width="520" /> |
 
-### Journal Window - Light Theme
-<img src="images/Light%20Theme.png" alt="Daily Logger light theme journal window" width="1100" />
+## Virtual Journal Reader
 
----
+Virtual Journal Reader turns `Journal.xlsx` into a local browser-based book view. It opens from the Journal Window navigation rail with **Virtual Reader**, or from `launch_journal_reader.bat`.
 
-## Project Structure
+Reader features:
 
-- `daily_logger.py` - main application logic
-- `launch_daily_logger.bat` - Windows launcher
-- `launch_journal_reader.bat` - Virtual Journal Reader launcher
-- `virtual-journal-reader.zip` - runnable Virtual Reader add-on package
-- `dist/DailyLogger.exe` - packaged executable build
-- `daily_logs/` - generated journal Excel data
-- `settings/` - local preferences and API key files
-- `images/` - README screenshots
+- Book-style browsing with journal, speech-to-text, and AI report sections.
+- Inline page editing for journal text, date, and time.
+- Sketch layer with color, line width, eraser, undo/redo, and Shift straight-line drawing.
+- Image layer with upload/paste, drag, resize, delete, and layer ordering.
+- Theme settings, sort order, single-page mode, English/Chinese UI, and optional LAN viewing.
 
----
+How the reader is found:
 
-## Quick Start (EXE)
+- PyInstaller builds can bundle `virtual-journal-reader/dist` and `serve_reader.py` through `DailyLogger.spec`.
+- Source runs use `virtual-journal-reader/serve_reader.py` and `virtual-journal-reader/dist/`.
+- If `virtual-journal-reader.zip` is copied next to the app, Daily Logger can extract it automatically the first time Virtual Reader opens.
+- EXE builds launch the reader server through Daily Logger's internal `--serve-virtual-reader` mode, so opening the reader does not create another Daily Logger window.
 
-1. Download `DailyLogger.exe` from the link above.
+The local reader server uses port `8765` by default. If an old reader server is already running, Daily Logger checks its health and refuses stale builds instead of silently opening the wrong UI.
+
+## Quick Start
+
+### Run the EXE
+
+1. Download [DailyLogger.exe](https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLogger.exe).
 2. Run the executable.
-3. On first launch:
-   - choose your app name (or press Enter for `Daily Logger`)
-   - choose whether to auto-start with Windows
+3. On first launch, choose an app name and whether to start with Windows.
 
-No Python installation is required when using the EXE.
+No Python installation is required for the packaged EXE.
 
----
-
-## Quick Start (Python)
-
-### 1) Prerequisites
-
-- Python 3.10+ recommended
-- Windows Command Prompt or PowerShell
-
-### 2) Run the app
+### Run from Source
 
 ```bash
 python daily_logger.py
 ```
 
-Or double-click:
+Or on Windows:
 
 ```text
 launch_daily_logger.bat
 ```
 
-### 3) Dependency installation prompt
+Daily Logger checks required and optional Python packages at startup. Required packages are needed to run; optional packages enable features such as microphone recording and the calendar date picker.
 
-At startup, Daily Logger checks for required and optional packages and shows a single combined install prompt.
+### Build the Virtual Reader UI
 
-- Required packages are needed for app startup.
-- Optional packages enable full Journal Window features such as speech-to-text recording and calendar popup.
-
----
-
-## Core Commands
-
-From the main menu:
-
-- `J` - Journal
-- `R` - Recap (journal-context AI)
-- `RT` - Recap using thinking model
-- `C` - Chatbot (general AI chat)
-- `CT` - Chatbot using thinking model
-- `H` or `HELP` - command help
-- `RESTORE` - reopen latest unsaved Journal Window draft
-- `STARTUP TRUE` / `STARTUP FALSE` - manage Windows startup behavior
-- `DEFAULT WINDOWS` / `DEFAULT CONSOLE` - set preferred journal input mode
-- `SB bat` / `SB journal` - create Start Menu shortcuts
-- `RENAME` or `RENAME <name>` - rename the app title
-
----
-
-## Data and Storage
-
-### Journal File
-
-- Path: `daily_logs/Journal.xlsx`
-- Sheets:
-  - `Master Journal` (always first)
-  - date sheets (for example `2026-04-28`)
-
-### Sync Behavior
-
-- New entries are saved to that day sheet.
-- `Master Journal` is rebuilt from date sheets.
-- Deleting a date sheet removes those entries from `Master Journal` on next rebuild.
-- Date sheets are ordered newest to oldest behind `Master Journal`.
-
-### Draft Backup
-
-- Journal Window draft file: `settings/journal_window_draft.json`
-- Automatically updated while editing
-- Reopen with `RESTORE`
-
-### Virtual Journal Reader (optional)
-
-When `virtual-journal-reader/dist/` is built and `virtual-journal-reader/serve_reader.py` is present next to the app, the **Virtual Reader** item on the **left nav rail (under Console)** starts a small local server (default port **8765**), opens your default browser, and loads the same data as `Journal.xlsx` (journal text, speech-to-text, AI report). If `virtual-journal-reader.zip` is copied next to the app, Daily Logger can extract that add-on package automatically the first time Virtual Reader opens. If the addon is missing, the same control opens `Journal.xlsx` in the default browser via a `file:` URL (often downloads or opens in Excel depending on your browser).
-
-To build the web UI once (requires Node.js for development):
+Only needed when developing or rebuilding the browser reader:
 
 ```bash
 cd virtual-journal-reader
@@ -142,47 +80,100 @@ npm install
 npm run build
 ```
 
-The reader process Daily Logger **starts for you** stops when you **close the Journal window** or when the **Daily Logger Python process exits** (including `atexit`). If the server was already running on port 8765 before you opened it from Daily Logger (for example you started `serve_reader.py` manually), Daily Logger does **not** own that process and will **not** stop it when you close the app.
+## Console Commands
 
-If UI changes do not appear, end any old **Python** process still listening on port **8765** in Task Manager, run `npm run build` again, then open Virtual Reader (Daily Logger refuses an outdated server on that port and tells you to restart it).
+The Journal Window has a built-in console. Press `H` or `HELP` to see the current command list.
 
-PyInstaller builds can bundle `virtual-journal-reader/dist` and `serve_reader.py` via `DailyLogger.spec` `datas`. In EXE builds, the reader server is launched through Daily Logger's internal `--serve-virtual-reader` mode so it does not open a second logger window.
+| Command | Action |
+| --- | --- |
+| `J` | Open journal flow. |
+| `J SETTINGS`, `J SETTING`, `JOURNAL SETTINGS`, `JS` | Open the journal command menu. |
+| `R`, `RT` | Run AI recap, with `RT` using the thinking model. |
+| `R [date range]`, `RT [date range]` | Recap entries within a date range, such as `4/27 - 4/30`. |
+| `R [file]`, `RT [file]` | Recap using file text as context. |
+| `C`, `CT` | Open chatbot, with `CT` using the thinking model. |
+| `RESTORE` | Reopen the latest unsaved Journal Window draft. |
+| `OPEN DIRECTORY` | Open the app data folder. |
+| `OPEN JOURNAL` | Open `Journal.xlsx`. |
+| `OPEN SCREENSHOTS` | Open the chat screenshots folder. |
+| `STARTUP TRUE`, `STARTUP FALSE` | Enable or disable launch at Windows sign-in. |
+| `DEFAULT WINDOWS`, `DEFAULT CONSOLE` | Choose whether `J` opens the window directly or shows journal choices. |
+| `BACKUP START` | Create a backup zip now. |
+| `BACKUP TRUE`, `BACKUP FALSE`, `BACKUP LIMITED` | Enable, disable, or limit automatic backups. |
+| `TOKEN ADD [token]`, `TOKEN RESET`, `TOKEN COPY` | Manage the stored OpenAI API key. |
+| `LAN cn`, `LAN en`, `LANGUAGE Chinese`, `LANGUAGE English` | Switch UI language. |
+| `SB bat`, `SB journal`, `SB reader` | Create Start Menu search shortcuts. |
+| `WIFI WARN [name]` | Warn when connected to the named Wi-Fi network. |
+| `RENAME` | Change the app name shown in the UI. |
+| `TS` | Take a screenshot for chat workflows. |
+| `UNINSTALL`, `CONFIRM UNINSTALL` | Request and confirm local app-data cleanup. |
 
----
+## Data and Storage
+
+Daily Logger stores user data outside the repo so EXE and source runs share the same files:
+
+```text
+%APPDATA%\DailyLogger\
+```
+
+Important files and folders:
+
+- `daily_logs/Journal.xlsx` - main Excel journal file.
+- `daily_logs/Recording/` - saved recording files.
+- `daily_logs/backup/` - backup zip files.
+- `settings/daily_logger_prefs.json` - local preferences.
+- `settings/journal_window_draft.json` - autosaved unsaved draft.
+- `settings/journal_reader_sketches.json` - reader sketches and page overlays.
+- `settings/daily_logger_api_key.txt` - optional saved OpenAI API key.
+
+Journal workbook behavior:
+
+- Entries save to date sheets such as `2026-05-22`.
+- `Master Journal` is rebuilt from date sheets.
+- Date sheets are ordered newest to oldest behind `Master Journal`.
+- Old repo-local `daily_logs/` and `settings/` data can be migrated into `%APPDATA%\DailyLogger`.
+
+Backup behavior:
+
+- Automatic backup runs once per new day when enabled.
+- Startup is kept responsive: the journal window opens first, then backup runs in the background.
+- Limited backup mode keeps a small rotating set of backup zip files.
 
 ## OpenAI Features
 
-OpenAI features include Recap/Chatbot modes, AI report generation, and transcription support.
+OpenAI is optional. Without a key, local journaling, Excel storage, the reader, settings, backups, and shortcuts still work.
 
-You can add your token at any time from the app command line:
+OpenAI-powered features include:
 
-- `TOKEN ADD [OPENAI API TOKEN]`
+- AI recap over journal entries.
+- General chatbot mode.
+- AI report generation from journal text and speech-to-text.
+- Speech transcription when recording dependencies are installed.
 
-On first AI use, the app can also prompt for an API key and stores it locally in:
+Set a key with:
 
-- `settings/daily_logger_api_key.txt`
+```text
+TOKEN ADD [OPENAI API TOKEN]
+```
 
-Optional environment override:
+You can also use the `OPENAI_API_KEY` environment variable.
 
-- `OPENAI_API_KEY`
+## Project Layout
 
-No token is required to use non-AI features (for example journaling, Excel logging, theme switching, startup controls, and other local app functions).
-
----
-
-## Startup Behavior
-
-You can enable launch-at-login from inside the app:
-
-- `STARTUP TRUE` to enable
-- `STARTUP FALSE` to disable
-
-This manages a shortcut in the Windows Startup folder.
-
----
+```text
+daily_logger.py                 Main desktop app
+journal_i18n.py                 Journal Window translations
+launch_daily_logger.bat         Windows app launcher
+launch_journal_reader.bat       Virtual Reader launcher
+DailyLogger.spec                PyInstaller build spec
+dist/DailyLogger.exe            Packaged executable build
+virtual-journal-reader/         React/Vite reader UI and server
+virtual-journal-reader.zip      Runnable reader add-on package
+images/                         README screenshots and feature mockups
+```
 
 ## Notes
 
-- This project is Windows-focused.
-- Settings and generated data are local and not intended for source control.
-- The journal flow supports fast terminal input and a richer window editor workflow.
+- This project is designed primarily for Windows.
+- Settings, generated journals, backups, recordings, and API keys are local user data and should not be committed.
+- The reader is served locally by default; LAN viewing can be toggled from the reader settings when needed.
