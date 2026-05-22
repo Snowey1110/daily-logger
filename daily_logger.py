@@ -11,7 +11,8 @@ import importlib.util
 import atexit
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import runpy
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,7 @@ import webbrowser
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 import wave
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -400,6 +402,11 @@ JOURNAL_WINDOW_DRAFT_FILE = SETTINGS_DIR / "journal_window_draft.json"
 JOURNAL_WINDOW_CONSOLE_RESERVE_BOTTOM = 56
 SCREENSHOT_DIR = DATA_DIR / "chat_screenshots"
 STARTUP_SHORTCUT_NAME = "Daily Logger.lnk"
+VIRTUAL_READER_DIR_NAME = "virtual-journal-reader"
+VIRTUAL_READER_ZIP_NAME = "virtual-journal-reader.zip"
+VIRTUAL_READER_SERVER_ARG = "--serve-virtual-reader"
+AUTO_BACKUP_START_DELAY_SEC = 2.0
+BACKUP_COMPRESSION_LEVEL = 1
 
 
 @dataclass
@@ -412,6 +419,7 @@ class ModuleConfig:
 
 
 PENDING_UNINSTALL_CONFIRM = False
+_backup_lock = threading.Lock()
 
 
 def bind_openpyxl_symbols() -> bool:
@@ -1051,21 +1059,108 @@ def delete_journal_reader_entry(
         wb.close()
 
 
+def _virtual_reader_paths_from_root(root: Path) -> Optional[Tuple[Path, Path]]:
+    script = root / "serve_reader.py"
+    dist = root / "dist"
+    if script.is_file() and (dist / "index.html").is_file():
+        return script, dist
+    return None
+
+
+def _safe_virtual_reader_zip_parts(name: str) -> Optional[Tuple[str, ...]]:
+    pure = PurePosixPath(name)
+    if pure.is_absolute():
+        return None
+    parts = tuple(part for part in pure.parts if part not in ("", "."))
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return parts
+
+
+def _virtual_reader_zip_member_relpath(
+    parts: Tuple[str, ...],
+    archive_has_root_dir: bool,
+) -> Optional[Path]:
+    if archive_has_root_dir:
+        if parts[0] != VIRTUAL_READER_DIR_NAME or len(parts) == 1:
+            return None
+        parts = parts[1:]
+    return Path(*parts)
+
+
+def _extract_virtual_reader_zip(zip_path: Path, parent_dir: Path) -> Optional[Tuple[Path, Path]]:
+    """Extract a packaged Virtual Reader zip when the folder addon is not present."""
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            member_parts = [
+                parts
+                for info in archive.infolist()
+                if not info.is_dir()
+                for parts in [_safe_virtual_reader_zip_parts(info.filename)]
+                if parts is not None
+            ]
+            if not member_parts:
+                return None
+            archive_has_root_dir = any(parts[0] == VIRTUAL_READER_DIR_NAME for parts in member_parts)
+            relpaths = [
+                rel
+                for parts in member_parts
+                for rel in [_virtual_reader_zip_member_relpath(parts, archive_has_root_dir)]
+                if rel is not None
+            ]
+            relpath_strings = {rel.as_posix() for rel in relpaths}
+            if "serve_reader.py" not in relpath_strings or "dist/index.html" not in relpath_strings:
+                return None
+
+            target_root = parent_dir / VIRTUAL_READER_DIR_NAME
+            target_root.mkdir(parents=True, exist_ok=True)
+            target_root_resolved = target_root.resolve()
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                parts = _safe_virtual_reader_zip_parts(info.filename)
+                if parts is None:
+                    return None
+                relpath = _virtual_reader_zip_member_relpath(parts, archive_has_root_dir)
+                if relpath is None:
+                    continue
+                dest = target_root / relpath
+                try:
+                    dest.resolve().relative_to(target_root_resolved)
+                except ValueError:
+                    return None
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(info) as src, dest.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+            return _virtual_reader_paths_from_root(target_root)
+    except (OSError, zipfile.BadZipFile):
+        return None
+
+
 def virtual_journal_reader_addon_paths() -> Optional[Tuple[Path, Path]]:
     """Return (serve_reader.py, dist_dir) if the Virtual Reader addon is present."""
     roots: List[Path] = []
     if getattr(sys, "frozen", False):
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
-            roots.append(Path(meipass) / "virtual-journal-reader")
-    roots.append(BASE_DIR / "virtual-journal-reader")
+            roots.append(Path(meipass) / VIRTUAL_READER_DIR_NAME)
+    roots.append(BASE_DIR / VIRTUAL_READER_DIR_NAME)
     if getattr(sys, "frozen", False):
-        roots.append(Path(sys.executable).resolve().parent / "virtual-journal-reader")
+        roots.append(Path(sys.executable).resolve().parent / VIRTUAL_READER_DIR_NAME)
     for root in roots:
-        script = root / "serve_reader.py"
-        dist = root / "dist"
-        if script.is_file() and (dist / "index.html").is_file():
-            return script, dist
+        found = _virtual_reader_paths_from_root(root)
+        if found is not None:
+            return found
+
+    zip_parents: List[Path] = [BASE_DIR]
+    if getattr(sys, "frozen", False):
+        exe_parent = Path(sys.executable).resolve().parent
+        if exe_parent not in zip_parents:
+            zip_parents.append(exe_parent)
+    for parent in zip_parents:
+        found = _extract_virtual_reader_zip(parent / VIRTUAL_READER_ZIP_NAME, parent)
+        if found is not None:
+            return found
     return None
 
 
@@ -1142,9 +1237,15 @@ def open_virtual_journal_reader_in_browser() -> Tuple[bool, str]:
     if sys.platform == "win32":
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     global _virtual_reader_child_proc
+    cmd = [sys.executable]
+    if getattr(sys, "frozen", False):
+        cmd.append(VIRTUAL_READER_SERVER_ARG)
+    else:
+        cmd.append(str(script_path))
+    cmd.extend(["--port", str(port), "--no-browser"])
     try:
         _virtual_reader_child_proc = subprocess.Popen(
-            [sys.executable, str(script_path), "--port", str(port)],
+            cmd,
             cwd=str(script_path.resolve().parent),
             env=env,
             close_fds=sys.platform != "win32",
@@ -1177,6 +1278,47 @@ def open_virtual_journal_reader_in_browser() -> Tuple[bool, str]:
                 pass
     _virtual_reader_child_proc = None
     return False, _virtual_reader_tr("msg.virtual_reader_server_timeout")
+
+
+def run_virtual_reader_server_from_cli(argv: List[str]) -> int:
+    debug_log = os.getenv("DAILY_LOGGER_READER_SERVER_LOG", "").strip()
+
+    def _debug(message: str) -> None:
+        if not debug_log:
+            return
+        try:
+            Path(debug_log).write_text(message, encoding="utf-8")
+        except OSError:
+            pass
+
+    paths = virtual_journal_reader_addon_paths()
+    if paths is None:
+        _debug("Virtual Journal Reader addon is missing.\n")
+        print("Virtual Journal Reader addon is missing.", file=sys.stderr)
+        return 1
+    script_path, dist_dir = paths
+    sys.modules.setdefault("daily_logger", sys.modules[__name__])
+    os.environ["VIRTUAL_READER_DIST"] = str(dist_dir.resolve())
+    old_argv = sys.argv[:]
+    sys.argv = [str(script_path), *argv]
+    try:
+        runpy.run_path(str(script_path), run_name="__main__")
+        return 0
+    except SystemExit as exc:
+        if exc.code is None:
+            return 0
+        if isinstance(exc.code, int):
+            if exc.code != 0:
+                _debug(f"Virtual Reader server exited with code {exc.code}.\n")
+            return exc.code
+        print(exc.code, file=sys.stderr)
+        _debug(f"Virtual Reader server exited: {exc.code}\n")
+        return 1
+    except Exception:
+        _debug(traceback.format_exc())
+        return 1
+    finally:
+        sys.argv = old_argv
 
 
 def open_virtual_reader_nav_action() -> Tuple[bool, str]:
@@ -1537,28 +1679,43 @@ def _list_backup_zip_files() -> List[Path]:
 
 
 def run_backup_now() -> Optional[Path]:
-    ensure_backup_folder()
-    items_to_backup = [
-        path
-        for path in DATA_DIR.iterdir()
-        if path.name.lower() != BACKUP_DIR.name.lower()
-    ]
-    if not items_to_backup:
-        return None
+    with _backup_lock:
+        ensure_backup_folder()
+        items_to_backup = [
+            path
+            for path in DATA_DIR.iterdir()
+            if path.name.lower() != BACKUP_DIR.name.lower()
+        ]
+        if not items_to_backup:
+            return None
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    zip_path = BACKUP_DIR / f"backup_{timestamp}.zip"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        zip_path = BACKUP_DIR / f"backup_{timestamp}.zip"
+        temp_zip_path = BACKUP_DIR / f".backup_{timestamp}.tmp"
 
-    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for item in items_to_backup:
-            if item.is_file():
-                archive.write(item, arcname=item.name)
-                continue
-            if item.is_dir():
-                for nested in item.rglob("*"):
-                    if nested.is_file():
-                        archive.write(nested, arcname=str(nested.relative_to(DATA_DIR)))
-    return zip_path
+        try:
+            with zipfile.ZipFile(
+                temp_zip_path,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=BACKUP_COMPRESSION_LEVEL,
+            ) as archive:
+                for item in items_to_backup:
+                    if item.is_file():
+                        archive.write(item, arcname=item.name)
+                        continue
+                    if item.is_dir():
+                        for nested in item.rglob("*"):
+                            if nested.is_file():
+                                archive.write(nested, arcname=str(nested.relative_to(DATA_DIR)))
+            temp_zip_path.replace(zip_path)
+        except Exception:
+            try:
+                temp_zip_path.unlink()
+            except OSError:
+                pass
+            raise
+        return zip_path
 
 
 def trim_backups_if_limited(prefs: Dict[str, str]) -> None:
@@ -1599,19 +1756,41 @@ def maybe_run_daily_auto_backup() -> None:
     today = datetime.now().strftime("%Y-%m-%d")
     last_program_run_date = prefs.get("last_program_run_date", "").strip()
     if last_program_run_date != today:
-        evict_oldest_backup_if_limited_full(prefs)
-        backup_path = run_backup_now()
-        if backup_path is None:
-            print("Auto backup skipped: nothing in daily_logs to back up.")
+        try:
+            evict_oldest_backup_if_limited_full(prefs)
+            backup_path = run_backup_now()
+        except Exception as exc:
+            print(f"Auto backup failed: {exc}")
         else:
-            print(f"Auto backup created: {backup_path.name}")
-            trim_backups_if_limited(prefs)
-            prefs["last_backup_date"] = today
+            if backup_path is None:
+                print("Auto backup skipped: nothing in daily_logs to back up.")
+            else:
+                print(f"Auto backup created: {backup_path.name}")
+                trim_backups_if_limited(prefs)
+                prefs["last_backup_date"] = today
 
     prefs["backup_enabled"] = "true" if _is_pref_true(backup_enabled) else "false"
     prefs["last_program_run_date"] = today
     if not save_preferences(prefs):
         print("Warning: could not save backup preferences.")
+
+
+def start_daily_auto_backup_in_background(delay_sec: float = AUTO_BACKUP_START_DELAY_SEC) -> Optional[threading.Thread]:
+    prefs = load_preferences()
+    if not _is_pref_true(prefs.get("backup_enabled", "true")):
+        return None
+    today = datetime.now().strftime("%Y-%m-%d")
+    if prefs.get("last_program_run_date", "").strip() == today:
+        return None
+
+    def _worker() -> None:
+        if delay_sec > 0:
+            time.sleep(delay_sec)
+        maybe_run_daily_auto_backup()
+
+    thread = threading.Thread(target=_worker, name="DailyLoggerAutoBackup", daemon=True)
+    thread.start()
+    return thread
 
 
 def prompt_for_app_name() -> str:
@@ -2792,7 +2971,11 @@ def generate_journal_report_from_sources(journal_text: str, speech_transcript: s
     )
 
 
-def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -> bool:
+def open_journal_window_editor(
+    draft_data: Optional[Dict[str, object]] = None,
+    *,
+    start_auto_backup: bool = False,
+) -> bool:
     if tk is None or messagebox is None:
         print("Window mode is not available on this Python setup.")
         return False
@@ -8038,6 +8221,8 @@ def open_journal_window_editor(draft_data: Optional[Dict[str, object]] = None) -
         autosave()
         refresh_save_entry_state()
         _startup_step("splash.detail.ready")
+        if start_auto_backup:
+            start_daily_auto_backup_in_background()
 
     root.after(1, _background_post_init)
     root.mainloop()
@@ -9812,7 +9997,6 @@ def run() -> None:
     migrate_legacy_storage_if_needed()
     setup_first_time_preferences()
     ensure_backup_folder()
-    maybe_run_daily_auto_backup()
     if sys.platform == "win32":
         try:
             hwnd = ctypes.windll.kernel32.GetConsoleWindow()
@@ -9822,8 +10006,16 @@ def run() -> None:
             pass
     # Do NOT auto-restore on app launch; only restore when user types `restore`.
     # This prevents the journal editor from popping up with an old unsaved draft.
-    open_journal_window_editor(None)
+    open_journal_window_editor(None, start_auto_backup=True)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == VIRTUAL_READER_SERVER_ARG:
+        return run_virtual_reader_server_from_cli(args[1:])
+    run()
+    return 0
 
 
 if __name__ == "__main__":
-    run()
+    raise SystemExit(main())

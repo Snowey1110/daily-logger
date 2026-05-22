@@ -1,5 +1,15 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import type { PageImage } from '../lib/utils';
+import {
+  captureCanvasSnapshot,
+  createCanvasHistory,
+  isShiftStraightLine,
+  pushUndoSnapshot,
+  redoCanvas,
+  restoreCanvasSnapshot,
+  straightLineTargetWithGuideSnap,
+  undoCanvas,
+} from '../lib/sketchDrawing';
 
 export type LayerKind = 'text' | 'sketch' | 'images';
 
@@ -84,6 +94,9 @@ export function useInlineEditor(opts: {
   const [isErasing, setIsErasing] = useState(false);
   const [eraserSize, setEraserSize] = useState(20);
   const sketchLoaded = useRef(false);
+  const strokeStartRef = useRef<{ x: number; y: number } | null>(null);
+  const strokeSnapshotRef = useRef<ImageData | null>(null);
+  const historyRef = useRef(createCanvasHistory());
 
   const eraserCursor = isErasing ? buildEraserCursor(eraserSize) : 'crosshair';
 
@@ -92,99 +105,143 @@ export function useInlineEditor(opts: {
   const [resizing, setResizing] = useState<{ id: string; startX: number; startY: number; origW: number; origH: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  /* ── canvas init ── */
-  const initCanvasForElement = useCallback((el: HTMLElement) => {
+  /* ── canvas sizing: CSS layout must match page; bitmap attrs alone shrink the hit box ── */
+  const applyCtxDefaults = useCallback((ctx: CanvasRenderingContext2D) => {
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = isErasing ? '#000000' : color;
+    ctx.lineWidth = isErasing ? eraserSize : lineWidth;
+    ctx.globalCompositeOperation = isErasing ? 'destination-out' : 'source-over';
+  }, [color, lineWidth, isErasing, eraserSize]);
+
+  const syncCanvasSize = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    const { width, height } = el.getBoundingClientRect();
+    const pageEl = pageAreaRef.current;
+    if (!canvas || !pageEl) return;
+
+    const rect = pageEl.getBoundingClientRect();
+    const width = Math.round(rect.width);
+    const height = Math.round(rect.height);
     if (width === 0 || height === 0) return;
+
+    const prevW = canvas.width;
+    const prevH = canvas.height;
+    const layoutUnchanged =
+      prevW === width &&
+      prevH === height &&
+      canvas.style.width === `${width}px` &&
+      canvas.style.height === `${height}px`;
+
+    if (layoutUnchanged) {
+      if (!ctxRef.current) {
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          applyCtxDefaults(ctx);
+          ctxRef.current = ctx;
+        }
+      }
+      return;
+    }
+
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = prevW;
+    tempCanvas.height = prevH;
+    const tempCtx = tempCanvas.getContext('2d');
+    if (tempCtx && prevW > 0 && prevH > 0) tempCtx.drawImage(canvas, 0, 0);
+
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    canvas.style.position = 'absolute';
+    canvas.style.left = '0';
+    canvas.style.top = '0';
+
     canvas.width = width;
     canvas.height = height;
     const ctx = canvas.getContext('2d');
-    if (ctx) {
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.strokeStyle = color;
-      ctx.lineWidth = lineWidth;
-      ctx.globalCompositeOperation = 'source-over';
-      ctxRef.current = ctx;
-    }
-    if (initialSketchDataUrl && !sketchLoaded.current) {
+    if (!ctx) return;
+    applyCtxDefaults(ctx);
+    ctxRef.current = ctx;
+
+    if (prevW > 0 && prevH > 0) {
+      ctx.drawImage(tempCanvas, 0, 0, prevW, prevH, 0, 0, width, height);
+    } else if (initialSketchDataUrl && !sketchLoaded.current) {
       const img = new Image();
       img.onload = () => {
         if (ctxRef.current && canvas.width > 0) {
           ctxRef.current.drawImage(img, 0, 0, canvas.width, canvas.height);
+          sketchLoaded.current = true;
         }
-        sketchLoaded.current = true;
       };
       img.src = initialSketchDataUrl;
     }
-    sketchLoaded.current = true;
-  }, [initialSketchDataUrl, color, lineWidth]);
+  }, [applyCtxDefaults, initialSketchDataUrl, pageAreaRef]);
+
+  const initCanvasForElement = useCallback((_el: HTMLElement) => {
+    syncCanvasSize();
+  }, [syncCanvasSize]);
 
   useEffect(() => {
-    const el = pageAreaRef.current;
-    if (el) initCanvasForElement(el);
-  }, []);
+    const canvas = canvasRef.current;
+    const pageEl = pageAreaRef.current;
+    if (!canvas) return;
 
-  useEffect(() => {
-    if (ctxRef.current) {
-      ctxRef.current.strokeStyle = isErasing ? '#000000' : color;
-      ctxRef.current.lineWidth = isErasing ? eraserSize : lineWidth;
-      ctxRef.current.globalCompositeOperation = isErasing ? 'destination-out' : 'source-over';
-    }
-  }, [color, lineWidth, isErasing, eraserSize]);
+    const runSync = () => syncCanvasSize();
+    runSync();
+    const raf1 = requestAnimationFrame(() => {
+      runSync();
+      requestAnimationFrame(runSync);
+    });
 
-  /* ── resize handler ── */
-  useEffect(() => {
-    const handleResize = () => {
-      const canvas = canvasRef.current;
-      const el = pageAreaRef.current;
-      if (!canvas || !el) return;
-      const { width, height } = el.getBoundingClientRect();
-      if (width === 0 || height === 0) return;
-      const prevW = canvas.width;
-      const prevH = canvas.height;
-      if (prevW === width && prevH === height) return;
-      const tempCanvas = document.createElement('canvas');
-      tempCanvas.width = prevW;
-      tempCanvas.height = prevH;
-      const tempCtx = tempCanvas.getContext('2d');
-      if (tempCtx && prevW > 0 && prevH > 0) tempCtx.drawImage(canvas, 0, 0);
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        ctx.strokeStyle = isErasing ? '#000000' : color;
-        ctx.lineWidth = isErasing ? eraserSize : lineWidth;
-        ctx.globalCompositeOperation = isErasing ? 'destination-out' : 'source-over';
-        ctxRef.current = ctx;
-        if (prevW > 0 && prevH > 0) ctx.drawImage(tempCanvas, 0, 0, prevW, prevH, 0, 0, width, height);
-      }
+    const ro = new ResizeObserver(runSync);
+    ro.observe(canvas);
+    if (pageEl) ro.observe(pageEl);
+
+    window.addEventListener('resize', runSync);
+    return () => {
+      cancelAnimationFrame(raf1);
+      ro.disconnect();
+      window.removeEventListener('resize', runSync);
     };
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, [color, lineWidth, isErasing, eraserSize, pageAreaRef]);
+  }, [syncCanvasSize, pageAreaRef]);
+
+  useEffect(() => {
+    if (ctxRef.current) applyCtxDefaults(ctxRef.current);
+  }, [applyCtxDefaults]);
+
+  useEffect(() => {
+    if (activeLayer === 'sketch') {
+      requestAnimationFrame(() => syncCanvasSize());
+    }
+  }, [activeLayer, syncCanvasSize]);
 
   /* ── drawing ── */
   const getCanvasCoords = (e: React.MouseEvent | React.TouchEvent) => {
     const canvas = canvasRef.current;
     if (!canvas) return { x: 0, y: 0 };
     const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return { x: 0, y: 0 };
     let cx: number, cy: number;
     if ('touches' in e) { cx = e.touches[0].clientX; cy = e.touches[0].clientY; }
     else { cx = e.clientX; cy = e.clientY; }
-    return { x: cx - rect.left, y: cy - rect.top };
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return { x: (cx - rect.left) * scaleX, y: (cy - rect.top) * scaleY };
   };
 
   const startDrawing = (e: React.MouseEvent | React.TouchEvent) => {
     if (activeLayer !== 'sketch') return;
     if ('touches' in e) e.preventDefault();
+    syncCanvasSize();
     const { x, y } = getCanvasCoords(e);
-    ctxRef.current?.beginPath();
-    ctxRef.current?.moveTo(x, y);
+    strokeStartRef.current = { x, y };
+    const ctx = ctxRef.current;
+    const canvas = canvasRef.current;
+    if (ctx && canvas) {
+      strokeSnapshotRef.current = captureCanvasSnapshot(ctx, canvas);
+      pushUndoSnapshot(historyRef.current, strokeSnapshotRef.current);
+    }
+    ctx?.beginPath();
+    ctx?.moveTo(x, y);
     setIsDrawingStroke(true);
   };
 
@@ -192,14 +249,35 @@ export function useInlineEditor(opts: {
     if (!isDrawingStroke || activeLayer !== 'sketch') return;
     if ('touches' in e) e.preventDefault();
     const { x, y } = getCanvasCoords(e);
-    ctxRef.current?.lineTo(x, y);
-    ctxRef.current?.stroke();
+    const ctx = ctxRef.current;
+    if (!ctx) return;
+
+    const start = strokeStartRef.current;
+    if (
+      isShiftStraightLine(e) &&
+      !isErasing &&
+      start &&
+      strokeSnapshotRef.current
+    ) {
+      const canvas = canvasRef.current;
+      restoreCanvasSnapshot(ctx, strokeSnapshotRef.current, canvas ?? undefined);
+      const end = straightLineTargetWithGuideSnap(start, { x, y });
+      ctx.beginPath();
+      ctx.moveTo(start.x, start.y);
+      ctx.lineTo(end.x, end.y);
+      ctx.stroke();
+    } else {
+      ctx.lineTo(x, y);
+      ctx.stroke();
+    }
   };
 
   const stopDrawing = () => {
     if (isDrawingStroke) {
       ctxRef.current?.closePath();
       setIsDrawingStroke(false);
+      strokeStartRef.current = null;
+      strokeSnapshotRef.current = null;
     }
   };
 
@@ -207,11 +285,43 @@ export function useInlineEditor(opts: {
     const canvas = canvasRef.current;
     if (canvas && ctxRef.current) {
       const prevOp = ctxRef.current.globalCompositeOperation;
+      pushUndoSnapshot(historyRef.current, captureCanvasSnapshot(ctxRef.current, canvas));
       ctxRef.current.globalCompositeOperation = 'source-over';
       ctxRef.current.clearRect(0, 0, canvas.width, canvas.height);
       ctxRef.current.globalCompositeOperation = prevOp;
     }
   };
+
+  const undoSketch = useCallback(() => {
+    const canvas = canvasRef.current;
+    const ctx = ctxRef.current;
+    if (!canvas || !ctx) return;
+    if (undoCanvas(ctx, canvas, historyRef.current)) applyCtxDefaults(ctx);
+  }, [applyCtxDefaults]);
+
+  const redoSketch = useCallback(() => {
+    const canvas = canvasRef.current;
+    const ctx = ctxRef.current;
+    if (!canvas || !ctx) return;
+    if (redoCanvas(ctx, canvas, historyRef.current)) applyCtxDefaults(ctx);
+  }, [applyCtxDefaults]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (activeLayer !== 'sketch') return;
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      const key = e.key.toLowerCase();
+      if (key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        undoSketch();
+      } else if (key === 'y' || (key === 'z' && e.shiftKey)) {
+        e.preventDefault();
+        redoSketch();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [activeLayer, undoSketch, redoSketch]);
 
   /* ── images ── */
   const addImageFromFile = useCallback((file: File) => {

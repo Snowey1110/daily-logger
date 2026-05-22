@@ -931,7 +931,7 @@ const JournalBook: React.FC = () => {
   return (
     <div className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden select-none font-sans transition-colors duration-500" style={{ backgroundColor: bgTheme.colors.bg }}>
       {!singlePage && (
-        <div className="absolute top-6 left-8 opacity-80 z-10" style={{ color: bgTheme.cover.accentText }}>
+        <div className="absolute top-6 left-8 opacity-80 z-10 pointer-events-none" style={{ color: bgTheme.cover.accentText }}>
           <h1 className="text-2xl tracking-widest uppercase font-light font-serif">
             {appTitle}{' '}
             <span className="text-xs opacity-50 block tracking-normal font-sans">{t('readerSubtitle')}</span>
@@ -996,7 +996,7 @@ const JournalBook: React.FC = () => {
               ? 'aspect-[0.7/1] w-[min(100%,24rem,92vw)] shadow-[0_20px_60px_-10px_rgba(0,0,0,0.5)]'
               : 'aspect-[1.4/1] w-[min(100%,72rem,92vw)] shadow-[0_50px_100px_-20px_rgba(0,0,0,0.5)]',
           )}
-          style={{ transform: inlineEditEntry && !singlePage ? 'translateX(7rem)' : 'none', transition: 'transform 0.3s ease' }}
+          style={{ transition: 'transform 0.3s ease' }}
         >
           <div className="absolute inset-0 bg-black/40 -z-10 rounded-xl translate-x-2 translate-y-2 blur-2xl" />
 
@@ -1369,6 +1369,7 @@ const InlineEditorOverlay: React.FC<{
             entryDate={editDate}
             entryTime={editTime}
             isMobile={isMobile}
+            dockSide={side === 'left' ? 'right' : 'left'}
           />
           <input ref={editor.fileInputRef} type="file" accept="image/*" className="hidden" onChange={editor.handleFileChange} />
         </>,
@@ -1384,26 +1385,36 @@ const InlineEditorOverlay: React.FC<{
         />
       )}
 
-      {/* Sketch canvas — absolute within book spread, covers the active page */}
-      <canvas
-        ref={editor.canvasRef}
-        className={`absolute top-0 bottom-0 ${overlayWidth} touch-none ${pagePosition}`}
-        style={{
-          zIndex: 50 + editor.zIndex('sketch'),
-          pointerEvents: editor.activeLayer === 'sketch' ? 'auto' : 'none',
-          cursor: editor.activeLayer === 'sketch' ? editor.eraserCursor : 'default',
-        }}
-        onMouseDown={editor.startDrawing}
-        onMouseMove={editor.draw}
-        onMouseUp={editor.stopDrawing}
-        onMouseOut={editor.stopDrawing}
-        onTouchStart={editor.startDrawing}
-        onTouchMove={editor.draw}
-        onTouchEnd={editor.stopDrawing}
-      />
+      {/* Sketch canvas — host fills page column; canvas pixel size set in JS to match page */}
+      <div
+        className={`absolute top-0 bottom-0 ${overlayWidth} ${pagePosition} pointer-events-none`}
+        style={{ zIndex: 50 + editor.zIndex('sketch') }}
+      >
+        <canvas
+          ref={editor.canvasRef}
+          className="touch-none block"
+          style={{
+            pointerEvents: editor.activeLayer === 'sketch' ? 'auto' : 'none',
+            cursor: editor.activeLayer === 'sketch' ? editor.eraserCursor : 'default',
+          }}
+          onMouseDown={editor.startDrawing}
+          onMouseMove={editor.draw}
+          onMouseUp={editor.stopDrawing}
+          onMouseOut={editor.stopDrawing}
+          onTouchStart={editor.startDrawing}
+          onTouchMove={editor.draw}
+          onTouchEnd={editor.stopDrawing}
+        />
+      </div>
 
       {/* Text + image editing layers — absolute within book spread, covers the active page */}
-      <div className={`absolute top-0 bottom-0 ${overlayWidth} ${pagePosition}`} style={{ zIndex: 50 }}>
+      <div
+        className={`absolute top-0 bottom-0 ${overlayWidth} ${pagePosition}`}
+        style={{
+          zIndex: 50,
+          pointerEvents: editor.activeLayer === 'sketch' ? 'none' : 'auto',
+        }}
+      >
         {/* Text layer — opaque background to hide rendered page text underneath */}
         <div
           className={`absolute inset-0 ${padClass} flex flex-col font-serif`}

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib import request
 from urllib.parse import unquote, urlparse
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -404,14 +405,26 @@ class ReaderHandler(BaseHTTPRequestHandler):
 
 
 def _get_lan_ip() -> str:
+    s = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.25)
         s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        return s.getsockname()[0]
     except Exception:
         return "127.0.0.1"
+    finally:
+        if s is not None:
+            s.close()
+
+
+def _server_health_ok(port: int) -> bool:
+    try:
+        with request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=0.5) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        return bool(payload.get("ok"))
+    except Exception:
+        return False
 
 
 def main() -> None:
@@ -428,10 +441,19 @@ def main() -> None:
     if not (ReaderHandler.dist / "index.html").is_file():
         print(f"Missing dist: {ReaderHandler.dist / 'index.html'} — run npm run build", file=sys.stderr)
         sys.exit(1)
-    global _lan_ip
-    server = ThreadingHTTPServer((args.host, args.port), ReaderHandler)
-    _lan_ip = _get_lan_ip()
     url = f"http://127.0.0.1:{args.port}/"
+    global _lan_ip
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), ReaderHandler)
+    except OSError as exc:
+        if _server_health_ok(args.port):
+            print("Virtual Journal Reader is already running.", flush=True)
+            if not args.no_browser:
+                webbrowser.open(url)
+            return
+        print(f"Could not start Virtual Journal Reader on port {args.port}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    _lan_ip = _get_lan_ip()
     print(f"Virtual Journal Reader:", flush=True)
     print(f"  Local:   {url}", flush=True)
     if args.host == "0.0.0.0":

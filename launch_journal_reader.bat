@@ -1,5 +1,11 @@
 @echo off
 setlocal
+
+if exist "%~dp0DailyLogger.exe" (
+  start "" /b "%~dp0DailyLogger.exe" --serve-virtual-reader %*
+  exit /b 0
+)
+
 cd /d "%~dp0\virtual-journal-reader"
 
 where pythonw >nul 2>nul

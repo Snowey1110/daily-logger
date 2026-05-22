@@ -41,6 +41,8 @@ If you just want to run the app on Windows, use the packaged executable:
 
 - `daily_logger.py` - main application logic
 - `launch_daily_logger.bat` - Windows launcher
+- `launch_journal_reader.bat` - Virtual Journal Reader launcher
+- `virtual-journal-reader.zip` - runnable Virtual Reader add-on package
 - `dist/DailyLogger.exe` - packaged executable build
 - `daily_logs/` - generated journal Excel data
 - `settings/` - local preferences and API key files
@@ -130,7 +132,7 @@ From the main menu:
 
 ### Virtual Journal Reader (optional)
 
-When `virtual-journal-reader/dist/` is built and `virtual-journal-reader/serve_reader.py` is present next to the app, the **Virtual Reader** item on the **left nav rail (under Console)** starts a small local Python server (default port **8765**), opens your default browser, and loads the same data as `Journal.xlsx` (journal text, speech-to-text, AI report). If the addon is missing, the same control opens `Journal.xlsx` in the default browser via a `file:` URL (often downloads or opens in Excel depending on your browser).
+When `virtual-journal-reader/dist/` is built and `virtual-journal-reader/serve_reader.py` is present next to the app, the **Virtual Reader** item on the **left nav rail (under Console)** starts a small local server (default port **8765**), opens your default browser, and loads the same data as `Journal.xlsx` (journal text, speech-to-text, AI report). If `virtual-journal-reader.zip` is copied next to the app, Daily Logger can extract that add-on package automatically the first time Virtual Reader opens. If the addon is missing, the same control opens `Journal.xlsx` in the default browser via a `file:` URL (often downloads or opens in Excel depending on your browser).
 
 To build the web UI once (requires Node.js for development):
 
@@ -144,7 +146,7 @@ The reader process Daily Logger **starts for you** stops when you **close the Jo
 
 If UI changes do not appear, end any old **Python** process still listening on port **8765** in Task Manager, run `npm run build` again, then open Virtual Reader (Daily Logger refuses an outdated server on that port and tells you to restart it).
 
-PyInstaller builds can bundle `virtual-journal-reader/dist` and `serve_reader.py` via `DailyLogger.spec` `datas`.
+PyInstaller builds can bundle `virtual-journal-reader/dist` and `serve_reader.py` via `DailyLogger.spec` `datas`. In EXE builds, the reader server is launched through Daily Logger's internal `--serve-virtual-reader` mode so it does not open a second logger window.
 
 ---
 

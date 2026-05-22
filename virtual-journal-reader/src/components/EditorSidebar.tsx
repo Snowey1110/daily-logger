@@ -33,6 +33,7 @@ interface EditorSidebarProps {
   entryDate: string;
   entryTime: string;
   isMobile?: boolean;
+  dockSide?: 'left' | 'right';
 }
 
 const LAYER_ICON: Record<LayerKind, React.ReactNode> = {
@@ -45,7 +46,7 @@ export const EditorSidebar: React.FC<EditorSidebarProps> = ({
   activeLayer, onLayerChange, layerOrder, onMoveLayer, onReorderLayers,
   color, lineWidth, isErasing, eraserSize,
   onColorChange, onLineWidthChange, onSetErasing, onEraserSizeChange, onClearCanvas,
-  onUploadImage, onSave, onClose, entryDate, entryTime, isMobile,
+  onUploadImage, onSave, onClose, entryDate, entryTime, isMobile, dockSide = 'left',
 }) => {
   const { t } = useReaderT();
   const { bgTheme } = useTheme();
@@ -145,6 +146,9 @@ export const EditorSidebar: React.FC<EditorSidebarProps> = ({
                 <button onClick={onClearCanvas} className="flex items-center gap-1 px-2 py-2 text-xs rounded-lg border min-h-[40px]" style={{ borderColor: bgTheme.colors.border, color: bgTheme.colors.textMuted }}>
                   <Trash2 size={14} /> {t('clearCanvas')}
                 </button>
+                <p className="w-full text-[10px] opacity-50" style={{ color: bgTheme.colors.textMuted }}>
+                  {t('sketchShiftStraightLine')}
+                </p>
               </div>
             )}
             {activeLayer === 'images' && (
@@ -168,8 +172,13 @@ export const EditorSidebar: React.FC<EditorSidebarProps> = ({
 
   return (
     <div
-      className="fixed left-0 top-0 bottom-0 w-56 z-[110] flex flex-col shadow-2xl font-sans"
-      style={{ backgroundColor: bgTheme.colors.bookInner, borderRight: `1px solid ${bgTheme.colors.border}` }}
+      className={`fixed ${dockSide === 'right' ? 'right-0' : 'left-0'} top-0 bottom-0 w-56 z-[110] flex flex-col shadow-2xl font-sans`}
+      style={{
+        backgroundColor: bgTheme.colors.bookInner,
+        ...(dockSide === 'right'
+          ? { borderLeft: `1px solid ${bgTheme.colors.border}` }
+          : { borderRight: `1px solid ${bgTheme.colors.border}` }),
+      }}
     >
       {/* Header */}
       <div
@@ -347,6 +356,9 @@ export const EditorSidebar: React.FC<EditorSidebarProps> = ({
               <Trash2 size={14} />
               {t('clearCanvas')}
             </button>
+            <p className="text-[10px] opacity-50" style={{ color: bgTheme.colors.textMuted }}>
+              {t('sketchShiftStraightLine')}
+            </p>
           </div>
         )}
 
