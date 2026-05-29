@@ -3,7 +3,7 @@
 Daily Logger is a Windows-first personal journal for fast daily capture, rich review, and Excel-backed storage. It opens into a desktop Journal Window, saves entries locally, and can optionally use OpenAI features for recap, chat, transcription, and AI reports.
 
 <p align="center">
-  <a href="https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLogger.exe"><strong>Download the latest DailyLogger.exe</strong></a>
+  <a href="https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerPortable.zip"><strong>Download the latest DailyLoggerPortable.zip</strong></a>
 </p>
 
 ## Highlights
@@ -12,6 +12,7 @@ Daily Logger is a Windows-first personal journal for fast daily capture, rich re
 - Virtual Journal Reader for browsing entries as a book in the browser.
 - Editable reader pages with text, sketch, image, and layer-order controls.
 - Excel storage in `Journal.xlsx` with per-day sheets and a rebuilt `Master Journal`.
+- Portable folder build for faster repeat startup than the old single-file EXE package.
 - Background daily backup after the journal UI finishes loading.
 - Optional OpenAI recap/chat tools; normal journaling works without an API key.
 
@@ -48,13 +49,15 @@ The local reader server uses port `8765` by default. If an old reader server is 
 
 ## Quick Start
 
-### Run the EXE
+### Run the Portable App
 
-1. Download [DailyLogger.exe](https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLogger.exe).
-2. Run the executable.
-3. On first launch, choose an app name and whether to start with Windows.
+1. Download [DailyLoggerPortable.zip](https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerPortable.zip).
+2. Extract the zip.
+3. Open the extracted `DailyLogger` folder.
+4. Run `DailyLogger.exe`.
+5. On first launch, choose an app name and whether to start with Windows.
 
-No Python installation is required for the packaged EXE.
+No Python installation is required for the portable build. Keep the extracted folder together; `DailyLogger.exe` uses the bundled `_internal` runtime files next to it. The portable folder avoids the old single-file EXE unpack step, which improves repeat launch time.
 
 ### Run from Source
 
@@ -165,8 +168,8 @@ daily_logger.py                 Main desktop app
 journal_i18n.py                 Journal Window translations
 launch_daily_logger.bat         Windows app launcher
 launch_journal_reader.bat       Virtual Reader launcher
-DailyLogger.spec                PyInstaller build spec
-dist/DailyLogger.exe            Packaged executable build
+DailyLogger.spec                PyInstaller portable-folder build spec
+dist/DailyLoggerPortable.zip    Portable release package
 virtual-journal-reader/         React/Vite reader UI and server
 virtual-journal-reader.zip      Runnable reader add-on package
 images/                         README screenshots and feature mockups
