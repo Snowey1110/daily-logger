@@ -1,5 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files
+
+
+imageio_ffmpeg_datas = collect_data_files('imageio_ffmpeg')
+
 
 a = Analysis(
     ['c:\\Users\\LixiaoKuang\\OneDrive - VisionNav Robotics USA inc\\Desktop\\Code\\daily_logger.py'],
@@ -8,8 +13,9 @@ a = Analysis(
     datas=[
         ('virtual-journal-reader/dist', 'virtual-journal-reader/dist'),
         ('virtual-journal-reader/serve_reader.py', 'virtual-journal-reader'),
+        *imageio_ffmpeg_datas,
     ],
-    hiddenimports=[],
+    hiddenimports=['imageio_ffmpeg'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

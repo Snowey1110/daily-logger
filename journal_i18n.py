@@ -75,6 +75,11 @@ _EN: Dict[str, str] = {
     "journal.open": "Open",
     "journal.lang_label": "Language:",
     "journal.transcribe": "Transcribe",
+    "journal.transcribe_file": "Transcribe File",
+    "journal.transcribe_file_tooltip": (
+        "Choose one or more audio/video files to transcribe.\n"
+        "Files are transcribed oldest to newest. Supports app WAV recordings and iPhone videos."
+    ),
     "journal.transcribe_tooltip_busy": "Transcribing…",
     "journal.transcribe_tooltip_no_audio": "Record an audio first",
     "journal.transcribe_tooltip_ok": (
@@ -194,6 +199,10 @@ _EN: Dict[str, str] = {
     "tip.recap_to_disabled": 'The "To" range option is only available when at most one day is selected on the calendar. Remove extra days or use From only.',
     "tip.recap_all_journal": (
         "Use every journal entry as context, ignoring the date picker and calendar."
+    ),
+    "tip.thinking_model": (
+        "Uses the stronger reasoning model for harder questions, better planning, and deeper summaries. "
+        "It can take longer and may cost more than the regular model."
     ),
     "tip.open_recordings": "Opens the recording directory.",
     "tip.generate_report": (
@@ -395,6 +404,10 @@ _ZH: Dict[str, str] = {
     "tip.recap_to": "开启后选择「到」日期，日记范围包含从「从」到「到」（含端点）。",
     "tip.recap_to_disabled": "「至」范围仅在日历上至多选择一天时可用。请减少已选日期或仅使用「从」。",
     "tip.recap_all_journal": "使用所有日记条目作为上下文，忽略日期与日历选择。",
+    "tip.thinking_model": (
+        "使用更强的推理模型，适合复杂问题、计划和更深入的总结。"
+        "速度可能更慢，也可能产生更高 API 费用。"
+    ),
     "tip.open_recordings": "打开录音文件所在文件夹。",
     "tip.generate_report": (
         "使用 AI（ChatGPT）根据日记正文与语音转写生成摘要。"

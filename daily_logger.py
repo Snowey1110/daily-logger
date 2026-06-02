@@ -123,14 +123,58 @@ WHISPER_TRANSCRIBE_CHUNK_SEC = 8 * 60
 # OpenAI Whisper multipart limit is ~25 MiB total; keep each mono int16 chunk smaller than that.
 WHISPER_SAFE_CHUNK_PCM_BYTES = 20 * 1024 * 1024
 WHISPER_SKIP_SINGLE_FILE_BYTES = 22 * 1024 * 1024
+TRANSCRIPTION_DIRECT_UPLOAD_MAX_BYTES = 24 * 1024 * 1024
+TRANSCRIPTION_AUDIO_CHUNK_SEC = 8 * 60
+TRANSCRIPTION_CONVERTED_AUDIO_BITRATE = "96k"
 WHISPER_TRANSCRIBE_PROMPT_CHAR_LIMIT = 600
 WHISPER_REPEAT_SENTENCE_KEEP = 1
 WHISPER_UNSUPPORTED_SCRIPT_RATIO = 0.25
 WHISPER_UNSUPPORTED_SCRIPT_MIN_LETTERS = 8
+TRANSCRIPTION_DIRECT_SUFFIXES = {
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".mp4",
+    ".mpeg",
+    ".mpga",
+    ".ogg",
+    ".wav",
+    ".webm",
+}
+TRANSCRIPTION_VIDEO_SUFFIXES = {".mov", ".mp4", ".qt", ".webm"}
+TRANSCRIPTION_MEDIA_SUFFIXES = TRANSCRIPTION_DIRECT_SUFFIXES | {".mov", ".qt"}
+TRANSCRIPTION_CONTENT_TYPES = {
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".mov": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".mp4": "audio/mp4",
+    ".mpeg": "audio/mpeg",
+    ".mpga": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".qt": "audio/mp4",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+}
 # Hover tooltips: narrow wrap → shorter line length, more lines (taller block).
 TOOLTIP_WRAP_PX = 220
 TOOLTIP_WRAP_PX_MAX = 280
 JOURNAL_PREF_THEME_KEY = "journal_window_theme"
+JOURNAL_TEXT_FONT_FAMILY = "Microsoft YaHei UI"
+
+
+def run_hidden_subprocess(args: List[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    """Run console tools from the GUI without flashing a Windows terminal."""
+    if os.name == "nt":
+        creationflags = int(kwargs.pop("creationflags", 0) or 0)
+        creationflags |= int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+        kwargs["creationflags"] = creationflags
+        if "startupinfo" not in kwargs and hasattr(subprocess, "STARTUPINFO"):
+            startupinfo = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
+            startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+            startupinfo.wShowWindow = 0
+            kwargs["startupinfo"] = startupinfo
+    return subprocess.run(args, **kwargs)
 
 
 def migrate_legacy_storage_if_needed() -> None:
@@ -2354,6 +2398,239 @@ def prepare_wav_path_for_whisper(source: Path) -> Tuple[Path, Optional[str], Opt
     return tmp, None, tmp
 
 
+def _media_size_mb(num_bytes: int) -> str:
+    return f"{num_bytes / 1024 / 1024:.1f} MB"
+
+
+def transcription_content_type_for_path(path: Path) -> str:
+    return TRANSCRIPTION_CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
+
+
+def is_transcription_media_file(path: Path) -> bool:
+    return path.suffix.lower() in TRANSCRIPTION_MEDIA_SUFFIXES
+
+
+def is_transcription_video_file(path: Path) -> bool:
+    return path.suffix.lower() in TRANSCRIPTION_VIDEO_SUFFIXES
+
+
+def _find_ffmpeg_executable() -> Optional[str]:
+    candidates: List[Optional[str]] = []
+    try:
+        import imageio_ffmpeg
+
+        candidates.append(str(imageio_ffmpeg.get_ffmpeg_exe()))
+    except Exception:
+        pass
+    candidates.extend([
+        shutil.which("ffmpeg"),
+        str(BASE_DIR / "ffmpeg.exe"),
+        str(BASE_DIR / "_internal" / "ffmpeg.exe"),
+    ])
+    try:
+        candidates.append(str(Path(sys.executable).with_name("ffmpeg.exe")))
+    except Exception:
+        pass
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            p = Path(candidate)
+            if p.is_file():
+                return str(p)
+        except OSError:
+            continue
+    return None
+
+
+def _temp_media_path(suffix: str, prefix: str) -> Path:
+    fd, tmp_name = tempfile.mkstemp(suffix=suffix, prefix=prefix)
+    os.close(fd)
+    return Path(tmp_name)
+
+
+def _temp_media_dir(prefix: str) -> Path:
+    return Path(tempfile.mkdtemp(prefix=prefix))
+
+
+def _cleanup_transcription_temp(temp_path: Optional[Path]) -> None:
+    if temp_path is None:
+        return
+    try:
+        if temp_path.is_dir():
+            shutil.rmtree(temp_path, ignore_errors=True)
+        else:
+            temp_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _run_ffmpeg_extract(source: Path, target: Path, *, copy_audio: bool = False) -> Tuple[bool, str]:
+    ffmpeg = _find_ffmpeg_executable()
+    if not ffmpeg:
+        return False, "ffmpeg is not installed or bundled."
+    codec_args = (
+        ["-c:a", "copy"]
+        if copy_audio
+        else ["-ac", "1", "-c:a", "aac", "-b:a", TRANSCRIPTION_CONVERTED_AUDIO_BITRATE]
+    )
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source),
+        "-vn",
+        *codec_args,
+        str(target),
+    ]
+    try:
+        result = run_hidden_subprocess(cmd, capture_output=True, text=True, timeout=300)
+    except Exception as exc:
+        return False, str(exc)
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        return False, details or f"ffmpeg exited with code {result.returncode}."
+    try:
+        if target.is_file() and target.stat().st_size > 0:
+            return True, ""
+    except OSError:
+        pass
+    return False, "ffmpeg did not create an audio file."
+
+
+def _run_ffmpeg_segment_audio(source: Path, target_pattern: Path) -> Tuple[bool, str]:
+    ffmpeg = _find_ffmpeg_executable()
+    if not ffmpeg:
+        return False, "ffmpeg is not installed or bundled."
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source),
+        "-vn",
+        "-map",
+        "0:a:0?",
+        "-ac",
+        "1",
+        "-c:a",
+        "aac",
+        "-b:a",
+        TRANSCRIPTION_CONVERTED_AUDIO_BITRATE,
+        "-f",
+        "segment",
+        "-segment_time",
+        str(TRANSCRIPTION_AUDIO_CHUNK_SEC),
+        "-reset_timestamps",
+        "1",
+        str(target_pattern),
+    ]
+    try:
+        result = run_hidden_subprocess(cmd, capture_output=True, text=True, timeout=900)
+    except Exception as exc:
+        return False, str(exc)
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        return False, details or f"ffmpeg exited with code {result.returncode}."
+    return True, ""
+
+
+def _looks_like_no_audio_media_error(text: str) -> bool:
+    low = (text or "").casefold()
+    markers = (
+        "stream map",
+        "matches no streams",
+        "does not contain any stream",
+        "output file does not contain",
+        "no audio",
+        "audio:0",
+    )
+    return any(marker in low for marker in markers)
+
+
+def _extract_media_audio_for_transcription(source: Path) -> Tuple[List[Path], Optional[str], Optional[Path]]:
+    temp_dir = _temp_media_dir("transcribe_audio_")
+    pattern = temp_dir / "part_%03d.m4a"
+    ok, err = _run_ffmpeg_segment_audio(source, pattern)
+    if not ok:
+        _cleanup_transcription_temp(temp_dir)
+        if _looks_like_no_audio_media_error(err):
+            return [], f"No audio track found in {source.name}.", None
+        return [], f"Could not extract audio from that media file: {err}", None
+    parts = sorted(
+        (p for p in temp_dir.glob("part_*.m4a") if p.is_file()),
+        key=lambda p: p.name.lower(),
+    )
+    parts = [p for p in parts if p.stat().st_size > 0]
+    if not parts:
+        _cleanup_transcription_temp(temp_dir)
+        return [], f"No audio track found in {source.name}.", None
+    oversized = [p for p in parts if p.stat().st_size >= TRANSCRIPTION_DIRECT_UPLOAD_MAX_BYTES]
+    if oversized:
+        largest = max(int(p.stat().st_size) for p in oversized)
+        _cleanup_transcription_temp(temp_dir)
+        return (
+            [],
+            "The selected media is still too large after extracting audio "
+            f"({_media_size_mb(largest)} in one chunk). Use a shorter clip or compress it first.",
+            None,
+        )
+    return parts, None, temp_dir
+
+
+def _copy_mov_as_mp4_for_transcription(source: Path) -> Tuple[Path, Optional[str], Optional[Path]]:
+    tmp = _temp_media_path(".mp4", "transcribe_iphone_")
+    try:
+        shutil.copyfile(source, tmp)
+    except OSError as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return source, f"Could not prepare iPhone video for transcription: {exc}", None
+    return tmp, None, tmp
+
+
+def prepare_paths_for_transcription(source: Path) -> Tuple[List[Path], Optional[str], Optional[Path]]:
+    """Return ordered upload files for WAV, audio, and video files."""
+    suffix = source.suffix.lower()
+    if suffix == ".wav":
+        upload, err, temp_path = prepare_wav_path_for_whisper(source)
+        if err is not None:
+            return [], err, None
+        return [upload], None, temp_path
+    if not is_transcription_media_file(source):
+        allowed = ", ".join(sorted(TRANSCRIPTION_MEDIA_SUFFIXES))
+        return [], f"Unsupported transcription file type '{suffix or '(none)'}'. Use: {allowed}", None
+    try:
+        source_size = int(source.stat().st_size)
+    except OSError as exc:
+        return [], f"Could not read audio file: {exc}", None
+    if source_size <= 0:
+        return [], "Empty audio.", None
+
+    if is_transcription_video_file(source):
+        return _extract_media_audio_for_transcription(source)
+    if source_size >= TRANSCRIPTION_DIRECT_UPLOAD_MAX_BYTES:
+        return _extract_media_audio_for_transcription(source)
+    return [source], None, None
+
+
+def prepare_path_for_transcription(source: Path) -> Tuple[Path, Optional[str], Optional[Path]]:
+    """Return (upload_path, error, temp_path) for WAV, audio, and supported video files."""
+    uploads, err, temp_path = prepare_paths_for_transcription(source)
+    if err is not None:
+        return source, err, temp_path
+    if not uploads:
+        return source, "Whisper returned empty text.", temp_path
+    return uploads[0], None, temp_path
+
+
 def _default_whisper_prompt(language: Optional[str]) -> str:
     lang = (language or "").strip().lower()
     if lang == "en":
@@ -2499,6 +2776,36 @@ def _unsupported_transcript_script_ratio(text: str) -> Tuple[int, float]:
     return letters, unsupported / float(letters)
 
 
+JOURNAL_PUNCTUATION_TRANSLATION = str.maketrans(
+    {
+        "，": ",",
+        "。": ".",
+        "、": ",",
+        "；": ";",
+        "：": ":",
+        "？": "?",
+        "！": "!",
+        "（": "(",
+        "）": ")",
+        "【": "[",
+        "】": "]",
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+    }
+)
+
+
+def normalize_journal_text_punctuation(text: str) -> str:
+    """Use baseline-friendly ASCII punctuation in mixed Chinese/English journal text."""
+    if not text:
+        return ""
+    fixed = text.translate(JOURNAL_PUNCTUATION_TRANSLATION)
+    fixed = re.sub(r"\s+([,.;:?!])", r"\1", fixed)
+    return fixed
+
+
 def clean_whisper_transcript(text: str, language: Optional[str]) -> str:
     """Normalize Whisper text and reject obvious non-English/non-Chinese hallucinations."""
     cleaned = re.sub(r"\s+", " ", (text or "").strip())
@@ -2506,6 +2813,7 @@ def clean_whisper_transcript(text: str, language: Optional[str]) -> str:
         return ""
     cleaned = _collapse_repeated_transcript_clauses(cleaned)
     cleaned = _collapse_repeated_transcript_sentences(cleaned)
+    cleaned = normalize_journal_text_punctuation(cleaned)
     letters, unsupported_ratio = _unsupported_transcript_script_ratio(cleaned)
     if (
         letters >= WHISPER_UNSUPPORTED_SCRIPT_MIN_LETTERS
@@ -2526,6 +2834,7 @@ def _transcribe_audio_openai_single(
     *,
     prompt: Optional[str] = None,
     temperature: float = 0.0,
+    content_type: Optional[str] = None,
     progress: Optional[Callable[[int], None]] = None,
 ) -> str:
     """Single-request Whisper upload. Caller handles retries/fallback strategy."""
@@ -2575,7 +2884,8 @@ def _transcribe_audio_openai_single(
         f'Content-Disposition: form-data; name="file"; filename="{filename}"'.encode("utf-8")
         + crlf
     )
-    body_chunks.append(b"Content-Type: audio/wav" + crlf + crlf)
+    upload_content_type = content_type or transcription_content_type_for_path(file_path)
+    body_chunks.append(f"Content-Type: {upload_content_type}".encode("ascii", "ignore") + crlf + crlf)
     body_chunks.append(audio_bytes + crlf)
     body_chunks.append(b"--" + boundary + b"--" + crlf)
     body = b"".join(body_chunks)
@@ -2659,7 +2969,14 @@ def _is_likely_api_error_message_global(text: str) -> bool:
         "Whisper request failed",
         "Whisper returned",
         "Whisper transcription rejected",
+        "Unsupported transcription file type",
+        "That media file is too large",
+        "That iPhone video is too large",
+        "The selected media is still too large",
+        "Could not prepare iPhone video",
+        "Could not extract audio",
         "Could not read audio file",
+        "No audio track found",
         "Recording needs optional packages",
         "No speech detected",
         "Empty audio.",
@@ -2681,6 +2998,7 @@ def _transcribe_audio_openai_chunked(
     *,
     prompt: Optional[str] = None,
     temperature: float = 0.0,
+    on_part: Optional[Callable[[str], None]] = None,
     progress: Optional[Callable[[int], None]] = None,
 ) -> str:
     """Fallback for oversized uploads/context: split WAV and merge partial transcripts."""
@@ -2749,6 +3067,11 @@ def _transcribe_audio_openai_chunked(
                 _pg(22 + int(72 * (ci + 1) / n_chunks))
                 continue
             transcripts.append(chunk_result)
+            if on_part is not None:
+                try:
+                    on_part(chunk_result)
+                except Exception:
+                    pass
         _pg(22 + int(72 * (ci + 1) / n_chunks))
     merged = clean_whisper_transcript(" ".join(t for t in transcripts if t.strip()).strip(), language)
     _pg(97)
@@ -2757,12 +3080,70 @@ def _transcribe_audio_openai_chunked(
     return "Whisper returned empty text."
 
 
+def _transcribe_prepared_upload_openai(
+    upload_path: Path,
+    language: Optional[str],
+    *,
+    prompt: Optional[str] = None,
+    temperature: float = 0.0,
+    on_part: Optional[Callable[[str], None]] = None,
+    progress: Optional[Callable[[int], None]] = None,
+) -> str:
+    upload_is_wav = upload_path.suffix.lower() == ".wav"
+    upload_content_type = transcription_content_type_for_path(upload_path)
+    upl_sz = 0
+    try:
+        upl_sz = int(upload_path.stat().st_size)
+    except OSError:
+        pass
+    if upload_is_wav and upl_sz >= WHISPER_SKIP_SINGLE_FILE_BYTES:
+        return _transcribe_audio_openai_chunked(
+            upload_path,
+            language,
+            prompt=prompt,
+            temperature=temperature,
+            on_part=on_part,
+            progress=progress,
+        )
+    if not upload_is_wav and upl_sz >= TRANSCRIPTION_DIRECT_UPLOAD_MAX_BYTES:
+        return (
+            "That media file is too large for one transcription upload "
+            f"({_media_size_mb(upl_sz)}). Use a shorter clip or compress it first."
+        )
+    result = _transcribe_audio_openai_single(
+        upload_path,
+        language,
+        prompt=prompt,
+        temperature=temperature,
+        content_type=upload_content_type,
+        progress=progress,
+    )
+    if upload_is_wav and _whisper_context_too_long_error(result):
+        return _transcribe_audio_openai_chunked(
+            upload_path,
+            language,
+            prompt=prompt,
+            temperature=temperature,
+            on_part=on_part,
+            progress=progress,
+        )
+    if on_part is not None and not _is_likely_api_error_message_global(result):
+        final_text = normalize_journal_text_punctuation(result.strip())
+        if final_text:
+            try:
+                on_part(final_text)
+            except Exception:
+                pass
+    return result
+
+
 def transcribe_audio_openai(
     file_path: Path,
     language: Optional[str],
     *,
     prompt: Optional[str] = None,
     temperature: float = 0.0,
+    on_part: Optional[Callable[[str], None]] = None,
     progress: Optional[Callable[[int], None]] = None,
 ) -> str:
     """Send local audio to Whisper with fallback for long context/uploads."""
@@ -2781,49 +3162,39 @@ def transcribe_audio_openai(
                 pass
 
     _p(2)
-    upload_path, prep_err, temp_upload = prepare_wav_path_for_whisper(file_path)
+    upload_paths, prep_err, temp_upload = prepare_paths_for_transcription(file_path)
     if prep_err is not None:
         return prep_err
+    if not upload_paths:
+        return "Whisper returned empty text."
     _p(6)
     try:
-        upl_sz = 0
-        try:
-            upl_sz = int(upload_path.stat().st_size)
-        except OSError:
-            pass
-        if upl_sz >= WHISPER_SKIP_SINGLE_FILE_BYTES:
-            _p(10)
-            return _transcribe_audio_openai_chunked(
+        transcripts: List[str] = []
+        n_uploads = max(len(upload_paths), 1)
+        for idx, upload_path in enumerate(upload_paths):
+            def _part_progress(pct: int, _idx: int = idx) -> None:
+                base = 6 + int(92 * (_idx / n_uploads))
+                span = max(1, int(92 / n_uploads))
+                _p(base + int(span * min(100, max(0, int(pct))) / 100))
+
+            result = _transcribe_prepared_upload_openai(
                 upload_path,
                 language,
                 prompt=prompt,
                 temperature=temperature,
-                progress=_p,
+                on_part=on_part,
+                progress=_part_progress,
             )
-        first_try = _transcribe_audio_openai_single(
-            upload_path,
-            language,
-            prompt=prompt,
-            temperature=temperature,
-            progress=_p,
-        )
-        if _whisper_context_too_long_error(first_try):
-            _p(92)
-            return _transcribe_audio_openai_chunked(
-                upload_path,
-                language,
-                prompt=prompt,
-                temperature=temperature,
-                progress=_p,
-            )
+            if _is_likely_api_error_message_global(result):
+                return result
+            if result.strip():
+                transcripts.append(result.strip())
         _p(99)
-        return first_try
+        merged = clean_whisper_transcript(" ".join(transcripts).strip(), language)
+        return merged or "Whisper returned empty text."
     finally:
         if temp_upload is not None:
-            try:
-                temp_upload.unlink(missing_ok=True)
-            except OSError:
-                pass
+            _cleanup_transcription_temp(temp_upload)
 
 
 def archive_journal_recording(wav_path: Path) -> Optional[Path]:
@@ -3143,27 +3514,40 @@ def record_microphone_session_wav(
     return None
 
 
-def generate_journal_report_from_sources(journal_text: str, speech_transcript: str) -> str:
+def generate_journal_report_from_sources(
+    journal_text: str,
+    speech_transcript: str,
+    *,
+    progress: Optional[Callable[[str], None]] = None,
+) -> str:
     system_message = (
         "You produce clear, professional summaries of daily work notes. "
         "Highlight key activities, decisions, blockers, and suggested follow-ups. "
         "Use short sections with bullets where appropriate."
     )
+    if progress is not None:
+        try:
+            progress("Preparing report")
+        except Exception:
+            pass
     user_content = (
         "### Journal text\n"
-        + (journal_text.strip() or "(empty)")
+        + (normalize_journal_text_punctuation(journal_text.strip()) or "(empty)")
         + "\n\n### Speech-to-text transcript\n"
-        + (speech_transcript.strip() or "(none)")
+        + (normalize_journal_text_punctuation(speech_transcript.strip()) or "(none)")
     )
     messages: List[Dict[str, object]] = [
         {"role": "system", "content": system_message},
         {"role": "user", "content": user_content},
     ]
-    return chat_completion(
+    return normalize_journal_text_punctuation(chat_completion(
         messages,
         model=OPENAI_THINKING_MODEL,
         reasoning_effort="high",
-    )
+        progress=progress,
+        timeout_sec=180,
+        attempts=4,
+    ))
 
 
 def open_journal_window_editor(
@@ -3186,9 +3570,11 @@ def open_journal_window_editor(
     edit_target_sheet = ""
     edit_target_row = 0
     if draft_data:
-        draft_text = str(draft_data.get("text", "") or "")
-        draft_speech = str(draft_data.get("speech_transcript", "") or "")
-        draft_report = str(draft_data.get("ai_report", "") or "")
+        draft_text = normalize_journal_text_punctuation(str(draft_data.get("text", "") or ""))
+        draft_speech = normalize_journal_text_punctuation(
+            str(draft_data.get("speech_transcript", "") or "")
+        )
+        draft_report = normalize_journal_text_punctuation(str(draft_data.get("ai_report", "") or ""))
         draft_date = str(draft_data.get("date", default_date) or default_date)
         draft_time = str(draft_data.get("time", default_time) or default_time)
         edit_target_sheet = str(draft_data.get("edit_target_sheet", "") or "")
@@ -3854,7 +4240,7 @@ def open_journal_window_editor(
         relief="flat",
         padx=12,
         pady=12,
-        font=("Segoe UI", 11),
+        font=(JOURNAL_TEXT_FONT_FAMILY, 11),
         highlightthickness=1,
         highlightbackground=t_init.border,
         highlightcolor=t_init.accent,
@@ -4016,7 +4402,7 @@ def open_journal_window_editor(
         relief="flat",
         padx=10,
         pady=10,
-        font=("Segoe UI", 10),
+        font=(JOURNAL_TEXT_FONT_FAMILY, 10),
         highlightthickness=1,
         highlightbackground=t_init.border,
         highlightcolor=t_init.accent,
@@ -4054,6 +4440,23 @@ def open_journal_window_editor(
         cursor="hand2",
     )
     transcribe_btn.pack()
+    transcribe_file_btn = tk.Button(
+        transcribe_hover,
+        text="Transcribe File",
+        state="disabled",
+        width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+        bg=_tid[0],
+        fg=_tid[1],
+        activebackground=_tid[2],
+        activeforeground=_tid[3],
+        disabledforeground=_tid[4],
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=8,
+        cursor="hand2",
+    )
+    transcribe_file_btn.pack(pady=(6, 0))
     stt_box.insert("1.0", draft_speech)
 
     report_outer = tk.Frame(right_col, bg=t_init.surface)
@@ -4099,7 +4502,7 @@ def open_journal_window_editor(
         relief="flat",
         padx=10,
         pady=10,
-        font=("Segoe UI", 10),
+        font=(JOURNAL_TEXT_FONT_FAMILY, 10),
         highlightthickness=1,
         highlightbackground=t_init.border,
         highlightcolor=t_init.accent,
@@ -4191,7 +4594,7 @@ def open_journal_window_editor(
         recap_top.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         recap_top.grid_columnconfigure(4, weight=1)
 
-        recap_thinking_var = tk.BooleanVar(value=False)
+        recap_thinking_var = tk.BooleanVar(value=True)
         recap_thinking_chk = tk.Checkbutton(
             recap_top,
             text=tr("recap.thinking"),
@@ -4204,6 +4607,7 @@ def open_journal_window_editor(
             font=("Segoe UI", 9),
         )
         recap_thinking_chk.grid(row=0, column=0, padx=(10, 8), pady=8, sticky="w")
+        bind_hover_tooltip(recap_thinking_chk, lambda: tr("tip.thinking_model"))
 
         recap_from_fr = tk.Frame(recap_top, bg=t0.panel)
         recap_from_fr.grid(row=0, column=1, padx=(0, 10), pady=8, sticky="w")
@@ -4243,7 +4647,7 @@ def open_journal_window_editor(
             ).pack(side="left")
 
         recap_to_var = tk.BooleanVar(value=False)
-        recap_all_journal_var = tk.BooleanVar(value=False)
+        recap_all_journal_var = tk.BooleanVar(value=True)
         recap_to_wrap = tk.Frame(recap_top, bg=t0.panel)
         recap_to_wrap.grid(row=0, column=2, padx=(0, 8), pady=8, sticky="w")
         recap_to_chk = tk.Checkbutton(
@@ -4426,6 +4830,18 @@ def open_journal_window_editor(
             busy = bool(recap_session.get("busy"))
             if recap_all_journal_var.get():
                 try:
+                    recap_from_fr.grid_remove()
+                except tk.TclError:
+                    pass
+                try:
+                    recap_to_wrap.grid_remove()
+                except tk.TclError:
+                    pass
+                try:
+                    recap_through_fr.grid_remove()
+                except tk.TclError:
+                    pass
+                try:
                     recap_cal_row.grid_remove()
                 except tk.TclError:
                     pass
@@ -4448,6 +4864,14 @@ def open_journal_window_editor(
                 recap_all_journal_chk.config(state=("disabled" if busy else "normal"))
                 recap_update_sel_label()
                 return
+            try:
+                recap_from_fr.grid(row=0, column=1, padx=(0, 10), pady=8, sticky="w")
+            except tk.TclError:
+                pass
+            try:
+                recap_to_wrap.grid(row=0, column=2, padx=(0, 8), pady=8, sticky="w")
+            except tk.TclError:
+                pass
             if recap_from_de is not None:
                 try:
                     recap_from_de.config(state=("disabled" if busy else "normal"))
@@ -4486,8 +4910,9 @@ def open_journal_window_editor(
 
         def on_recap_to_mode(*_a: Any) -> None:
             if recap_to_var.get():
-                recap_through_fr.grid(row=0, column=3, padx=(0, 8), pady=8, sticky="w")
-                recap_cal_row.grid_remove()
+                if not recap_all_journal_var.get():
+                    recap_through_fr.grid(row=0, column=3, padx=(0, 8), pady=8, sticky="w")
+                    recap_cal_row.grid_remove()
                 if len(recap_selected_dates) == 1 and DateEntry is not None:
                     only = next(iter(recap_selected_dates))
                     if recap_from_de is not None and recap_to_de is not None:
@@ -4498,7 +4923,8 @@ def open_journal_window_editor(
                             pass
             else:
                 recap_through_fr.grid_remove()
-                recap_cal_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+                if not recap_all_journal_var.get():
+                    recap_cal_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
                 recap_refresh_cal_marks()
                 recap_update_sel_label()
                 recap_sync_to_checkbox()
@@ -4506,7 +4932,6 @@ def open_journal_window_editor(
 
         recap_to_var.trace_add("write", lambda *_: on_recap_to_mode())
         recap_through_fr.grid_remove()
-        recap_cal_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         recap_refresh_date_controls()
 
         recap_mid = tk.Frame(recap_wrap, bg=t0.surface)
@@ -4752,7 +5177,7 @@ def open_journal_window_editor(
             recap_session["messages"].clear()
             recap_session["bootstrapped"] = False
             recap_session["busy"] = False
-            recap_all_journal_var.set(False)
+            recap_all_journal_var.set(True)
             recap_pending_images.clear()
             recap_pending_files.clear()
             recap_refresh_pending_lbl()
@@ -4967,7 +5392,7 @@ def open_journal_window_editor(
 
         cb_attach = tk.Frame(cb_wrap, bg=t0.surface)
         cb_attach.grid(row=2, column=0, sticky="ew", pady=(0, 4))
-        cb_thinking_var = tk.BooleanVar(value=False)
+        cb_thinking_var = tk.BooleanVar(value=True)
         cb_thinking_chk = tk.Checkbutton(
             cb_attach,
             text=tr("chatbot.thinking"),
@@ -4980,6 +5405,7 @@ def open_journal_window_editor(
             font=("Segoe UI", 9),
         )
         cb_thinking_chk.pack(side="left")
+        bind_hover_tooltip(cb_thinking_chk, lambda: tr("tip.thinking_model"))
         cb_pending_lbl = tk.Label(
             cb_attach,
             text=tr("recap.attachments", what=tr("recap.attachments_none")),
@@ -6366,9 +6792,11 @@ def open_journal_window_editor(
             edit_target_row = 0
         is_edit_mode["v"] = bool(edit_target_sheet and edit_target_row > 0)
 
-        new_text = str(values.get("text", "") or "")
-        new_speech = str(values.get("speech_transcript", "") or "")
-        new_report = str(values.get("ai_report", "") or "")
+        new_text = normalize_journal_text_punctuation(str(values.get("text", "") or ""))
+        new_speech = normalize_journal_text_punctuation(
+            str(values.get("speech_transcript", "") or "")
+        )
+        new_report = normalize_journal_text_punctuation(str(values.get("ai_report", "") or ""))
         new_date = str(values.get("date", "") or "")
         new_time = str(values.get("time", "") or "")
 
@@ -6418,11 +6846,17 @@ def open_journal_window_editor(
         is_edit_mode["v"] = False
 
         text_box.delete("1.0", "end")
-        text_box.insert("1.0", str(draft.get("text", "") or ""))
+        text_box.insert("1.0", normalize_journal_text_punctuation(str(draft.get("text", "") or "")))
         stt_box.delete("1.0", "end")
-        stt_box.insert("1.0", str(draft.get("speech_transcript", "") or ""))
+        stt_box.insert(
+            "1.0",
+            normalize_journal_text_punctuation(str(draft.get("speech_transcript", "") or "")),
+        )
         report_box.delete("1.0", "end")
-        report_box.insert("1.0", str(draft.get("ai_report", "") or ""))
+        report_box.insert(
+            "1.0",
+            normalize_journal_text_punctuation(str(draft.get("ai_report", "") or "")),
+        )
 
         draft_date = str(draft.get("date", "") or "").strip()
         draft_time = str(draft.get("time", "") or "").strip()
@@ -6534,6 +6968,8 @@ def open_journal_window_editor(
     record_thread_holder: Dict[str, object] = {"thread": None}
     record_path_holder: Dict[str, object] = {"path": None}
     recording_ui_busy = {"v": False}
+    recording_background_mode = {"v": False}
+    record_close_requested = {"v": False}
     last_journal_wav: Dict[str, Optional[Path]] = {"path": None}
     transcribing_busy = {"v": False}
     transcribing_progress: Dict[str, int] = {"v": 0}
@@ -6618,6 +7054,30 @@ def open_journal_window_editor(
 
     def update_transcribe_ui() -> None:
         t = th()
+
+        def _set_transcribe_file_button_enabled(enabled: bool) -> None:
+            if enabled:
+                bg, fg, abg, afg = t.side_action_config()
+                transcribe_file_btn.config(
+                    state="normal",
+                    width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+                    bg=bg,
+                    fg=fg,
+                    activebackground=abg,
+                    activeforeground=afg,
+                )
+            else:
+                tb = t.transcribe_idle_disabled_config()
+                transcribe_file_btn.config(
+                    state="disabled",
+                    width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+                    bg=tb[0],
+                    fg=tb[1],
+                    activebackground=tb[2],
+                    activeforeground=tb[3],
+                    disabledforeground=tb[4],
+                )
+
         if transcribing_busy["v"]:
             tb = t.transcribe_busy_config()
             transcribe_btn.config(
@@ -6629,6 +7089,7 @@ def open_journal_window_editor(
                 activeforeground=tb[3],
                 disabledforeground=tb[4],
             )
+            _set_transcribe_file_button_enabled(False)
             return
         if recording_ui_busy["v"]:
             tb = t.transcribe_idle_disabled_config()
@@ -6641,7 +7102,9 @@ def open_journal_window_editor(
                 activeforeground=tb[3],
                 disabledforeground=tb[4],
             )
+            _set_transcribe_file_button_enabled(False)
             return
+        _set_transcribe_file_button_enabled(filedialog is not None)
         p = last_journal_wav.get("path")
         has_session = p is not None and isinstance(p, Path) and p.exists()
         has_archived = latest_archived_journal_wav() is not None
@@ -6680,8 +7143,85 @@ def open_journal_window_editor(
             return tr("journal.transcribe_tooltip_archived")
         return tr("journal.transcribe_tooltip_no_recording").format(dir=str(RECORDING_DIR))
 
-    def run_transcribe() -> None:
+    def transcribe_file_tooltip_text() -> str:
         if transcribing_busy["v"]:
+            pct = int(transcribing_progress.get("v", 0))
+            return tr("journal.transcribe_tooltip_busy_full").format(pct=pct)
+        if recording_ui_busy["v"]:
+            return tr("journal.transcribe_tooltip_wait_recording")
+        return tr("journal.transcribe_file_tooltip")
+
+    def begin_transcribe_path(use_path: Path, *, display_path: Optional[Path] = None) -> None:
+        if not use_path.exists():
+            messagebox.showinfo("Speech to text", f"That file is no longer on disk:\n{use_path}")
+            update_transcribe_ui()
+            return
+        if not get_openai_api_key():
+            messagebox.showerror(
+                "Speech to text",
+                "No OpenAI API key. Use TOKEN ADD in the main menu or set OPENAI_API_KEY.",
+            )
+            return
+        if display_path is not None:
+            _set_stt_saved_path_display(f"Selected: {display_path}")
+        transcribing_progress["v"] = 0
+
+        def schedule_progress(pct: int) -> None:
+            p = min(100, max(0, int(pct)))
+            transcribing_progress["v"] = p
+
+            def _ui() -> None:
+                try:
+                    stt_status.config(text=f"Transcribingâ€¦ ({p}%)")
+                except tk.TclError:
+                    pass
+
+            root.after(0, _ui)
+
+        transcribing_busy["v"] = True
+        update_transcribe_ui()
+        schedule_progress(0)
+        lang_snap = _language_code_for_whisper()
+
+        def work() -> None:
+            result = ""
+            try:
+                result = transcribe_audio_openai(
+                    use_path,
+                    lang_snap,
+                    temperature=0.0,
+                    progress=schedule_progress,
+                )
+            except BaseException as _tw_exc:
+                result = f"Whisper request failed: {_tw_exc}"
+            finally:
+                try:
+                    schedule_progress(100)
+                except Exception:
+                    pass
+
+            def done() -> None:
+                transcribing_busy["v"] = False
+                transcribing_progress["v"] = 0
+                update_transcribe_ui()
+                stt_status.config(text="")
+                if _is_likely_api_error_message(result):
+                    messagebox.showerror("Speech to text", result[:4000])
+                    return
+                final_text = normalize_journal_text_punctuation(result.strip())
+                if final_text:
+                    if stt_box.get("1.0", "end-1c").strip():
+                        stt_box.insert("end", " ")
+                    stt_box.insert("end", final_text)
+                save_draft()
+                refresh_save_entry_state()
+
+            root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def run_transcribe() -> None:
+        if transcribing_busy["v"] or recording_ui_busy["v"]:
             return
         p = last_journal_wav.get("path")
         cleared_stale_cache = False
@@ -6777,7 +7317,7 @@ def open_journal_window_editor(
                 if _is_likely_api_error_message(result):
                     messagebox.showerror("Speech to text", result[:4000])
                     return
-                final_text = result.strip()
+                final_text = normalize_journal_text_punctuation(result.strip())
                 if final_text:
                     if stt_box.get("1.0", "end-1c").strip():
                         stt_box.insert("end", " ")
@@ -6789,8 +7329,179 @@ def open_journal_window_editor(
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _transcription_file_sort_key(path: Path) -> Tuple[float, str, str]:
+        try:
+            mtime = float(path.stat().st_mtime)
+        except OSError:
+            mtime = float("inf")
+        return (mtime, path.name.lower(), str(path).lower())
+
+    def begin_transcribe_paths(use_paths: List[Path]) -> None:
+        ordered_paths = sorted(use_paths, key=_transcription_file_sort_key)
+        if not ordered_paths:
+            return
+        missing = [p for p in ordered_paths if not p.exists()]
+        if missing:
+            messagebox.showinfo("Speech to text", f"That file is no longer on disk:\n{missing[0]}")
+            update_transcribe_ui()
+            return
+        if not get_openai_api_key():
+            messagebox.showerror(
+                "Speech to text",
+                "No OpenAI API key. Use TOKEN ADD in the main menu or set OPENAI_API_KEY.",
+            )
+            return
+        if len(ordered_paths) == 1:
+            _set_stt_saved_path_display(f"Selected: {ordered_paths[0]}")
+        else:
+            _set_stt_saved_path_display(f"Selected: {len(ordered_paths)} files")
+        transcribing_progress["v"] = 0
+
+        def schedule_progress(file_index: int, file_count: int, pct: int, filename: str) -> None:
+            part_pct = min(100, max(0, int(pct)))
+            total_pct = min(
+                100,
+                max(0, int(((file_index + (part_pct / 100.0)) / max(file_count, 1)) * 100)),
+            )
+            transcribing_progress["v"] = total_pct
+
+            def _ui() -> None:
+                try:
+                    stt_status.config(
+                        text=f"Transcribing {file_index + 1}/{file_count}: {filename} ({part_pct}%)"
+                    )
+                except tk.TclError:
+                    pass
+
+            root.after(0, _ui)
+
+        def append_transcribed_text(text: str) -> None:
+            final_text = normalize_journal_text_punctuation((text or "").strip())
+            if not final_text:
+                return
+
+            def _ui() -> None:
+                try:
+                    if stt_box.get("1.0", "end-1c").strip():
+                        stt_box.insert("end", " ")
+                    stt_box.insert("end", final_text)
+                    save_draft()
+                    refresh_save_entry_state()
+                except tk.TclError:
+                    pass
+
+            root.after(0, _ui)
+
+        def _is_skippable_file_transcribe_error(text: str) -> bool:
+            t = (text or "").strip()
+            if not t:
+                return False
+            prefixes = (
+                "No audio track found",
+                "Unsupported transcription file type",
+                "That media file is too large",
+                "That iPhone video is too large",
+                "The selected media is still too large",
+                "Could not prepare iPhone video",
+                "Could not extract audio",
+                "No speech detected",
+                "Empty audio.",
+            )
+            return any(t.startswith(prefix) for prefix in prefixes)
+
+        transcribing_busy["v"] = True
+        update_transcribe_ui()
+        schedule_progress(0, len(ordered_paths), 0, ordered_paths[0].name)
+        lang_snap = _language_code_for_whisper()
+
+        def work() -> None:
+            error_result = ""
+            skipped_results: List[str] = []
+            try:
+                for file_index, use_path in enumerate(ordered_paths):
+                    def _file_progress(pct: int, _idx: int = file_index, _path: Path = use_path) -> None:
+                        schedule_progress(_idx, len(ordered_paths), pct, _path.name)
+
+                    result = transcribe_audio_openai(
+                        use_path,
+                        lang_snap,
+                        temperature=0.0,
+                        on_part=append_transcribed_text,
+                        progress=_file_progress,
+                    )
+                    if _is_likely_api_error_message(result):
+                        if _is_skippable_file_transcribe_error(result):
+                            skipped_results.append(f"{use_path.name}: {result}")
+                            schedule_progress(file_index, len(ordered_paths), 100, use_path.name)
+                            continue
+                        error_result = result
+                        break
+                    schedule_progress(file_index, len(ordered_paths), 100, use_path.name)
+            except BaseException as _tw_exc:
+                error_result = f"Whisper request failed: {_tw_exc}"
+            finally:
+                try:
+                    if not error_result and ordered_paths:
+                        schedule_progress(len(ordered_paths) - 1, len(ordered_paths), 100, ordered_paths[-1].name)
+                except Exception:
+                    pass
+
+            def done() -> None:
+                transcribing_busy["v"] = False
+                transcribing_progress["v"] = 0
+                update_transcribe_ui()
+                stt_status.config(text="")
+                if error_result:
+                    messagebox.showerror("Speech to text", error_result[:4000])
+                    return
+                if skipped_results:
+                    preview = "\n".join(skipped_results[:12])
+                    if len(skipped_results) > 12:
+                        preview += f"\n...and {len(skipped_results) - 12} more."
+                    messagebox.showinfo(
+                        "Speech to text",
+                        f"Skipped {len(skipped_results)} file(s) that could not be transcribed:\n{preview}"[:4000],
+                    )
+                save_draft()
+                refresh_save_entry_state()
+
+            root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def run_transcribe_file() -> None:
+        if transcribing_busy["v"] or recording_ui_busy["v"]:
+            return
+        if filedialog is None:
+            messagebox.showerror("Speech to text", "File selection is not available.")
+            return
+        try:
+            RECORDING_DIR.mkdir(parents=True, exist_ok=True)
+            initial_dir = str(RECORDING_DIR)
+        except OSError:
+            initial_dir = str(DATA_DIR)
+        selected = filedialog.askopenfilenames(
+            title="Choose files to transcribe",
+            initialdir=initial_dir,
+            filetypes=[
+                (
+                    "Transcribable media",
+                    "*.wav *.mp3 *.m4a *.mp4 *.mov *.webm *.mpeg *.mpga *.flac *.ogg",
+                ),
+                ("iPhone videos", "*.mov *.mp4"),
+                ("Audio files", "*.wav *.mp3 *.m4a *.mpeg *.mpga *.flac *.ogg"),
+                ("Video files", "*.mp4 *.mov *.webm"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not selected:
+            return
+        begin_transcribe_paths([Path(p) for p in selected])
+
     transcribe_btn.config(command=run_transcribe)
+    transcribe_file_btn.config(command=run_transcribe_file)
     bind_hover_tooltip(transcribe_btn, transcribe_tooltip_text)
+    bind_hover_tooltip(transcribe_file_btn, transcribe_file_tooltip_text)
 
     def transcribe_rest_style() -> Tuple[str, str, str, str, str]:
         t = th()
@@ -6808,9 +7519,22 @@ def open_journal_window_editor(
         b0, b1, b2, b3, b4 = t.transcribe_idle_disabled_config()
         return ("disabled", b0, b1, b2, b3)
 
+    def transcribe_file_rest_style() -> Tuple[str, str, str, str, str]:
+        t = th()
+        if transcribing_busy["v"] or recording_ui_busy["v"] or filedialog is None:
+            b0, b1, b2, b3, b4 = t.transcribe_idle_disabled_config()
+            return ("disabled", b0, b1, b2, b3)
+        return t.side_action_bind_rest()
+
     bind_button_hover_if_enabled(
         transcribe_btn,
         transcribe_rest_style,
+        lambda: th().hover_primary,
+        lambda: "white",
+    )
+    bind_button_hover_if_enabled(
+        transcribe_file_btn,
+        transcribe_file_rest_style,
         lambda: th().hover_primary,
         lambda: "white",
     )
@@ -6842,9 +7566,9 @@ def open_journal_window_editor(
 
     def apply_draft_dict_to_ui(d: Dict[str, object]) -> None:
         nonlocal edit_target_sheet, edit_target_row
-        _txt = str(d.get("text", "") or "")
-        _sp = str(d.get("speech_transcript", "") or "")
-        _rp = str(d.get("ai_report", "") or "")
+        _txt = normalize_journal_text_punctuation(str(d.get("text", "") or ""))
+        _sp = normalize_journal_text_punctuation(str(d.get("speech_transcript", "") or ""))
+        _rp = normalize_journal_text_punctuation(str(d.get("ai_report", "") or ""))
         text_box.delete("1.0", "end")
         text_box.insert("1.0", _txt)
         stt_box.delete("1.0", "end")
@@ -6962,7 +7686,14 @@ def open_journal_window_editor(
             "Whisper request failed",
             "Whisper returned",
             "Whisper transcription rejected",
+            "Unsupported transcription file type",
+            "That media file is too large",
+            "That iPhone video is too large",
+            "The selected media is still too large",
+            "Could not prepare iPhone video",
+            "Could not extract audio",
             "Could not read audio file",
+            "No audio track found",
             "Recording needs optional packages",
             "No speech detected",
             "Empty audio.",
@@ -6990,10 +7721,82 @@ def open_journal_window_editor(
                 cursor="arrow",
             )
 
+    def _journal_rec_btn_set_disabled_look_clickable(btn: Any) -> None:
+        t = th()
+        btn.config(
+            state="normal",
+            bg=t.btn_disabled,
+            fg=t.disabled_fg,
+            activebackground=t.btn_disabled,
+            activeforeground=t.disabled_fg,
+            disabledforeground=t.disabled_fg,
+            cursor="hand2",
+        )
+
+    def _archive_finished_recording(wav_path: Path) -> Optional[Path]:
+        dest = archive_journal_recording(wav_path)
+        try:
+            wav_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return dest
+
+    def _reset_recording_state_after_close() -> None:
+        record_thread_holder["thread"] = None
+        record_pause.clear()
+        record_close_requested["v"] = False
+        recording_background_mode["v"] = False
+        recording_ui_busy["v"] = False
+
     def on_record_worker_finished(err: Optional[str], wav_path: Optional[Path]) -> None:
+        was_background = bool(recording_background_mode["v"])
         record_thread_holder["thread"] = None
         record_pause.clear()
         cancel_wave_tick()
+        if was_background:
+            recording_ui_busy["v"] = False
+            recording_background_mode["v"] = False
+            record_close_requested["v"] = False
+            _journal_rec_btn_set(start_rec_button, True)
+            _journal_rec_btn_set(pause_rec_button, False)
+            _journal_rec_btn_set(stop_rec_button, False)
+            pause_rec_button.config(text=tr("journal.rec.pause"))
+            if err:
+                last_journal_wav["path"] = None
+                if wav_path is not None:
+                    try:
+                        wav_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                update_transcribe_ui()
+                try:
+                    console_append(f"Background recording failed: {err}")
+                except Exception:
+                    pass
+                return
+            if wav_path is None or not wav_path.exists():
+                last_journal_wav["path"] = None
+                update_transcribe_ui()
+                try:
+                    console_append("Background recording stopped without a saved file.")
+                except Exception:
+                    pass
+                return
+            dest = _archive_finished_recording(wav_path)
+            if dest is not None:
+                last_journal_wav["path"] = dest
+                try:
+                    console_append(f"Background recording saved: {dest}")
+                except Exception:
+                    pass
+            else:
+                last_journal_wav["path"] = None
+                try:
+                    console_append(f"Background recording finished but could not copy to {RECORDING_DIR}.")
+                except Exception:
+                    pass
+            update_transcribe_ui()
+            return
         if err:
             recording_ui_busy["v"] = False
             last_journal_wav["path"] = None
@@ -7003,7 +7806,7 @@ def open_journal_window_editor(
             _journal_rec_btn_set(start_rec_button, True)
             _journal_rec_btn_set(pause_rec_button, False)
             _journal_rec_btn_set(stop_rec_button, False)
-            pause_rec_button.config(text="Pause recording")
+            pause_rec_button.config(text=tr("journal.rec.pause"))
             if ttk is not None:
                 lang_combo.config(state="readonly")
             else:
@@ -7025,23 +7828,19 @@ def open_journal_window_editor(
             _journal_rec_btn_set(start_rec_button, True)
             _journal_rec_btn_set(pause_rec_button, False)
             _journal_rec_btn_set(stop_rec_button, False)
-            pause_rec_button.config(text="Pause recording")
+            pause_rec_button.config(text=tr("journal.rec.pause"))
             if ttk is not None:
                 lang_combo.config(state="readonly")
             else:
                 lang_combo.config(state="normal")
             reset_waveform_session()
             return
-        dest = archive_journal_recording(wav_path)
-        try:
-            wav_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        dest = _archive_finished_recording(wav_path)
         recording_ui_busy["v"] = False
         _journal_rec_btn_set(start_rec_button, True)
         _journal_rec_btn_set(pause_rec_button, False)
         _journal_rec_btn_set(stop_rec_button, False)
-        pause_rec_button.config(text="Pause recording")
+        pause_rec_button.config(text=tr("journal.rec.pause"))
         if ttk is not None:
             lang_combo.config(state="readonly")
         else:
@@ -7065,53 +7864,77 @@ def open_journal_window_editor(
             record_stop,
             chunk_interval_sec=LIVE_STT_CHUNK_INTERVAL_SEC,
             on_audio_chunk=None,
-            on_pcm_block=on_pcm_block_journal,
+            on_pcm_block=(None if recording_background_mode["v"] else on_pcm_block_journal),
             pause_event=record_pause,
         )
+        if record_close_requested["v"]:
+            if err is None and wav_path.exists():
+                _archive_finished_recording(wav_path)
+            else:
+                try:
+                    wav_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            _reset_recording_state_after_close()
+            return
         root.after(0, lambda: on_record_worker_finished(err, wav_path))
 
-    def start_recording() -> None:
+    def start_recording(*, background: bool = False) -> bool:
         if recording_ui_busy["v"]:
-            return
+            return False
         fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="journal_mic_")
         os.close(fd)
         tmp = Path(tmp_name)
         record_path_holder["path"] = tmp
         last_journal_wav["path"] = None
-        update_transcribe_ui()
-        _set_stt_saved_path_display("")
         record_stop.clear()
         record_pause.clear()
+        record_close_requested["v"] = False
+        recording_background_mode["v"] = bool(background)
         recording_ui_busy["v"] = True
+        if background:
+            _journal_rec_btn_set_disabled_look_clickable(stop_rec_button)
+            th = threading.Thread(target=record_worker_main, args=(tmp,), daemon=True)
+            record_thread_holder["thread"] = th
+            th.start()
+            return True
+        update_transcribe_ui()
+        _set_stt_saved_path_display("")
         reset_waveform_session()
         start_wave_tick()
         _journal_rec_btn_set(start_rec_button, False)
         _journal_rec_btn_set(pause_rec_button, True)
         _journal_rec_btn_set(stop_rec_button, True)
-        pause_rec_button.config(text="Pause recording")
+        pause_rec_button.config(text=tr("journal.rec.pause"))
         if ttk is not None:
             lang_combo.config(state="disabled")
         else:
             lang_combo.config(state="disabled")
-        stt_status.config(text="Recording…")
+        stt_status.config(text=tr("journal.status.recording"))
         th = threading.Thread(target=record_worker_main, args=(tmp,), daemon=True)
         record_thread_holder["thread"] = th
         th.start()
+        return True
 
-    def stop_recording() -> None:
+    def stop_recording() -> bool:
         th = record_thread_holder["thread"]
         if not (
             recording_ui_busy["v"]
             and isinstance(th, threading.Thread)
             and th.is_alive()
         ):
-            return
-        stt_status.config(text="Stopping…")
+            return False
+        if not recording_background_mode["v"]:
+            stt_status.config(text=tr("journal.status.stopping"))
         record_stop.set()
         record_pause.clear()
-        _journal_rec_btn_set(start_rec_button, False)
-        _journal_rec_btn_set(pause_rec_button, False)
-        _journal_rec_btn_set(stop_rec_button, False)
+        if recording_background_mode["v"]:
+            _journal_rec_btn_set(stop_rec_button, False)
+        else:
+            _journal_rec_btn_set(start_rec_button, False)
+            _journal_rec_btn_set(pause_rec_button, False)
+            _journal_rec_btn_set(stop_rec_button, False)
+        return True
 
     def toggle_pause_recording() -> None:
         th = record_thread_holder["thread"]
@@ -7123,12 +7946,12 @@ def open_journal_window_editor(
             return
         if record_pause.is_set():
             record_pause.clear()
-            pause_rec_button.config(text="Pause recording")
-            stt_status.config(text="Recording…")
+            pause_rec_button.config(text=tr("journal.rec.pause"))
+            stt_status.config(text=tr("journal.status.recording"))
         else:
             record_pause.set()
-            pause_rec_button.config(text="Resume recording")
-            stt_status.config(text="Recording paused")
+            pause_rec_button.config(text=tr("journal.rec.resume"))
+            stt_status.config(text=tr("journal.status.paused"))
 
     _sr_bg, _sr_fg, _sr_abg, _sr_afg = t_init.side_action_config()
     start_rec_button = tk.Button(
@@ -7171,6 +7994,8 @@ def open_journal_window_editor(
 
     def rec_primary_rest(btn: Any) -> Tuple[str, str, str, str, str]:
         t = th()
+        if btn is stop_rec_button and recording_background_mode["v"]:
+            return ("disabled", t.btn_disabled, t.disabled_fg, t.btn_disabled, t.disabled_fg)
         if str(btn.cget("state")) == "normal":
             return t.side_action_bind_rest()
         return t.side_action_disabled()
@@ -7204,6 +8029,64 @@ def open_journal_window_editor(
     stt_lang_lbl.grid(row=0, column=4, sticky="w", padx=(4, 0), pady=8)
     lang_combo.grid(row=0, column=5, sticky="ew", padx=(8, 12), pady=8)
 
+    report_progress_state: Dict[str, object] = {
+        "busy": False,
+        "started_at": 0.0,
+        "message": "",
+        "job_id": 0,
+    }
+
+    def _normalize_text_widget_punctuation(widget: tk.Text) -> None:
+        try:
+            raw = widget.get("1.0", "end-1c")
+            fixed = normalize_journal_text_punctuation(raw)
+            if fixed == raw:
+                return
+            insert_index = widget.index("insert")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", fixed)
+            try:
+                widget.mark_set("insert", insert_index)
+                widget.see("insert")
+            except tk.TclError:
+                pass
+        except tk.TclError:
+            pass
+
+    def _refresh_report_progress_status(job_id: int) -> None:
+        if int(report_progress_state.get("job_id", 0) or 0) != job_id:
+            return
+        if not bool(report_progress_state.get("busy", False)):
+            return
+        started_at = float(report_progress_state.get("started_at", 0.0) or 0.0)
+        elapsed = max(0, int(time.time() - started_at)) if started_at else 0
+        message = str(report_progress_state.get("message", "") or "Generating report")
+        try:
+            report_status.config(text=f"{message} ({elapsed}s)")
+        except tk.TclError:
+            pass
+
+    def _tick_report_progress(job_id: int) -> None:
+        _refresh_report_progress_status(job_id)
+        if (
+            int(report_progress_state.get("job_id", 0) or 0) == job_id
+            and bool(report_progress_state.get("busy", False))
+        ):
+            root.after(1000, lambda: _tick_report_progress(job_id))
+
+    def _set_report_progress(message: str, job_id: int) -> None:
+        clean_message = (message or "").strip() or "Generating report"
+
+        def _ui() -> None:
+            if int(report_progress_state.get("job_id", 0) or 0) != job_id:
+                return
+            if not bool(report_progress_state.get("busy", False)):
+                return
+            report_progress_state["message"] = clean_message
+            _refresh_report_progress_status(job_id)
+
+        root.after(0, _ui)
+
     def run_generate_report() -> None:
         if not get_openai_api_key():
             messagebox.showerror(
@@ -7219,18 +8102,33 @@ def open_journal_window_editor(
             disabledforeground=t.disabled_fg,
             cursor="arrow",
         )
-        report_status.config(text="Generating…")
+        _normalize_text_widget_punctuation(text_box)
+        _normalize_text_widget_punctuation(stt_box)
+        journal_snapshot = text_box.get("1.0", "end-1c")
+        speech_snapshot = stt_box.get("1.0", "end-1c")
+        job_id = int(report_progress_state.get("job_id", 0) or 0) + 1
+        report_progress_state.update(
+            {
+                "busy": True,
+                "started_at": time.time(),
+                "message": "Preparing report",
+                "job_id": job_id,
+            }
+        )
+        _refresh_report_progress_status(job_id)
+        root.after(1000, lambda: _tick_report_progress(job_id))
 
         def work() -> None:
             body = generate_journal_report_from_sources(
-                text_box.get("1.0", "end-1c"),
-                stt_box.get("1.0", "end-1c"),
+                journal_snapshot,
+                speech_snapshot,
+                progress=lambda msg: _set_report_progress(msg, job_id),
             )
-            root.after(0, lambda b=body: on_generate_report_done(b))
+            root.after(0, lambda b=body, jid=job_id: on_generate_report_done(b, jid))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def on_generate_report_done(body: str) -> None:
+    def on_generate_report_done(body: str, job_id: int) -> None:
         t = th()
         bg, fg, abg, afg = t.side_action_config()
         gen_button.config(
@@ -7241,10 +8139,13 @@ def open_journal_window_editor(
             activeforeground=afg,
             cursor="hand2",
         )
-        report_status.config(text="")
+        if int(report_progress_state.get("job_id", 0) or 0) == job_id:
+            report_progress_state["busy"] = False
+            report_status.config(text="")
         if _is_likely_api_error_message(body):
             messagebox.showerror("AI report", body[:4000])
             return
+        body = normalize_journal_text_punctuation(body)
         report_box.delete("1.0", "end")
         report_box.insert("1.0", body.strip())
         save_draft()
@@ -7262,9 +8163,11 @@ def open_journal_window_editor(
 
     def build_draft_dict() -> Dict[str, object]:
         return {
-            "text": text_box.get("1.0", "end-1c"),
-            "speech_transcript": stt_box.get("1.0", "end-1c"),
-            "ai_report": report_box.get("1.0", "end-1c"),
+            "text": normalize_journal_text_punctuation(text_box.get("1.0", "end-1c")),
+            "speech_transcript": normalize_journal_text_punctuation(
+                stt_box.get("1.0", "end-1c")
+            ),
+            "ai_report": normalize_journal_text_punctuation(report_box.get("1.0", "end-1c")),
             "date": date_entry.get().strip(),
             "time": time_entry.get().strip(),
             "edit_target_sheet": edit_target_sheet,
@@ -7296,7 +8199,10 @@ def open_journal_window_editor(
         if normalized_time is None:
             messagebox.showerror("Journal Window", "Invalid time. Example: 2:03PM")
             return
-        text_value = text_box.get("1.0", "end-1c").strip()
+        _normalize_text_widget_punctuation(text_box)
+        _normalize_text_widget_punctuation(stt_box)
+        _normalize_text_widget_punctuation(report_box)
+        text_value = normalize_journal_text_punctuation(text_box.get("1.0", "end-1c")).strip()
         if not text_value and is_edit_mode["v"]:
             should_delete = messagebox.askyesno(
                 "Clear Entry",
@@ -7319,8 +8225,8 @@ def open_journal_window_editor(
             return
         if not text_value:
             text_value = "(no details entered)"
-        speech_value = stt_box.get("1.0", "end-1c").strip()
-        report_value = report_box.get("1.0", "end-1c").strip()
+        speech_value = normalize_journal_text_punctuation(stt_box.get("1.0", "end-1c")).strip()
+        report_value = normalize_journal_text_punctuation(report_box.get("1.0", "end-1c")).strip()
         row_payload = [date_value, normalized_time, text_value, speech_value, report_value]
         if edit_target_sheet and edit_target_row > 0:
             saved_ok = update_journal_entry_at(
@@ -7342,7 +8248,24 @@ def open_journal_window_editor(
             root.after_cancel(autosave_id["value"])
         destroy_journal_window()
 
+    def stop_active_recording_for_close() -> None:
+        th = record_thread_holder.get("thread")
+        if not (
+            recording_ui_busy["v"]
+            and isinstance(th, threading.Thread)
+            and th.is_alive()
+        ):
+            return
+        record_close_requested["v"] = True
+        record_stop.set()
+        record_pause.clear()
+        try:
+            th.join(timeout=12)
+        except RuntimeError:
+            pass
+
     def on_close(event=None) -> None:
+        stop_active_recording_for_close()
         has_content = any(
             [
                 text_box.get("1.0", "end-1c").strip(),
@@ -7403,6 +8326,24 @@ def open_journal_window_editor(
             console_history.append(raw)
         console_hist_index["value"] = len(console_history)
         cmd = raw.upper()
+        if cmd in {"RC", "RECORD"}:
+            if transcribing_busy["v"]:
+                console_append("Finish the current transcription before starting a background recording.")
+                return
+            if recording_ui_busy["v"]:
+                console_append("Recording is already running. Type RECORD STOP or rs to stop it.")
+                return
+            if start_recording(background=True):
+                console_append("Background recording started. Type RECORD STOP or rs to stop and save it.")
+            else:
+                console_append("Could not start background recording.")
+            return
+        if cmd in {"RS", "RECORD STOP", "RECORDSTOP"}:
+            if stop_recording():
+                console_append("Stopping recording; it will save to the Recording folder.")
+            else:
+                console_append("No active recording to stop.")
+            return
         if bool(js_gui_state.get("active")):
             # First token after JS is treated as "journal_settings_menu" choice.
             # This mirrors the old CLI menu, but stays non-blocking for the Tk GUI.
@@ -7860,6 +8801,7 @@ def open_journal_window_editor(
         open_recording_btn.config(text=tr("journal.open"))
         stt_lang_lbl.config(text=tr("journal.lang_label"))
         transcribe_btn.config(text=tr("journal.transcribe"))
+        transcribe_file_btn.config(text=tr("journal.transcribe_file"))
         gen_button.config(text=tr("journal.generate_report"))
         save_entry_btn.config(text=tr("journal.save_entry"))
         start_rec_button.config(text=tr("journal.rec.start"))
@@ -8205,7 +9147,10 @@ def open_journal_window_editor(
             )
         update_transcribe_ui()
         for _b in (start_rec_button, pause_rec_button, stop_rec_button):
-            _journal_rec_btn_set(_b, str(_b.cget("state")) == "normal")
+            if _b is stop_rec_button and recording_background_mode["v"]:
+                _journal_rec_btn_set_disabled_look_clickable(_b)
+            else:
+                _journal_rec_btn_set(_b, str(_b.cget("state")) == "normal")
         button_row.configure(bg=t.surface)
         button_row.pack_configure(padx=t.pad_outer, pady=(0, t.pad_button_y))
         refresh_save_entry_state()
@@ -8271,7 +9216,8 @@ def open_journal_window_editor(
             anchor="w",
             cursor="hand2",
         )
-        _btn.grid(row=_idx, column=0, sticky="ew", padx=10, pady=(0, 8))
+        _nav_row = 5 if _key == "console" else _idx
+        _btn.grid(row=_nav_row, column=0, sticky="ew", padx=10, pady=(0, 8))
         nav_buttons[_key] = _btn
         bind_button_hover_if_enabled(
             _btn,
@@ -8309,7 +9255,7 @@ def open_journal_window_editor(
         highlightthickness=0,
     )
     _virtual_reader_nav_btn_slot[0] = _vr_nav_btn
-    _vr_nav_btn.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 8))
+    _vr_nav_btn.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 8))
     nav_extra_buttons.append(_vr_nav_btn)
     bind_button_hover_if_enabled(
         _vr_nav_btn,
@@ -8574,11 +9520,24 @@ def chat_completion(
     messages: List[Dict[str, object]],
     model: str = OPENAI_MODEL,
     reasoning_effort: Optional[str] = None,
+    *,
+    progress: Optional[Callable[[str], None]] = None,
+    timeout_sec: float = 60,
+    attempts: int = 3,
 ) -> str:
     api_key = get_openai_api_key()
     if not api_key:
         return "OPENAI_API_KEY is not set. Set it, then try again."
 
+    def _notify(message: str) -> None:
+        if progress is None:
+            return
+        try:
+            progress(message)
+        except Exception:
+            pass
+
+    _notify("Preparing request")
     chat_url = get_chat_completions_url()
     payload_data: Dict[str, object] = {
         "model": model,
@@ -8587,21 +9546,24 @@ def chat_completion(
     if reasoning_effort:
         payload_data["reasoning_effort"] = reasoning_effort
     payload = json.dumps(payload_data).encode("utf-8")
-    req = request.Request(
-        chat_url,
-        data=payload,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
 
     body = None
     last_exception: Optional[Exception] = None
-    for attempt in range(3):
+    attempt_count = max(1, int(attempts))
+    for attempt in range(attempt_count):
+        req = request.Request(
+            chat_url,
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
         try:
-            with request.urlopen(req, timeout=60) as response:
+            _notify(f"Contacting AI ({attempt + 1}/{attempt_count})")
+            with request.urlopen(req, timeout=timeout_sec) as response:
+                _notify("Reading response")
                 body = response.read().decode("utf-8")
                 break
         except error.HTTPError as exc:
@@ -8612,8 +9574,10 @@ def chat_completion(
             return f"ChatGPT API error ({exc.code}): {details}"
         except Exception as exc:
             last_exception = exc
-            if attempt < 2:
-                time.sleep(2 * (attempt + 1))
+            if attempt < attempt_count - 1:
+                delay = 2 * (attempt + 1)
+                _notify(f"Connection issue, retrying in {delay}s ({attempt + 2}/{attempt_count})")
+                time.sleep(delay)
             continue
 
     if body is None:
@@ -8625,6 +9589,7 @@ def chat_completion(
         )
 
     try:
+        _notify("Formatting report")
         parsed = json.loads(body)
         return parsed["choices"][0]["message"]["content"].strip()
     except Exception:
@@ -9475,6 +10440,8 @@ def print_main_help() -> None:
     print("      Examples: R notes.txt | RT daily_logs/meeting.md")
     print("  C      - Chatbot")
     print("  CT     - Chatbot (thinking)")
+    print("  RC / RECORD - start background recording")
+    print("  RS / RECORD STOP - stop background recording and save it")
     print("  H/HELP - show this help")
     print("  J SETTINGS / J SETTING / JOURNAL SETTINGS / JS - open journal command menu")
     print("  RENAME - change app name")
@@ -9834,6 +10801,10 @@ MAIN_MENU_COMPLETIONS: Tuple[str, ...] = tuple(
             "JS",
             "R",
             "R ",
+            "RC",
+            "RECORD",
+            "RECORD STOP",
+            "RS",
             "RT",
             "RT ",
             "C",

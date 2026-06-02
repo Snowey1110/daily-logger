@@ -6114,6 +6114,12 @@
    'C:\\Users\\LixiaoKuang\\OneDrive - VisionNav Robotics USA '
    'inc\\Desktop\\Code\\build\\DailyLogger\\base_library.zip',
    'DATA'),
+  ('imageio_ffmpeg\\binaries\\README.md',
+   'C:\\Users\\LixiaoKuang\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\imageio_ffmpeg\\binaries\\README.md',
+   'DATA'),
+  ('imageio_ffmpeg\\binaries\\ffmpeg-win-x86_64-v7.1.exe',
+   'C:\\Users\\LixiaoKuang\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\imageio_ffmpeg\\binaries\\ffmpeg-win-x86_64-v7.1.exe',
+   'BINARY'),
   ('libcrypto-3.dll',
    'C:\\Users\\LixiaoKuang\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\libcrypto-3.dll',
    'BINARY'),
