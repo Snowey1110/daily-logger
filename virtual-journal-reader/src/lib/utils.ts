@@ -35,6 +35,8 @@ export interface PageImage {
 
 export interface PageOverlay {
   entryId: string;
+  pageKey?: string;
+  pageKind?: 'journal-left' | 'journal-overflow' | 'speech' | 'ai';
   sketchDataUrl?: string;
   images: PageImage[];
   layerOrder: ('text' | 'sketch' | 'images')[];

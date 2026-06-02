@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef, useLayoutEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn, JournalEntry, JournalSection, PositionedSketch, PageImage, PageOverlay } from '../lib/utils';
@@ -13,20 +13,24 @@ import { ChevronLeft, ChevronRight, Type, MessageSquare, BrainCircuit, X, GripVe
 import { useReaderT } from '../readerI18n';
 import { useTheme } from './ThemeProvider';
 import type { JournalTheme } from '../types/theme';
+import { journalMeasureRuntime, splitTextIntoJournalPages } from '../lib/journalPagination';
 
 export type JournalAction = 'sketch' | 'edit';
+
+type ReaderPageKind = 'journal-left' | 'journal-overflow' | 'speech' | 'ai';
 
 interface PageContent {
   type: 'text' | 'sketch' | 'empty';
   content?: string;
+  pageKey?: string;
+  pageKind?: ReaderPageKind;
   journalPage?: number;
   secondaryPage?: number;
   sourceEntryId?: string;
   sourceDate?: string;
   sourceTime?: string;
   showJournalEntryHeader?: boolean;
-  /** When journal text is empty, indicates which section was used as fallback on the left page */
-  leftFallbackSection?: 'stt' | 'ai';
+  journalOverflow?: boolean;
 }
 
 interface Spread {
@@ -36,6 +40,27 @@ interface Spread {
   left: PageContent;
   right: PageContent;
   isFirstSpread: boolean;
+}
+
+interface InlineEditTarget {
+  entryId: string;
+  pageKey: string;
+  pageKind: ReaderPageKind;
+  defaultLayer: LayerKind;
+  side: 'left' | 'right';
+}
+
+interface InlineSavePayload {
+  entryId: string;
+  pageKey: string;
+  pageKind: ReaderPageKind;
+  text: string;
+  sketchDataUrl: string;
+  images: PageImage[];
+  layerOrder: LayerKind[];
+  activeLayer: LayerKind;
+  date: string;
+  time: string;
 }
 
 /* ──── localStorage helpers ──── */
@@ -60,39 +85,43 @@ function isoToDisplayDate(iso: string): string {
   return m ? `${m[2]}/${m[3]}/${m[1]}` : iso;
 }
 
-/* ──── helpers for building left-page content ──── */
+function pageKeyFor(entryId: string, pageKind: ReaderPageKind): string {
+  return `${entryId}::${pageKind}`;
+}
 
-function buildLeftPage(
+function entryIdFromPageKey(pageKey: string): string {
+  return pageKey.includes('::') ? pageKey.split('::', 1)[0] : pageKey;
+}
+
+function pageKindFromPageKey(pageKey: string): ReaderPageKind {
+  const raw = pageKey.includes('::') ? pageKey.split('::')[1] : 'journal-left';
+  return raw === 'journal-overflow' || raw === 'speech' || raw === 'ai' ? raw : 'journal-left';
+}
+
+/* ──── helpers for building entry-centered spreads ──── */
+
+function buildJournalPage(
   entry: JournalEntry,
   displayDate: string,
   displayTime: string,
-): { left: PageContent; leftFallback: 'journal' | 'stt' | 'ai' } {
-  const journalText = (entry.journal || '').trim();
-  const sttText = (entry.speechToText || '').trim();
-  const aiText = (entry.aiReport || '').trim();
-
-  let leftFallback: 'journal' | 'stt' | 'ai' = 'journal';
-  let leftText = journalText;
-  if (!leftText && sttText) {
-    leftFallback = 'stt';
-    leftText = sttText;
-  } else if (!leftText && aiText) {
-    leftFallback = 'ai';
-    leftText = aiText;
-  }
-
-  const left: PageContent = {
+  content: string,
+  pageNo: number,
+  showHeader: boolean,
+  journalOverflow = false,
+): PageContent {
+  const pageKind: ReaderPageKind = journalOverflow ? 'journal-overflow' : 'journal-left';
+  return {
     type: 'text',
-    content: leftText,
-    journalPage: 1,
+    content,
+    pageKey: pageKeyFor(entry.id, pageKind),
+    pageKind,
+    journalPage: pageNo,
     sourceEntryId: entry.id,
     sourceDate: displayDate,
     sourceTime: displayTime,
-    showJournalEntryHeader: true,
-    leftFallbackSection: leftFallback !== 'journal' ? leftFallback : undefined,
+    showJournalEntryHeader: showHeader,
+    journalOverflow,
   };
-
-  return { left, leftFallback };
 }
 
 function entryDisplayDate(entry: JournalEntry): string {
@@ -111,102 +140,22 @@ function pageBreakToNewline(text: string): string {
   return text.replaceAll('\\n', '\n');
 }
 
-function applyPageBreaks(rawSpreads: Spread[]): Spread[] {
-  const result: Spread[] = [];
+function splitJournalForSpread(rawText: string): { leftText: string; overflowText: string } {
+  const journalText = rawText.trim();
+  if (!journalText) return { leftText: '', overflowText: '' };
 
-  for (const spread of rawSpreads) {
-    const { left, right } = spread;
+  const pages = splitByPageBreak(journalText)
+    .flatMap((part) => splitTextIntoJournalPages(pageBreakToNewline(part).trim()))
+    .map((page) => page.trim())
+    .filter((page) => page.length > 0);
 
-    const segments: PageContent[] = [];
-
-    if (left.type === 'text' && left.content && left.content.includes('\\n')) {
-      const parts = splitByPageBreak(left.content);
-      for (let i = 0; i < parts.length; i++) {
-        segments.push({
-          ...left,
-          content: parts[i],
-          showJournalEntryHeader: i === 0 ? left.showJournalEntryHeader : false,
-          journalPage: i === 0 ? left.journalPage : undefined,
-        });
-      }
-    } else {
-      segments.push(left);
-    }
-
-    if (right.type === 'text' && right.content && right.content.includes('\\n')) {
-      const parts = splitByPageBreak(right.content);
-      for (const part of parts) {
-        segments.push({ ...right, content: part });
-      }
-    } else {
-      segments.push(right);
-    }
-
-    if (segments.length === 2) {
-      result.push(spread);
-      continue;
-    }
-
-    for (let i = 0; i < segments.length; i += 2) {
-      const newLeft = segments[i];
-      const newRight = i + 1 < segments.length ? segments[i + 1] : { type: 'empty' as const };
-
-      result.push({
-        entryId: spread.entryId,
-        date: spread.date,
-        time: spread.time,
-        left: newLeft,
-        right: newRight,
-        isFirstSpread: i === 0 ? spread.isFirstSpread : false,
-      });
-    }
-  }
-
-  return result;
+  return {
+    leftText: pages[0] ?? '',
+    overflowText: pages.slice(1).join('\n\n'),
+  };
 }
 
-/* ──── unified spread builder (one spread per entry, scrollable) ──── */
-
-interface PageItem {
-  content: PageContent;
-  entryId: string;
-  date: string;
-  time: string;
-  sketchContents?: PageContent[];
-  bookmarkContent?: PageContent;
-}
-
-function expandEntryToPages(
-  entry: JournalEntry,
-  displayDate: string,
-  displayTime: string,
-  left: PageContent,
-  sketchPCs: PageContent[],
-): PageItem[] {
-  const textPages: PageContent[] = [];
-
-  if (left.type === 'text' && left.content && left.content.includes('\\n')) {
-    const parts = splitByPageBreak(left.content);
-    for (let j = 0; j < parts.length; j++) {
-      textPages.push({
-        ...left,
-        content: parts[j],
-        showJournalEntryHeader: j === 0 ? left.showJournalEntryHeader : false,
-        journalPage: j === 0 ? left.journalPage : undefined,
-      });
-    }
-  } else {
-    textPages.push(left);
-  }
-
-  return textPages.map((tp, j) => ({
-    content: tp,
-    entryId: entry.id,
-    date: displayDate,
-    time: displayTime,
-    sketchContents: j === textPages.length - 1 && sketchPCs.length > 0 ? sketchPCs : undefined,
-  }));
-}
+/* ──── unified spread builder (one text spread per entry, then sketches) ──── */
 
 function buildUnifiedSpreads(
   sortedEntries: JournalEntry[],
@@ -223,187 +172,69 @@ function buildUnifiedSpreads(
 
   const spreads: Spread[] = [];
 
-  if (activeSection === 'journal') {
-    // Expand all entries into page items (splitting by \n), then pair.
-    const items: PageItem[] = [];
+  for (const entry of sortedEntries) {
+    const entrySketches = sketchesByEntry.get(entry.id) ?? [];
+    const displayDate = entryDisplayDate(entry);
+    const displayTime = entry.time;
+    const { leftText, overflowText } = splitJournalForSpread(entry.journal || '');
 
-    for (const entry of sortedEntries) {
-      const entrySketches = sketchesByEntry.get(entry.id) ?? [];
-      const displayDate = entryDisplayDate(entry);
-      const displayTime = entry.time;
-      const { left } = buildLeftPage(entry, displayDate, displayTime);
+    const left = buildJournalPage(entry, displayDate, displayTime, leftText, 1, true);
+    let right: PageContent = { type: 'empty' };
 
-      const sketchPCs: PageContent[] = entrySketches.map((sk) => ({
-        type: 'sketch' as const,
-        content: sk.dataUrl,
-        sourceEntryId: entry.id,
-        sourceDate: displayDate,
-        sourceTime: displayTime,
-      }));
-
-      items.push(...expandEntryToPages(entry, displayDate, displayTime, left, sketchPCs));
-    }
-
-    // Pair page items into spreads
-    let i = 0;
-    while (i < items.length) {
-      const item = items[i];
-
-      if (item.sketchContents && item.sketchContents.length > 0) {
-        // First sketch goes on the right of the text page
-        spreads.push({
-          entryId: item.entryId,
-          date: item.date,
-          time: item.time,
-          left: item.content,
-          right: item.sketchContents[0],
-          isFirstSpread: true,
-        });
-        // Remaining sketches: pair them two at a time (left + right)
-        let s = 1;
-        while (s < item.sketchContents.length) {
-          const leftSketch = item.sketchContents[s];
-          const rightSketch = s + 1 < item.sketchContents.length ? item.sketchContents[s + 1] : null;
-          spreads.push({
-            entryId: item.entryId,
-            date: item.date,
-            time: item.time,
-            left: leftSketch,
-            right: rightSketch ?? { type: 'empty' },
-            isFirstSpread: false,
-          });
-          s += rightSketch ? 2 : 1;
-        }
-        i += 1;
-      } else {
-        // Pair with the next page item
-        const nextItem = i + 1 < items.length ? items[i + 1] : null;
-        spreads.push({
-          entryId: item.entryId,
-          date: item.date,
-          time: item.time,
-          left: item.content,
-          right: nextItem ? nextItem.content : { type: 'empty' },
-          isFirstSpread: true,
-        });
-        i += nextItem ? 2 : 1;
+    if (activeSection === 'journal') {
+      if (overflowText) {
+        right = buildJournalPage(entry, displayDate, displayTime, overflowText, 2, false, true);
       }
-    }
-  } else {
-    // STT or AI mode: same as journal but insert a bookmark page after
-    // each entry that has speech/AI content.  Pair everything 2-at-a-time.
-    const secondaryField = activeSection === 'stt' ? 'speechToText' : 'aiReport';
-    const items: PageItem[] = [];
-
-    for (const entry of sortedEntries) {
-      const entrySketches = sketchesByEntry.get(entry.id) ?? [];
-      const displayDate = entryDisplayDate(entry);
-      const displayTime = entry.time;
-      const { left } = buildLeftPage(entry, displayDate, displayTime);
-
-      const sketchPCs: PageContent[] = entrySketches.map((sk) => ({
-        type: 'sketch' as const,
-        content: sk.dataUrl,
-        sourceEntryId: entry.id,
-        sourceDate: displayDate,
-        sourceTime: displayTime,
-      }));
-
-      items.push(...expandEntryToPages(entry, displayDate, displayTime, left, sketchPCs));
-
+    } else {
+      const secondaryField = activeSection === 'stt' ? 'speechToText' : 'aiReport';
+      const pageKind: ReaderPageKind = activeSection === 'stt' ? 'speech' : 'ai';
       const secondaryText = (entry[secondaryField] || '').trim();
-      if (secondaryText) {
-        items.push({
-          content: {
-            type: 'text',
-            content: pageBreakToNewline(secondaryText),
-            secondaryPage: 1,
-            sourceEntryId: entry.id,
-            sourceDate: displayDate,
-            sourceTime: displayTime,
-          },
-          entryId: entry.id,
-          date: displayDate,
-          time: displayTime,
-        });
-      }
+      right = {
+        type: 'text',
+        content: pageBreakToNewline(secondaryText),
+        pageKey: pageKeyFor(entry.id, pageKind),
+        pageKind,
+        secondaryPage: 1,
+        sourceEntryId: entry.id,
+        sourceDate: displayDate,
+        sourceTime: displayTime,
+      };
     }
 
-    // Pair items into spreads. Bookmark pages (secondaryPage) always go
-    // on the RIGHT side of a spread.
-    const isBm = (it: PageItem) => !!it.content.secondaryPage;
-    let i = 0;
-    while (i < items.length) {
-      const item = items[i];
+    spreads.push({
+      entryId: entry.id,
+      date: displayDate,
+      time: displayTime,
+      left,
+      right,
+      isFirstSpread: true,
+    });
 
-      if (item.sketchContents && item.sketchContents.length > 0) {
-        spreads.push({
-          entryId: item.entryId,
-          date: item.date,
-          time: item.time,
-          left: item.content,
-          right: item.sketchContents[0],
-          isFirstSpread: true,
-        });
-        let s = 1;
-        while (s < item.sketchContents.length) {
-          const leftSketch = item.sketchContents[s];
-          const rightSketch = s + 1 < item.sketchContents.length ? item.sketchContents[s + 1] : null;
-          spreads.push({
-            entryId: item.entryId,
-            date: item.date,
-            time: item.time,
-            left: leftSketch,
-            right: rightSketch ?? { type: 'empty' },
-            isFirstSpread: false,
-          });
-          s += rightSketch ? 2 : 1;
-        }
-        i += 1;
-      } else if (isBm(item)) {
-        // Current item is a bookmark — put it on the right, show the
-        // entry's journal text on the left so it doesn't disappear.
-        let journalLeft: PageContent = { type: 'empty' };
-        for (let j = i - 1; j >= 0; j--) {
-          if (items[j].entryId === item.entryId && !isBm(items[j])) {
-            journalLeft = items[j].content;
-            break;
-          }
-        }
-        spreads.push({
-          entryId: item.entryId,
-          date: item.date,
-          time: item.time,
-          left: journalLeft,
-          right: item.content,
-          isFirstSpread: false,
-        });
-        i += 1;
-      } else {
-        const nextItem = i + 1 < items.length ? items[i + 1] : null;
-        if (nextItem && isBm(nextItem)) {
-          // Next item is a bookmark — pair journal (left) + bookmark (right)
-          spreads.push({
-            entryId: item.entryId,
-            date: item.date,
-            time: item.time,
-            left: item.content,
-            right: nextItem.content,
-            isFirstSpread: true,
-          });
-          i += 2;
-        } else {
-          spreads.push({
-            entryId: item.entryId,
-            date: item.date,
-            time: item.time,
-            left: item.content,
-            right: nextItem ? nextItem.content : { type: 'empty' },
-            isFirstSpread: true,
-          });
-          i += nextItem ? 2 : 1;
-        }
-      }
+    for (let s = 0; s < entrySketches.length; s += 2) {
+      const leftSketch = entrySketches[s];
+      const rightSketch = s + 1 < entrySketches.length ? entrySketches[s + 1] : undefined;
+      spreads.push({
+        entryId: entry.id,
+        date: displayDate,
+        time: displayTime,
+        left: {
+          type: 'sketch',
+          content: leftSketch.dataUrl,
+          sourceEntryId: entry.id,
+          sourceDate: displayDate,
+          sourceTime: displayTime,
+        },
+        right: rightSketch
+          ? {
+              type: 'sketch',
+              content: rightSketch.dataUrl,
+              sourceEntryId: entry.id,
+              sourceDate: displayDate,
+              sourceTime: displayTime,
+            }
+          : { type: 'empty' },
+        isFirstSpread: false,
+      });
     }
   }
 
@@ -446,6 +277,39 @@ function firstSpreadIndexForEntry(spreads: Spread[], entryId: string): number {
   return spreads.findIndex((s) => spreadTouchesEntryId(s, entryId));
 }
 
+function pageForSide(spread: Spread | undefined, side: 'left' | 'right'): PageContent | undefined {
+  if (!spread) return undefined;
+  return side === 'left' ? spread.left : spread.right;
+}
+
+function overlayForPage(overlays: Record<string, PageOverlay>, page?: PageContent): PageOverlay | undefined {
+  if (!page || page.type !== 'text') return undefined;
+  if (page.pageKey && overlays[page.pageKey]) return overlays[page.pageKey];
+  if (page.pageKind === 'journal-left' && page.sourceEntryId && overlays[page.sourceEntryId]) {
+    return overlays[page.sourceEntryId];
+  }
+  return undefined;
+}
+
+function editTargetForPage(page: PageContent | undefined, side: 'left' | 'right', spread?: Spread): InlineEditTarget | null {
+  if (!page || page.type !== 'text' || !page.pageKey || !page.pageKind) return null;
+  return {
+    entryId: page.sourceEntryId ?? spread?.entryId ?? entryIdFromPageKey(page.pageKey),
+    pageKey: page.pageKey,
+    pageKind: page.pageKind,
+    defaultLayer: 'text',
+    side,
+  };
+}
+
+function combineJournalPages(leftText: string, overflowText: string): string {
+  const left = leftText.trimEnd();
+  const overflow = overflowText.trim();
+  if (!left) return overflow;
+  if (!overflow) return left;
+  return `${left}\n\n${overflow}`;
+}
+
 /* ──── data fetching ──── */
 
 async function fetchData(): Promise<{
@@ -462,8 +326,19 @@ async function fetchData(): Promise<{
   const overlays: Record<string, PageOverlay> = {};
   for (const [k, v] of Object.entries(rawOverlays)) {
     const val = v as Record<string, unknown>;
-    overlays[k] = {
-      entryId: k,
+    const rawEntryId = typeof val.entryId === 'string' && val.entryId.trim()
+      ? val.entryId.trim()
+      : entryIdFromPageKey(k);
+    const rawPageKey = typeof val.pageKey === 'string' && val.pageKey.trim()
+      ? val.pageKey.trim()
+      : (k.includes('::') ? k : pageKeyFor(rawEntryId, 'journal-left'));
+    const rawPageKind = typeof val.pageKind === 'string' && val.pageKind.trim()
+      ? pageKindFromPageKey(`${rawEntryId}::${val.pageKind}`)
+      : pageKindFromPageKey(rawPageKey);
+    overlays[rawPageKey] = {
+      entryId: rawEntryId,
+      pageKey: rawPageKey,
+      pageKind: rawPageKind,
       sketchDataUrl: (typeof val.sketchDataUrl === 'string' ? val.sketchDataUrl : undefined),
       images: Array.isArray(val.images) ? val.images as PageImage[] : [],
       layerOrder: Array.isArray(val.layerOrder) ? val.layerOrder as ('text' | 'sketch' | 'images')[] : ['text', 'sketch', 'images'],
@@ -500,11 +375,55 @@ const JournalBook: React.FC = () => {
   const [showSketchPlacer, setShowSketchPlacer] = useState(false);
   const [editingSketchId, setEditingSketchId] = useState<string | null>(null);
 
-  const [inlineEditEntry, setInlineEditEntry] = useState<{ entryId: string; defaultLayer: LayerKind; side: 'left' | 'right' } | null>(null);
+  const [inlineEditEntry, setInlineEditEntry] = useState<InlineEditTarget | null>(null);
 
   const bookSpreadRef = useRef<HTMLDivElement>(null);
   const leftPageRef = useRef<HTMLDivElement>(null);
   const rightPageRef = useRef<HTMLDivElement>(null);
+  const measureSignatureRef = useRef('');
+  const [measureVersion, setMeasureVersion] = useState(0);
+
+  useLayoutEffect(() => {
+    if (currentPage === 0) return undefined;
+
+    let raf = 0;
+    const readMeasurements = () => {
+      const leftBody = leftPageRef.current?.querySelector<HTMLElement>('[data-journal-measure="body"]');
+      if (!leftBody) return;
+      const rightBody = rightPageRef.current?.querySelector<HTMLElement>('[data-journal-measure="body"]');
+      const sourceStyle = getComputedStyle(leftBody);
+      const paddingRight = parseFloat(sourceStyle.paddingRight || '0') || 0;
+      const widthPx = Math.max(0, Math.round(leftBody.clientWidth - paddingRight));
+      const firstPageInnerHeightPx = Math.round(leftBody.clientHeight);
+      const restPageInnerHeightPx = Math.round(rightBody?.clientHeight || firstPageInnerHeightPx);
+      if (widthPx < 32 || firstPageInnerHeightPx < 24 || restPageInnerHeightPx < 24) return;
+
+      const signature = `${widthPx}:${firstPageInnerHeightPx}:${restPageInnerHeightPx}:${sourceStyle.font}:${sourceStyle.lineHeight}`;
+      if (signature === measureSignatureRef.current) return;
+      measureSignatureRef.current = signature;
+      journalMeasureRuntime.styleSourceEl = leftBody;
+      journalMeasureRuntime.dims = { widthPx, firstPageInnerHeightPx, restPageInnerHeightPx };
+      setMeasureVersion((v) => v + 1);
+    };
+
+    const scheduleRead = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(readMeasurements);
+    };
+
+    scheduleRead();
+    const ro = new ResizeObserver(scheduleRead);
+    if (bookSpreadRef.current) ro.observe(bookSpreadRef.current);
+    if (leftPageRef.current) ro.observe(leftPageRef.current);
+    if (rightPageRef.current) ro.observe(rightPageRef.current);
+    window.addEventListener('resize', scheduleRead);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+      window.removeEventListener('resize', scheduleRead);
+    };
+  }, [currentPage, singlePage, activeSection]);
 
   /* ── load data ── */
 
@@ -562,7 +481,7 @@ const JournalBook: React.FC = () => {
 
   const spreads = useMemo(
     () => buildUnifiedSpreads(sortedEntries, sketches, singlePage ? 'journal' : activeSection),
-    [sortedEntries, sketches, activeSection, singlePage],
+    [sortedEntries, sketches, activeSection, singlePage, measureVersion],
   );
 
   const spreadCount = spreads.length;
@@ -578,7 +497,7 @@ const JournalBook: React.FC = () => {
     let ix = firstSpreadIndexForEntry(spl, entryId);
     if (ix < 0) ix = spl.findIndex((s) => spreadTouchesEntryId(s, entryId));
     setCurrentPage(ix >= 0 ? ix + 1 : 1);
-  }, [sortedEntries, sketches, activeSection]);
+  }, [sortedEntries, sketches, activeSection, measureVersion]);
 
   const handlePageJump = useCallback((page: number) => {
     if (!Number.isFinite(page)) return;
@@ -702,33 +621,44 @@ const JournalBook: React.FC = () => {
       if (currentPage === 0) return;
       const spread = spreads[currentPage - 1];
       if (!spread) return;
-      const leftEid = spread.left.sourceEntryId ?? spread.entryId;
-      if (leftEid) {
-        setInlineEditEntry({ entryId: leftEid, defaultLayer: 'text', side: 'left' });
-      }
+      const side = singlePage ? mobileSide : (activeSection === 'journal' ? 'left' : 'right');
+      const target = editTargetForPage(pageForSide(spread, side), side, spread);
+      if (target) setInlineEditEntry(target);
     }
   };
 
   /* ── inline editor ── */
 
   const handleOpenInlineEditor = (entryId: string, defaultLayer: 'text' | 'sketch') => {
-    setInlineEditEntry({ entryId, defaultLayer, side: 'left' });
+    setInlineEditEntry({
+      entryId,
+      pageKey: pageKeyFor(entryId, 'journal-left'),
+      pageKind: 'journal-left',
+      defaultLayer,
+      side: 'left',
+    });
   };
 
-  const doSaveEntry = async (
-    entryId: string,
-    text: string,
-    sketchDataUrl: string,
-    images: PageImage[],
-    layerOrder: ('text' | 'sketch' | 'images')[],
-    date?: string,
-    time?: string,
-  ): Promise<boolean> => {
+  const doSavePage = async (payload: InlineSavePayload): Promise<boolean> => {
     setSaveError(null);
     try {
-      const entryBody: Record<string, string> = { id: entryId, journal: text };
-      if (date !== undefined) entryBody.date = date;
-      if (time !== undefined) entryBody.time = time;
+      const entry = entries.find((e) => e.id === payload.entryId);
+      if (!entry) { setSaveError(t('errSaveFailed')); return false; }
+      const entryBody: Record<string, string> = { id: payload.entryId };
+      if (payload.date !== undefined) entryBody.date = payload.date;
+      if (payload.time !== undefined) entryBody.time = payload.time;
+
+      if (payload.pageKind === 'speech') {
+        entryBody.speechToText = payload.text;
+      } else if (payload.pageKind === 'ai') {
+        entryBody.aiReport = payload.text;
+      } else {
+        const { leftText, overflowText } = splitJournalForSpread(entry.journal || '');
+        entryBody.journal = payload.pageKind === 'journal-overflow'
+          ? combineJournalPages(leftText, payload.text)
+          : combineJournalPages(payload.text, overflowText);
+      }
+
       const res = await fetch('/api/entry', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -737,7 +667,14 @@ const JournalBook: React.FC = () => {
       const data = await res.json();
       if (!data.ok) { setSaveError(data.error || t('errSaveFailed')); return false; }
 
-      const overlayBody = { entryId, sketchDataUrl, images, layerOrder };
+      const overlayBody = {
+        entryId: payload.entryId,
+        pageKey: payload.pageKey,
+        pageKind: payload.pageKind,
+        sketchDataUrl: payload.sketchDataUrl,
+        images: payload.images,
+        layerOrder: payload.layerOrder,
+      };
       const res2 = await fetch('/api/page-overlay', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -751,26 +688,18 @@ const JournalBook: React.FC = () => {
     } catch { setSaveError(t('errNetworkSave')); return false; }
   };
 
-  const handleSaveInline = async (
-    text: string,
-    sketchDataUrl: string,
-    images: PageImage[],
-    layerOrder: ('text' | 'sketch' | 'images')[],
-    date?: string,
-    time?: string,
-  ) => {
+  const handleSaveInline = async (payload: InlineSavePayload) => {
     if (!inlineEditEntry) return;
-    const ok = await doSaveEntry(inlineEditEntry.entryId, text, sketchDataUrl, images, layerOrder, date, time);
+    const ok = await doSavePage(payload);
     if (ok) setInlineEditEntry(null);
   };
 
   const handleSwitchSide = async (
-    currentPayload: { entryId: string; text: string; sketchDataUrl: string; images: PageImage[]; layerOrder: LayerKind[]; activeLayer: LayerKind; date: string; time: string },
-    targetEntryId: string,
-    targetSide: 'left' | 'right',
+    currentPayload: InlineSavePayload,
+    target: InlineEditTarget,
   ) => {
-    await doSaveEntry(currentPayload.entryId, currentPayload.text, currentPayload.sketchDataUrl, currentPayload.images, currentPayload.layerOrder, currentPayload.date, currentPayload.time);
-    setInlineEditEntry({ entryId: targetEntryId, defaultLayer: currentPayload.activeLayer, side: targetSide });
+    const ok = await doSavePage(currentPayload);
+    if (ok) setInlineEditEntry({ ...target, defaultLayer: currentPayload.activeLayer });
   };
 
   /* ── sketch CRUD (backward compat for existing standalone sketches) ── */
@@ -916,14 +845,17 @@ const JournalBook: React.FC = () => {
   const singlePageBookmarkContent = useMemo<PageContent | undefined>(() => {
     if (!singlePage || !singlePageEntry || activeSection === 'journal') return undefined;
     const field = activeSection === 'stt' ? 'speechToText' : 'aiReport';
+    const pageKind: ReaderPageKind = activeSection === 'stt' ? 'speech' : 'ai';
     const text = (singlePageEntry[field] || '').trim();
     if (!text) return undefined;
     return {
       type: 'text',
       content: text,
+      pageKey: pageKeyFor(singlePageEntry.id, pageKind),
+      pageKind,
       secondaryPage: 1,
       sourceEntryId: singlePageEntry.id,
-      sourceDate: singlePageEntry.date,
+      sourceDate: entryDisplayDate(singlePageEntry),
       sourceTime: singlePageEntry.time,
     };
   }, [singlePage, singlePageEntry, activeSection]);
@@ -1074,6 +1006,7 @@ const JournalBook: React.FC = () => {
                       activeSection={activeSection}
                       theme={bgTheme}
                       fullWidth
+                      overlay={overlayForPage(overlays, singlePageBookmarkContent)}
                       onEditBookmark={handleEditBookmarkPage}
                     />
                   ) : (
@@ -1084,8 +1017,8 @@ const JournalBook: React.FC = () => {
                       activeSection={activeSection}
                       theme={bgTheme}
                       overlay={(() => {
-                        const eid = mobileSide === 'left' ? currentSpread?.left.sourceEntryId : currentSpread?.right.sourceEntryId;
-                        return eid ? overlays[eid] : undefined;
+                        const page = mobileSide === 'left' ? currentSpread?.left : currentSpread?.right;
+                        return overlayForPage(overlays, page);
                       })()}
                       fullWidth
                       onEditBookmark={handleEditBookmarkPage}
@@ -1099,7 +1032,7 @@ const JournalBook: React.FC = () => {
                       side="left"
                       activeSection={activeSection}
                       theme={bgTheme}
-                      overlay={currentSpread?.left.sourceEntryId ? overlays[currentSpread.left.sourceEntryId] : undefined}
+                      overlay={overlayForPage(overlays, currentSpread?.left)}
                       onEditBookmark={handleEditBookmarkPage}
                     />
                     <Page
@@ -1108,7 +1041,7 @@ const JournalBook: React.FC = () => {
                       side="right"
                       activeSection={activeSection}
                       theme={bgTheme}
-                      overlay={currentSpread?.right.sourceEntryId && currentSpread.right.sourceEntryId !== currentSpread.left.sourceEntryId ? overlays[currentSpread.right.sourceEntryId] : undefined}
+                      overlay={overlayForPage(overlays, currentSpread?.right)}
                       onEditBookmark={handleEditBookmarkPage}
                     />
                   </>
@@ -1119,20 +1052,22 @@ const JournalBook: React.FC = () => {
                    because motion.div's transform creates a containing block that traps fixed elements. */}
                 {inlineEditEntry && (() => {
                   const editEntry = entries.find((e) => e.id === inlineEditEntry.entryId);
-                  const editOv = overlays[inlineEditEntry.entryId];
+                  const editPage = pageForSide(currentSpread, inlineEditEntry.side);
+                  const editOv = overlayForPage(overlays, editPage);
                   const editOtherSide = inlineEditEntry.side === 'left' ? 'right' : 'left';
                   const editOtherPage = currentSpread ? (editOtherSide === 'left' ? currentSpread.left : currentSpread.right) : undefined;
-                  const editOtherEntryId = editOtherPage?.sourceEntryId ?? currentSpread?.entryId;
+                  const editOtherTarget = editTargetForPage(editOtherPage, editOtherSide, currentSpread);
+                  if (!editEntry || !editPage || editPage.type !== 'text') return null;
                   return (
                     <InlineEditorOverlay
-                      key={`${inlineEditEntry.entryId}-${inlineEditEntry.side}`}
+                      key={`${inlineEditEntry.pageKey}-${inlineEditEntry.side}`}
                       entry={editEntry}
+                      pageContent={editPage}
                       overlay={editOv}
                       defaultLayer={inlineEditEntry.defaultLayer}
                       side={inlineEditEntry.side}
                       pageRef={inlineEditEntry.side === 'left' ? leftPageRef : rightPageRef}
-                      otherEntryId={singlePage ? undefined : editOtherEntryId}
-                      otherSide={editOtherSide}
+                      otherTarget={singlePage ? undefined : editOtherTarget ?? undefined}
                       onSave={handleSaveInline}
                       onSwitchSide={handleSwitchSide}
                       onClose={() => setInlineEditEntry(null)}
@@ -1293,25 +1228,21 @@ const JournalBook: React.FC = () => {
 
 const InlineEditorOverlay: React.FC<{
   entry?: JournalEntry;
+  pageContent: PageContent;
   overlay?: PageOverlay;
   defaultLayer: LayerKind;
   side: 'left' | 'right';
   pageRef: React.RefObject<HTMLDivElement | null>;
-  otherEntryId?: string;
-  otherSide: 'left' | 'right';
-  onSave: (text: string, sketchDataUrl: string, images: PageImage[], layerOrder: LayerKind[], date?: string, time?: string) => void;
-  onSwitchSide: (
-    currentPayload: { entryId: string; text: string; sketchDataUrl: string; images: PageImage[]; layerOrder: LayerKind[]; activeLayer: LayerKind; date: string; time: string },
-    targetEntryId: string,
-    targetSide: 'left' | 'right',
-  ) => void;
+  otherTarget?: InlineEditTarget;
+  onSave: (payload: InlineSavePayload) => void;
+  onSwitchSide: (currentPayload: InlineSavePayload, target: InlineEditTarget) => void;
   onClose: () => void;
   isMobile?: boolean;
-}> = ({ entry, overlay: ov, defaultLayer, side, pageRef, otherEntryId, otherSide, onSave, onSwitchSide, onClose, isMobile }) => {
+}> = ({ entry, pageContent, overlay: ov, defaultLayer, side, pageRef, otherTarget, onSave, onSwitchSide, onClose, isMobile }) => {
   const { t } = useReaderT();
   const { bgTheme } = useTheme();
   const editor = useInlineEditor({
-    initialText: entry?.journal ?? '',
+    initialText: pageContent.content ?? '',
     initialSketchDataUrl: ov?.sketchDataUrl,
     initialImages: ov?.images ?? [],
     initialLayerOrder: ov?.layerOrder ?? ['text', 'sketch', 'images'],
@@ -1321,19 +1252,50 @@ const InlineEditorOverlay: React.FC<{
 
   const [editDate, setEditDate] = React.useState(entry?.date ?? '');
   const [editTime, setEditTime] = React.useState(entry?.time ?? '');
+  const pageKind = pageContent.pageKind ?? 'journal-left';
+  const pageKey = pageContent.pageKey ?? pageKeyFor(entry?.id ?? '', pageKind);
+  const editorTitle = pageKind === 'speech'
+    ? t('pageVoiceTranscript')
+    : pageKind === 'ai'
+      ? t('pageIntelAnalysis')
+      : pageKind === 'journal-overflow'
+        ? `${t('pageDailyReflection')} ${t('pageContSuffix')}`
+        : t('pageJournalEntry');
 
   const handleSave = () => {
+    if (!entry) return;
     const payload = editor.getSavePayload();
-    onSave(payload.text, payload.sketchDataUrl, payload.images, payload.layerOrder, editDate, editTime);
+    onSave({
+      entryId: entry.id,
+      pageKey,
+      pageKind,
+      text: payload.text,
+      sketchDataUrl: payload.sketchDataUrl,
+      images: payload.images,
+      layerOrder: payload.layerOrder,
+      activeLayer: editor.activeLayer,
+      date: editDate,
+      time: editTime,
+    });
   };
 
   const handleClickOtherPage = () => {
-    if (!otherEntryId || !entry) return;
+    if (!otherTarget || !entry) return;
     const payload = editor.getSavePayload();
     onSwitchSide(
-      { entryId: entry.id, text: payload.text, sketchDataUrl: payload.sketchDataUrl, images: payload.images, layerOrder: payload.layerOrder, activeLayer: editor.activeLayer, date: editDate, time: editTime },
-      otherEntryId,
-      otherSide,
+      {
+        entryId: entry.id,
+        pageKey,
+        pageKind,
+        text: payload.text,
+        sketchDataUrl: payload.sketchDataUrl,
+        images: payload.images,
+        layerOrder: payload.layerOrder,
+        activeLayer: editor.activeLayer,
+        date: editDate,
+        time: editTime,
+      },
+      otherTarget,
     );
   };
 
@@ -1377,9 +1339,9 @@ const InlineEditorOverlay: React.FC<{
       )}
 
       {/* Click-to-switch overlay on the opposite page */}
-      {otherEntryId && (
+      {otherTarget && (
         <div
-          className={`absolute top-0 bottom-0 ${overlayWidth} z-[60] cursor-pointer hover:bg-blue-400/10 transition-colors ${otherSide === 'left' ? 'left-0' : 'left-1/2'}`}
+          className={`absolute top-0 bottom-0 ${overlayWidth} z-[60] cursor-pointer hover:bg-blue-400/10 transition-colors ${otherTarget.side === 'left' ? 'left-0' : 'left-1/2'}`}
           onClick={handleClickOtherPage}
           title="Click to edit this page"
         />
@@ -1439,7 +1401,7 @@ const InlineEditorOverlay: React.FC<{
               />
             </div>
             <h2 className="text-2xl font-light leading-tight mt-1 font-serif" style={{ color: bgTheme.colors.text }}>
-              {t('pageJournalEntry')}
+              {editorTitle}
             </h2>
           </div>
           <div className="flex-1 relative min-h-0">
@@ -1567,20 +1529,16 @@ const Page = React.forwardRef<HTMLDivElement, {
   }
 
   /* ── text page ── */
-  const isRightSecondary = side === 'right' && pContent.secondaryPage !== undefined;
-  const hasFallback = !!pContent.leftFallbackSection;
-  const sectionTitle = isRightSecondary
-    ? (activeSection === 'stt' ? t('pageVoiceTranscript') : t('pageIntelAnalysis'))
-    : hasFallback
-      ? (pContent.leftFallbackSection === 'stt' ? t('pageVoiceTranscript') : t('pageIntelAnalysis'))
-      : t('pageDailyReflection');
+  const isSecondary = pContent.secondaryPage !== undefined;
+  const sectionTitle = isSecondary
+    ? (pContent.pageKind === 'speech' ? t('pageVoiceTranscript') : t('pageIntelAnalysis'))
+    : t('pageDailyReflection');
 
-  const bigHeaderTitle = hasFallback
-    ? (pContent.leftFallbackSection === 'stt' ? t('pageVoiceTranscript') : t('pageIntelAnalysis'))
-    : t('pageJournalEntry');
+  const bigHeaderTitle = t('pageJournalEntry');
 
-  const pageLabel = isRightSecondary ? pContent.secondaryPage : pContent.journalPage;
+  const pageLabel = isSecondary ? pContent.secondaryPage : pContent.journalPage;
   const columnDate = pContent.sourceDate ?? spread.date;
+  const textCanScroll = pContent.pageKind !== 'journal-left';
 
   const showBigHeader = pContent.type === 'text' && !!pContent.showJournalEntryHeader;
   const showSubHeader = !showBigHeader && pContent.type === 'text' && pageLabel !== undefined;
@@ -1622,12 +1580,12 @@ const Page = React.forwardRef<HTMLDivElement, {
               : sectionTitle}
           </h3>
           <div className="flex items-center gap-2">
-            {isRightSecondary && onEditBookmark && pContent.sourceEntryId && (
+            {isSecondary && onEditBookmark && pContent.sourceEntryId && (
               <button
                 type="button"
                 onClick={() => onEditBookmark(
                   pContent.sourceEntryId!,
-                  activeSection === 'stt' ? 'speechToText' : 'aiReport',
+                  pContent.pageKind === 'speech' ? 'speechToText' : 'aiReport',
                   pContent.content || '',
                 )}
                 className="p-1 rounded-full hover:bg-black/10 transition-colors z-50 min-h-[36px] min-w-[36px] flex items-center justify-center"
@@ -1645,7 +1603,8 @@ const Page = React.forwardRef<HTMLDivElement, {
       <div className="flex-1 relative min-h-0 overflow-hidden">
         {/* Text content */}
         <div
-          className={`absolute inset-0 leading-relaxed text-base overflow-y-auto pr-2 ${overlay ? 'whitespace-pre-wrap' : 'space-y-3'}`}
+          data-journal-measure="body"
+          className={`absolute inset-0 leading-relaxed text-base pr-2 ${textCanScroll ? 'overflow-y-auto' : 'overflow-hidden'} ${overlay ? 'whitespace-pre-wrap' : 'space-y-3'}`}
           style={{ color: theme.colors.text, zIndex: overlay ? layerZIndex('text') : 'auto' }}
         >
           {overlay

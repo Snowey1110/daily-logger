@@ -43,6 +43,49 @@ def _reader_settings_path() -> Path:
     return dl.SETTINGS_DIR / "journal_reader_settings.json"
 
 
+def _journal_left_page_key(entry_id: str) -> str:
+    return f"{entry_id}::journal-left"
+
+
+def _entry_id_from_page_key(page_key: str) -> str:
+    if "::" in page_key:
+        return page_key.split("::", 1)[0]
+    return page_key
+
+
+def _normalize_overlays(raw_overlays: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    normalized: Dict[str, Any] = {}
+    changed = False
+    for key, value in raw_overlays.items():
+        if not isinstance(value, dict):
+            changed = True
+            continue
+        entry_id = str(value.get("entryId") or _entry_id_from_page_key(str(key))).strip()
+        if not entry_id:
+            changed = True
+            continue
+        page_key = str(value.get("pageKey") or "").strip()
+        if not page_key:
+            page_key = str(key) if "::" in str(key) else _journal_left_page_key(entry_id)
+            changed = True
+        page_kind = str(value.get("pageKind") or "").strip()
+        if not page_kind:
+            page_kind = page_key.split("::", 1)[1] if "::" in page_key else "journal-left"
+            changed = True
+        normalized_value = {
+            "entryId": entry_id,
+            "pageKey": page_key,
+            "pageKind": page_kind,
+            "sketchDataUrl": value.get("sketchDataUrl") or "",
+            "images": value.get("images") if isinstance(value.get("images"), list) else [],
+            "layerOrder": value.get("layerOrder") if isinstance(value.get("layerOrder"), list) else ["text", "sketch", "images"],
+        }
+        if key != page_key or value != normalized_value:
+            changed = True
+        normalized[page_key] = normalized_value
+    return normalized, changed
+
+
 def _load_reader_settings() -> Dict[str, Any]:
     path = _reader_settings_path()
     if not path.is_file():
@@ -70,7 +113,14 @@ def _load_data() -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
     except (OSError, json.JSONDecodeError):
         return [], {}
     if isinstance(raw, dict) and raw.get("version") == 3:
-        return list(raw.get("sketches", [])), dict(raw.get("overlays", {}))
+        sketches = list(raw.get("sketches", []))
+        overlays, changed = _normalize_overlays(dict(raw.get("overlays", {})))
+        if changed:
+            try:
+                _save_data(sketches, overlays)
+            except OSError:
+                pass
+        return sketches, overlays
     if isinstance(raw, dict) and raw.get("version") == 2:
         sketches = list(raw.get("sketches", []))
         _save_data(sketches, {})
@@ -281,8 +331,15 @@ class ReaderHandler(BaseHTTPRequestHandler):
             ok, msg = dl.delete_journal_reader_entry(sheet_name, row_index)
             if ok:
                 sketches, overlays = _load_data()
-                if entry_id in overlays:
-                    del overlays[entry_id]
+                keys_to_delete = [
+                    key for key, value in overlays.items()
+                    if key == entry_id
+                    or key.startswith(f"{entry_id}::")
+                    or (isinstance(value, dict) and value.get("entryId") == entry_id)
+                ]
+                for key in keys_to_delete:
+                    overlays.pop(key, None)
+                if keys_to_delete:
                     try:
                         _save_data(sketches, overlays)
                     except OSError:
@@ -325,19 +382,26 @@ class ReaderHandler(BaseHTTPRequestHandler):
             if not entry_id:
                 self._send_json(400, {"ok": False, "error": "Missing entryId"})
                 return
+            page_key = str(payload.get("pageKey", "")).strip() or _journal_left_page_key(entry_id)
+            page_kind = str(payload.get("pageKind", "")).strip()
+            if not page_kind:
+                page_kind = page_key.split("::", 1)[1] if "::" in page_key else "journal-left"
             sketch_data = payload.get("sketchDataUrl") or ""
             images = payload.get("images") or []
             layer_order = payload.get("layerOrder") or ["text", "sketch", "images"]
             sketches, overlays = _load_data()
             has_content = bool(sketch_data) or bool(images)
             if has_content:
-                overlays[entry_id] = {
+                overlays[page_key] = {
+                    "entryId": entry_id,
+                    "pageKey": page_key,
+                    "pageKind": page_kind,
                     "sketchDataUrl": sketch_data,
                     "images": images,
                     "layerOrder": layer_order,
                 }
             else:
-                overlays.pop(entry_id, None)
+                overlays.pop(page_key, None)
             try:
                 _save_data(sketches, overlays)
             except OSError as exc:

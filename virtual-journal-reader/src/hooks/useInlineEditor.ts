@@ -93,7 +93,10 @@ export function useInlineEditor(opts: {
   const [lineWidth, setLineWidth] = useState(3);
   const [isErasing, setIsErasing] = useState(false);
   const [eraserSize, setEraserSize] = useState(20);
-  const sketchLoaded = useRef(false);
+  const sketchDirty = useRef(false);
+  const loadedSketchSourceRef = useRef<string | null>(null);
+  const sketchLoadIdRef = useRef(0);
+  const sketchLoadingSourceRef = useRef<string | null>(null);
   const strokeStartRef = useRef<{ x: number; y: number } | null>(null);
   const strokeSnapshotRef = useRef<ImageData | null>(null);
   const historyRef = useRef(createCanvasHistory());
@@ -113,6 +116,59 @@ export function useInlineEditor(opts: {
     ctx.lineWidth = isErasing ? eraserSize : lineWidth;
     ctx.globalCompositeOperation = isErasing ? 'destination-out' : 'source-over';
   }, [color, lineWidth, isErasing, eraserSize]);
+
+  const hydrateInitialSketchIfNeeded = useCallback(() => {
+    const source = initialSketchDataUrl;
+    const canvas = canvasRef.current;
+    const ctx = ctxRef.current;
+    if (!source || !canvas || !ctx || canvas.width === 0 || canvas.height === 0) return;
+    if (sketchDirty.current || loadedSketchSourceRef.current === source || sketchLoadingSourceRef.current === source) return;
+
+    const loadId = ++sketchLoadIdRef.current;
+    sketchLoadingSourceRef.current = source;
+    const img = new Image();
+    img.onload = () => {
+      if (loadId !== sketchLoadIdRef.current) return;
+      sketchLoadingSourceRef.current = null;
+      const activeCanvas = canvasRef.current;
+      const activeCtx = ctxRef.current;
+      if (
+        sketchDirty.current ||
+        loadedSketchSourceRef.current === source ||
+        !activeCanvas ||
+        !activeCtx ||
+        activeCanvas.width === 0 ||
+        activeCanvas.height === 0
+      ) {
+        return;
+      }
+
+      const prevOp = activeCtx.globalCompositeOperation;
+      activeCtx.globalCompositeOperation = 'source-over';
+      activeCtx.clearRect(0, 0, activeCanvas.width, activeCanvas.height);
+      activeCtx.drawImage(img, 0, 0, activeCanvas.width, activeCanvas.height);
+      activeCtx.globalCompositeOperation = prevOp;
+      applyCtxDefaults(activeCtx);
+      loadedSketchSourceRef.current = source;
+    };
+    img.onerror = () => {
+      if (loadId === sketchLoadIdRef.current) sketchLoadingSourceRef.current = null;
+    };
+    img.src = source;
+  }, [applyCtxDefaults, initialSketchDataUrl]);
+
+  useEffect(() => {
+    if (initialSketchDataUrl !== loadedSketchSourceRef.current) {
+      loadedSketchSourceRef.current = null;
+      sketchLoadingSourceRef.current = null;
+      sketchLoadIdRef.current += 1;
+    }
+  }, [initialSketchDataUrl]);
+
+  useEffect(() => () => {
+    sketchLoadingSourceRef.current = null;
+    sketchLoadIdRef.current += 1;
+  }, []);
 
   const syncCanvasSize = useCallback(() => {
     const canvas = canvasRef.current;
@@ -140,6 +196,7 @@ export function useInlineEditor(opts: {
           ctxRef.current = ctx;
         }
       }
+      hydrateInitialSketchIfNeeded();
       return;
     }
 
@@ -164,17 +221,9 @@ export function useInlineEditor(opts: {
 
     if (prevW > 0 && prevH > 0) {
       ctx.drawImage(tempCanvas, 0, 0, prevW, prevH, 0, 0, width, height);
-    } else if (initialSketchDataUrl && !sketchLoaded.current) {
-      const img = new Image();
-      img.onload = () => {
-        if (ctxRef.current && canvas.width > 0) {
-          ctxRef.current.drawImage(img, 0, 0, canvas.width, canvas.height);
-          sketchLoaded.current = true;
-        }
-      };
-      img.src = initialSketchDataUrl;
     }
-  }, [applyCtxDefaults, initialSketchDataUrl, pageAreaRef]);
+    hydrateInitialSketchIfNeeded();
+  }, [applyCtxDefaults, hydrateInitialSketchIfNeeded, pageAreaRef]);
 
   const initCanvasForElement = useCallback((_el: HTMLElement) => {
     syncCanvasSize();
@@ -232,6 +281,15 @@ export function useInlineEditor(opts: {
     if (activeLayer !== 'sketch') return;
     if ('touches' in e) e.preventDefault();
     syncCanvasSize();
+    if (
+      initialSketchDataUrl &&
+      !sketchDirty.current &&
+      loadedSketchSourceRef.current !== initialSketchDataUrl
+    ) {
+      hydrateInitialSketchIfNeeded();
+      if (sketchLoadingSourceRef.current === initialSketchDataUrl) return;
+    }
+    sketchDirty.current = true;
     const { x, y } = getCanvasCoords(e);
     strokeStartRef.current = { x, y };
     const ctx = ctxRef.current;
@@ -284,6 +342,7 @@ export function useInlineEditor(opts: {
   const clearCanvas = () => {
     const canvas = canvasRef.current;
     if (canvas && ctxRef.current) {
+      sketchDirty.current = true;
       const prevOp = ctxRef.current.globalCompositeOperation;
       pushUndoSnapshot(historyRef.current, captureCanvasSnapshot(ctxRef.current, canvas));
       ctxRef.current.globalCompositeOperation = 'source-over';
@@ -434,6 +493,7 @@ export function useInlineEditor(opts: {
 
   /* ── save ── */
   const getSketchDataUrl = (): string => {
+    if (!sketchDirty.current && initialSketchDataUrl) return initialSketchDataUrl;
     const canvas = canvasRef.current;
     if (!canvas) return '';
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
