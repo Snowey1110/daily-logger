@@ -12,6 +12,7 @@ import atexit
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import runpy
 import shutil
 import subprocess
@@ -21,6 +22,7 @@ import tempfile
 import threading
 import time
 import traceback
+import unicodedata
 import uuid
 import wave
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -91,6 +93,10 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_TRANSCRIPTION_URL = os.getenv(
     "OPENAI_TRANSCRIPTION_URL", "https://api.openai.com/v1/audio/transcriptions"
 ).strip()
+OPENAI_TRANSCRIPTION_MODEL = (
+    os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe").strip()
+    or "gpt-4o-mini-transcribe"
+)
 LIVE_STT_CHUNK_INTERVAL_SEC = 5.0
 LIVE_STT_MIN_CHUNK_SAMPLES = int(16000 * 0.4)
 # Journal waveform: int16 PCM RMS soft noise floor and display scale.
@@ -107,8 +113,10 @@ WHISPER_USD_PER_MIN = 0.006
 # Pre-send WAV cleanup (RMS on int16-scale, same ballpark as WAVEFORM_RMS_NOISE_FLOOR).
 WHISPER_PRE_FRAME_MS = 25
 WHISPER_PRE_SILENCE_RMS = 32.0
+WHISPER_PRE_NOISE_PERCENTILE = 10.0
+WHISPER_PRE_NOISE_MULTIPLIER = 2.5
 WHISPER_PRE_EDGE_PAD_MS = 120
-WHISPER_PRE_MIN_SPEECH_MS = 50
+WHISPER_PRE_MIN_SPEECH_MS = 350
 WHISPER_PRE_MAX_INTERNAL_SILENCE_SEC = 1.25
 WHISPER_PRE_KEEP_INTERNAL_SILENCE_SEC = 0.35
 WHISPER_TRANSCRIBE_CHUNK_SEC = 8 * 60
@@ -116,6 +124,9 @@ WHISPER_TRANSCRIBE_CHUNK_SEC = 8 * 60
 WHISPER_SAFE_CHUNK_PCM_BYTES = 20 * 1024 * 1024
 WHISPER_SKIP_SINGLE_FILE_BYTES = 22 * 1024 * 1024
 WHISPER_TRANSCRIBE_PROMPT_CHAR_LIMIT = 600
+WHISPER_REPEAT_SENTENCE_KEEP = 1
+WHISPER_UNSUPPORTED_SCRIPT_RATIO = 0.25
+WHISPER_UNSUPPORTED_SCRIPT_MIN_LETTERS = 8
 # Hover tooltips: narrow wrap → shorter line length, more lines (taller block).
 TOOLTIP_WRAP_PX = 220
 TOOLTIP_WRAP_PX_MAX = 280
@@ -2223,6 +2234,21 @@ def _rms_per_frame_int16(samples: Any, frame: int) -> Any:
     return np.sqrt(np.mean(blocks * blocks, axis=1))
 
 
+def _adaptive_whisper_silence_rms(rms: Any) -> float:
+    """Estimate a per-recording silence threshold so noisy rooms do not look like speech."""
+    try:
+        import numpy as np
+
+        if rms is None or int(rms.size) < 1:
+            return float(WHISPER_PRE_SILENCE_RMS)
+        noise_floor = float(np.percentile(rms, WHISPER_PRE_NOISE_PERCENTILE))
+        if not np.isfinite(noise_floor):
+            return float(WHISPER_PRE_SILENCE_RMS)
+        return max(float(WHISPER_PRE_SILENCE_RMS), noise_floor * WHISPER_PRE_NOISE_MULTIPLIER)
+    except Exception:
+        return float(WHISPER_PRE_SILENCE_RMS)
+
+
 def preprocess_wav_for_whisper(samples: Any, sample_rate: int) -> Tuple[Any, Optional[str]]:
     """Trim edge silence and shorten long internal silences. Returns (mono int16 ndarray, error)."""
     try:
@@ -2233,10 +2259,10 @@ def preprocess_wav_for_whisper(samples: Any, sample_rate: int) -> Tuple[Any, Opt
         return None, "Empty audio."
     rate = max(1, int(sample_rate))
     frame = max(int(rate * (WHISPER_PRE_FRAME_MS / 1000.0)), 1)
-    thr = float(WHISPER_PRE_SILENCE_RMS)
     rms = _rms_per_frame_int16(samples, frame)
     if rms.size < 1:
         return samples, None
+    thr = _adaptive_whisper_silence_rms(rms)
     voiced = rms > thr
     if not bool(np.any(voiced)):
         return samples[:0], "No speech detected (audio is mostly silence)."
@@ -2328,6 +2354,170 @@ def prepare_wav_path_for_whisper(source: Path) -> Tuple[Path, Optional[str], Opt
     return tmp, None, tmp
 
 
+def _default_whisper_prompt(language: Optional[str]) -> str:
+    lang = (language or "").strip().lower()
+    if lang == "en":
+        lang_hint = "The speech is English."
+    elif lang == "zh":
+        lang_hint = "The speech is Mandarin Chinese."
+    else:
+        lang_hint = "The speech is English, Mandarin Chinese, or a mix of those two."
+    return (
+        f"{lang_hint} Transcribe verbatim in the spoken language. Do not translate. "
+        "Do not output any other language. Do not add subtitles, timestamps, filler, "
+        "or repeated phrases. Common short test phrases may include: can you hear me, "
+        "test, \u6d4b\u8bd5, and counting numbers. If the audio is silent or unclear, "
+        "return empty text."
+    )
+
+
+def _whisper_prompt(language: Optional[str], prompt: Optional[str]) -> str:
+    base = _default_whisper_prompt(language)
+    extra = (prompt or "").strip()
+    if extra:
+        base = f"{base}\nContext words and names: {extra}"
+    return base[:WHISPER_TRANSCRIBE_PROMPT_CHAR_LIMIT]
+
+
+def _transcript_repeat_key(text: str) -> str:
+    return re.sub(r"[\W_]+", "", (text or "").casefold(), flags=re.UNICODE)
+
+
+def _strip_repeated_phrase_prefix(text: str, previous: str) -> str:
+    prev = previous.strip()
+    cur = text.strip()
+    if not prev or len(_transcript_repeat_key(prev)) < 2:
+        return text
+    if not cur.casefold().startswith(prev.casefold()):
+        return text
+    rest = cur[len(prev) :]
+    if not rest or (not rest[:1].isspace() and rest[:1] not in ",\uFF0C\u3001;\uFF1B"):
+        return text
+    leading = text[: len(text) - len(text.lstrip())]
+    return leading + rest.lstrip(" ,\uFF0C\u3001;\uFF1B")
+
+
+def _collapse_repeated_transcript_clauses(text: str) -> str:
+    """Collapse comma-separated repeat spam inside one sentence."""
+    sentence_re = re.compile(r"([^.!?\n\r\u3002\uff01\uff1f]+)([.!?\u3002\uff01\uff1f]*)(\s*)", re.UNICODE)
+    clause_sep_re = re.compile(r"([,\uFF0C\u3001;\uFF1B]\s*)", re.UNICODE)
+    pieces: List[str] = []
+    pos = 0
+    for sentence_match in sentence_re.finditer(text):
+        if sentence_match.start() > pos:
+            pieces.append(text[pos : sentence_match.start()])
+        body, end, space = sentence_match.groups()
+        tokens = clause_sep_re.split(body)
+        out: List[str] = []
+        last_key = ""
+        last_phrase = ""
+        last_clause_start = 0
+        i = 0
+        while i < len(tokens):
+            phrase = tokens[i]
+            sep = tokens[i + 1] if i + 1 < len(tokens) else ""
+            adjusted = _strip_repeated_phrase_prefix(phrase, last_phrase)
+            prefix_stripped = adjusted != phrase
+            key = _transcript_repeat_key(adjusted)
+            if prefix_stripped and key:
+                out = out[:last_clause_start]
+                last_key = ""
+                last_phrase = ""
+            if key and key == last_key:
+                i += 2
+                continue
+            clause_start = len(out)
+            out.append(adjusted)
+            if sep:
+                out.append(sep)
+            if key:
+                last_clause_start = clause_start
+                last_key = key
+                last_phrase = adjusted
+            i += 2
+        collapsed = re.sub(r"\s*[,\uFF0C\u3001;\uFF1B]\s*$", "", "".join(out)).strip()
+        pieces.append(collapsed + end + space)
+        pos = sentence_match.end()
+    if pos < len(text):
+        pieces.append(text[pos:])
+    return "".join(pieces).strip()
+
+
+def _collapse_repeated_transcript_sentences(text: str) -> str:
+    """Collapse consecutive duplicate sentence-like phrases from Whisper hallucinations."""
+    if not text.strip():
+        return ""
+    pieces: List[str] = []
+    last_key = ""
+    repeat_count = 0
+    pos = 0
+    sentence_re = re.compile(r"([^.!?\n\r\u3002\uff01\uff1f]+[.!?\u3002\uff01\uff1f]*)(\s*)", re.UNICODE)
+    for match in sentence_re.finditer(text):
+        if match.start() > pos:
+            pieces.append(text[pos : match.start()])
+        sentence = match.group(1)
+        space = match.group(2)
+        key = _transcript_repeat_key(sentence)
+        if key and key == last_key:
+            repeat_count += 1
+            if repeat_count <= WHISPER_REPEAT_SENTENCE_KEEP:
+                pieces.append(sentence + space)
+        else:
+            last_key = key
+            repeat_count = 1
+            pieces.append(sentence + space)
+        pos = match.end()
+    if pos < len(text):
+        pieces.append(text[pos:])
+    return "".join(pieces).strip()
+
+
+def _is_cjk_letter(ch: str) -> bool:
+    return (
+        "\u3400" <= ch <= "\u4dbf"
+        or "\u4e00" <= ch <= "\u9fff"
+        or "\uf900" <= ch <= "\ufaff"
+        or "\U00020000" <= ch <= "\U0002ebef"
+    )
+
+
+def _is_latin_letter(ch: str) -> bool:
+    return "LATIN" in unicodedata.name(ch, "")
+
+
+def _unsupported_transcript_script_ratio(text: str) -> Tuple[int, float]:
+    letters = 0
+    unsupported = 0
+    for ch in text:
+        if not unicodedata.category(ch).startswith("L"):
+            continue
+        letters += 1
+        if not (_is_latin_letter(ch) or _is_cjk_letter(ch)):
+            unsupported += 1
+    if letters <= 0:
+        return 0, 0.0
+    return letters, unsupported / float(letters)
+
+
+def clean_whisper_transcript(text: str, language: Optional[str]) -> str:
+    """Normalize Whisper text and reject obvious non-English/non-Chinese hallucinations."""
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned:
+        return ""
+    cleaned = _collapse_repeated_transcript_clauses(cleaned)
+    cleaned = _collapse_repeated_transcript_sentences(cleaned)
+    letters, unsupported_ratio = _unsupported_transcript_script_ratio(cleaned)
+    if (
+        letters >= WHISPER_UNSUPPORTED_SCRIPT_MIN_LETTERS
+        and unsupported_ratio > WHISPER_UNSUPPORTED_SCRIPT_RATIO
+    ):
+        return (
+            "Whisper transcription rejected: the result looked like a language outside "
+            "English/Chinese. Try again, or choose English/Chinese explicitly."
+        )
+    return cleaned
+
+
 
 
 def _transcribe_audio_openai_single(
@@ -2364,11 +2554,12 @@ def _transcribe_audio_openai_single(
         return "OPENAI_API_KEY is not set. Use TOKEN ADD in the main menu or set the environment variable."
 
     _pg(14)
-    add_field("model", "whisper-1")
+    add_field("model", OPENAI_TRANSCRIPTION_MODEL)
     if language:
         add_field("language", language)
-    if prompt and prompt.strip():
-        add_field("prompt", prompt.strip()[:WHISPER_TRANSCRIBE_PROMPT_CHAR_LIMIT])
+    prompt_text = _whisper_prompt(language, prompt)
+    if prompt_text:
+        add_field("prompt", prompt_text)
     add_field("temperature", str(temperature))
 
     _pg(22)
@@ -2420,7 +2611,7 @@ def _transcribe_audio_openai_single(
             parsed = json.loads(raw)
             text = parsed.get("text")
             if isinstance(text, str):
-                result = text.strip()
+                result = clean_whisper_transcript(text, language)
                 _pg(94)
             else:
                 result = "Whisper returned an unexpected response format."
@@ -2467,6 +2658,7 @@ def _is_likely_api_error_message_global(text: str) -> bool:
         "Whisper API error",
         "Whisper request failed",
         "Whisper returned",
+        "Whisper transcription rejected",
         "Could not read audio file",
         "Recording needs optional packages",
         "No speech detected",
@@ -2553,9 +2745,12 @@ def _transcribe_audio_openai_chunked(
         if _is_likely_api_error_message_global(chunk_result):
             return chunk_result
         if chunk_result:
+            if transcripts and _transcript_repeat_key(chunk_result) == _transcript_repeat_key(transcripts[-1]):
+                _pg(22 + int(72 * (ci + 1) / n_chunks))
+                continue
             transcripts.append(chunk_result)
         _pg(22 + int(72 * (ci + 1) / n_chunks))
-    merged = " ".join(t for t in transcripts if t.strip()).strip()
+    merged = clean_whisper_transcript(" ".join(t for t in transcripts if t.strip()).strip(), language)
     _pg(97)
     if merged:
         return merged
@@ -6766,6 +6961,7 @@ def open_journal_window_editor(
             "Whisper API error",
             "Whisper request failed",
             "Whisper returned",
+            "Whisper transcription rejected",
             "Could not read audio file",
             "Recording needs optional packages",
             "No speech detected",
