@@ -5,6 +5,8 @@ from datetime import date, datetime
 import base64
 import contextlib
 import ctypes
+import html
+import hmac
 import io
 import importlib
 import importlib.util
@@ -14,7 +16,9 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import runpy
+import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import webbrowser
@@ -27,7 +31,9 @@ import uuid
 import wave
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib import error, request
+from urllib.parse import parse_qs, unquote, urlparse
 import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from journal_i18n import UI_LANGUAGE_PREF_KEY, normalize_ui_language, ui_translate
 
@@ -83,6 +89,7 @@ def get_user_data_root() -> Path:
 USER_DATA_ROOT = get_user_data_root()
 DATA_DIR = USER_DATA_ROOT / "daily_logs"
 RECORDING_DIR = DATA_DIR / "Recording"
+IPHONE_INBOX_DIR = RECORDING_DIR / "iPhone Inbox"
 BACKUP_DIR = DATA_DIR / "backup"
 SETTINGS_DIR = USER_DATA_ROOT / "settings"
 LEGACY_DATA_DIR = BASE_DIR / "daily_logs"
@@ -155,6 +162,26 @@ TRANSCRIPTION_CONTENT_TYPES = {
     ".qt": "audio/mp4",
     ".wav": "audio/wav",
     ".webm": "audio/webm",
+}
+IPHONE_IMPORT_TOKEN_PREF_KEY = "iphone_import_token"
+IPHONE_IMPORT_DEFAULT_PORT = 8768
+IPHONE_IMPORT_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+IPHONE_IMPORT_CHUNK_BYTES = 1024 * 1024
+IPHONE_IMPORT_CONTENT_TYPE_SUFFIXES = {
+    "application/octet-stream": ".mov",
+    "application/quicktime": ".mov",
+    "audio/flac": ".flac",
+    "audio/m4a": ".m4a",
+    "audio/mp4": ".m4a",
+    "audio/mpeg": ".mp3",
+    "audio/mpga": ".mpga",
+    "audio/ogg": ".ogg",
+    "audio/wav": ".wav",
+    "audio/webm": ".webm",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "video/x-msvideo": ".mp4",
 }
 # Hover tooltips: narrow wrap → shorter line length, more lines (taller block).
 TOOLTIP_WRAP_PX = 220
@@ -1713,6 +1740,173 @@ def save_preferences(prefs: Dict[str, str]) -> bool:
         return True
     except OSError:
         return False
+
+
+def ensure_iphone_inbox_dir() -> Path:
+    IPHONE_INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    return IPHONE_INBOX_DIR
+
+
+def get_or_create_iphone_import_token() -> str:
+    prefs = load_preferences()
+    token = prefs.get(IPHONE_IMPORT_TOKEN_PREF_KEY, "").strip()
+    if len(token) >= 16 and re.fullmatch(r"[A-Za-z0-9._~-]+", token):
+        return token
+    token = secrets.token_urlsafe(18).rstrip("=")
+    prefs[IPHONE_IMPORT_TOKEN_PREF_KEY] = token
+    save_preferences(prefs)
+    return token
+
+
+def get_lan_ip_address() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = str(s.getsockname()[0])
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+    try:
+        host_ip = socket.gethostbyname(socket.gethostname())
+        if host_ip and not host_ip.startswith("127."):
+            return host_ip
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
+def get_computer_network_name_candidates() -> List[str]:
+    names: List[str] = []
+    seen: set[str] = set()
+    for raw in (os.getenv("COMPUTERNAME", ""), socket.gethostname()):
+        cleaned = re.sub(r"[^A-Za-z0-9-]+", "", str(raw or "").strip())
+        key = cleaned.casefold()
+        if cleaned and not cleaned.startswith("-") and key not in seen:
+            names.append(cleaned)
+            seen.add(key)
+    if names:
+        local_name = f"{names[0]}.local"
+        if local_name.casefold() not in seen:
+            names.append(local_name)
+    return names[:2]
+
+
+def build_iphone_upload_url(host: str, port: int, token: str) -> str:
+    return f"http://{host}:{port}/upload?token={token}"
+
+
+def build_iphone_mobile_page_url(host: str, port: int, token: str) -> str:
+    return f"http://{host}:{port}/iphone?token={token}"
+
+
+def build_iphone_receiver_urls(port: int, token: str) -> Dict[str, str]:
+    ip = get_lan_ip_address()
+    shortcut_url = build_iphone_upload_url(ip, port, token)
+    urls: Dict[str, str] = {
+        "wifi": shortcut_url,
+        "shortcut": shortcut_url,
+        "mobile": build_iphone_mobile_page_url(ip, port, token),
+    }
+    return urls
+
+
+def _filename_from_content_disposition(value: str) -> str:
+    if not value:
+        return ""
+    match = re.search(r"filename\*=UTF-8''([^;]+)", value, flags=re.IGNORECASE)
+    if match:
+        return unquote(match.group(1).strip().strip('"'))
+    match = re.search(r'filename="([^"]+)"', value, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"filename=([^;]+)", value, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip().strip('"')
+    return ""
+
+
+def _safe_iphone_upload_suffix(filename: str, content_type: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    if suffix in TRANSCRIPTION_MEDIA_SUFFIXES:
+        return suffix
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    suffix = IPHONE_IMPORT_CONTENT_TYPE_SUFFIXES.get(ctype, "")
+    if suffix in TRANSCRIPTION_MEDIA_SUFFIXES:
+        return suffix
+    return ""
+
+
+def _sanitize_iphone_upload_name(filename: str, content_type: str) -> Tuple[str, str]:
+    suffix = _safe_iphone_upload_suffix(filename, content_type)
+    if not suffix:
+        return "", ""
+    raw_stem = Path(filename).stem if filename else ""
+    stem = re.sub(r"[^A-Za-z0-9._ -]+", "_", raw_stem).strip(" ._-")
+    if not stem:
+        stem = "iphone_video" if suffix in TRANSCRIPTION_VIDEO_SUFFIXES else "iphone_audio"
+    if len(stem) > 80:
+        stem = stem[:80].rstrip(" ._-") or "iphone_media"
+    return stem, suffix
+
+
+def _unique_iphone_inbox_path(filename: str, content_type: str) -> Tuple[Optional[Path], str]:
+    stem, suffix = _sanitize_iphone_upload_name(filename, content_type)
+    if not suffix:
+        allowed = ", ".join(sorted(TRANSCRIPTION_MEDIA_SUFFIXES))
+        return None, f"Unsupported upload type. Use: {allowed}"
+    inbox = ensure_iphone_inbox_dir()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for attempt in range(200):
+        nonce = secrets.token_hex(3)
+        extra = f"_{attempt}" if attempt else ""
+        candidate = inbox / f"{stamp}_{stem}_{nonce}{extra}{suffix}"
+        if not candidate.exists() and not candidate.with_suffix(candidate.suffix + ".part").exists():
+            return candidate, ""
+    return None, "Could not create a unique iPhone Inbox filename."
+
+
+def list_pending_iphone_inbox_files() -> List[Path]:
+    try:
+        inbox = ensure_iphone_inbox_dir()
+    except OSError:
+        return []
+    items: List[Path] = []
+    try:
+        for path in inbox.iterdir():
+            if (
+                path.is_file()
+                and not path.name.lower().endswith(".part")
+                and is_transcription_media_file(path)
+            ):
+                items.append(path)
+    except OSError:
+        return []
+    return sorted(items, key=lambda p: (p.stat().st_mtime if p.exists() else float("inf"), p.name.lower()))
+
+
+def mark_iphone_inbox_files_processed(paths: List[Path]) -> None:
+    try:
+        processed_dir = ensure_iphone_inbox_dir() / "Processed"
+        processed_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    for src in paths:
+        try:
+            if not src.is_file() or src.parent.resolve() != IPHONE_INBOX_DIR.resolve():
+                continue
+            dest = processed_dir / src.name
+            if dest.exists():
+                stem = dest.stem
+                suffix = dest.suffix
+                for attempt in range(1, 200):
+                    alt = processed_dir / f"{stem}_{attempt}{suffix}"
+                    if not alt.exists():
+                        dest = alt
+                        break
+            shutil.move(str(src), str(dest))
+        except OSError:
+            continue
 
 
 def _is_pref_true(value: str) -> bool:
@@ -3584,8 +3778,15 @@ def open_journal_window_editor(
             edit_target_row = 0
 
     root = tk.Tk()
+    journal_cleanup_callbacks: List[Callable[[], None]] = []
 
     def destroy_journal_window() -> None:
+        while journal_cleanup_callbacks:
+            cb = journal_cleanup_callbacks.pop()
+            try:
+                cb()
+            except Exception:
+                pass
         shutdown_virtual_reader_child_server()
         root.destroy()
 
@@ -4457,6 +4658,23 @@ def open_journal_window_editor(
         cursor="hand2",
     )
     transcribe_file_btn.pack(pady=(6, 0))
+    receive_iphone_btn = tk.Button(
+        transcribe_hover,
+        text="Receive from iPhone",
+        state="normal",
+        width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+        bg=_tid[0],
+        fg=_tid[1],
+        activebackground=_tid[2],
+        activeforeground=_tid[3],
+        disabledforeground=_tid[4],
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=8,
+        cursor="hand2",
+    )
+    receive_iphone_btn.pack(pady=(6, 0))
     stt_box.insert("1.0", draft_speech)
 
     report_outer = tk.Frame(right_col, bg=t_init.surface)
@@ -7052,8 +7270,524 @@ def open_journal_window_editor(
         except Exception:
             pass
 
+    iphone_pending_paths: List[Path] = []
+    iphone_pending_keys: set[str] = set()
+    iphone_receiver_state: Dict[str, Any] = {
+        "active": False,
+        "server": None,
+        "thread": None,
+        "url": "",
+        "urls": {},
+        "token": get_or_create_iphone_import_token(),
+        "port": IPHONE_IMPORT_DEFAULT_PORT,
+    }
+
+    def _iphone_path_key(path: Path) -> str:
+        try:
+            return str(path.resolve()).casefold()
+        except OSError:
+            return str(path).casefold()
+
+    def _set_iphone_status(text: str) -> None:
+        try:
+            stt_status.config(text=text)
+        except tk.TclError:
+            pass
+
+    def _update_iphone_receive_button() -> None:
+        t = th()
+        bg, fg, abg, afg = t.side_action_config()
+        active = bool(iphone_receiver_state.get("active"))
+        receive_iphone_btn.config(
+            text=tr("journal.iphone_stop") if active else tr("journal.iphone_receive"),
+            state="normal",
+            width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+            bg=bg,
+            fg=fg,
+            activebackground=abg,
+            activeforeground=afg,
+            cursor="hand2",
+        )
+
+    def _iphone_pending_status_text() -> str:
+        count = len(iphone_pending_paths)
+        if count <= 0:
+            return ""
+        return tr("journal.iphone_pending").format(count=count)
+
+    def _refresh_iphone_pending_status() -> None:
+        text = _iphone_pending_status_text()
+        if text and not transcribing_busy["v"]:
+            _set_iphone_status(text)
+
+    def _move_iphone_batch_to_processed(success: bool, paths: List[Path]) -> None:
+        if success:
+            mark_iphone_inbox_files_processed(paths)
+
+    def drain_iphone_pending() -> None:
+        if transcribing_busy["v"] or recording_ui_busy["v"]:
+            _refresh_iphone_pending_status()
+            return
+        if not iphone_pending_paths:
+            if bool(iphone_receiver_state.get("active")):
+                _set_iphone_status(tr("journal.iphone_waiting"))
+            return
+        if not get_openai_api_key():
+            _set_iphone_status(_iphone_pending_status_text())
+            return
+        paths = sorted(iphone_pending_paths, key=_transcription_file_sort_key)
+        iphone_pending_paths.clear()
+        iphone_pending_keys.clear()
+        _set_stt_saved_path_display(tr("journal.iphone_inbox"))
+        begin_transcribe_paths(
+            paths,
+            display_label=tr("journal.iphone_inbox"),
+            after_done=_move_iphone_batch_to_processed,
+        )
+
+    def enqueue_iphone_imports(paths: List[Path]) -> None:
+        added = 0
+        for path in paths:
+            if not path.exists() or not is_transcription_media_file(path):
+                continue
+            key = _iphone_path_key(path)
+            if key in iphone_pending_keys:
+                continue
+            iphone_pending_keys.add(key)
+            iphone_pending_paths.append(path)
+            added += 1
+        if added:
+            _set_iphone_status(tr("journal.iphone_received").format(count=added))
+        root.after(100, drain_iphone_pending)
+
+    def _build_iphone_setup_message(url: str, token: str) -> str:
+        return tr("journal.iphone_setup_guide").format(
+            url=url,
+            token=token,
+            inbox=str(IPHONE_INBOX_DIR),
+        )
+
+    def show_iphone_setup_window(url: str, token: str) -> None:
+        win = tk.Toplevel(root)
+        win.title(tr("journal.iphone_inbox"))
+        win.transient(root)
+        win.geometry("480x620")
+        win.minsize(420, 540)
+        t = th()
+        win.configure(bg=t.surface)
+        wrap = tk.Frame(win, bg=t.surface, padx=20, pady=18)
+        wrap.pack(fill="both", expand=True)
+        wrap.grid_columnconfigure(0, weight=1)
+
+        title = tk.Label(
+            wrap,
+            text=tr("journal.iphone_waiting"),
+            bg=t.surface,
+            fg=t.text,
+            font=("Segoe UI", 13, "bold"),
+            anchor="w",
+        )
+        title.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+
+        hint = tk.Label(
+            wrap,
+            text=tr("journal.iphone_qr_hint"),
+            bg=t.surface,
+            fg=t.muted,
+            justify="left",
+            anchor="w",
+            wraplength=420,
+            font=("Segoe UI", 9),
+        )
+        hint.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+
+        def _copy(value: str) -> None:
+            try:
+                win.clipboard_clear()
+                win.clipboard_append(value)
+                win.update()
+            except tk.TclError:
+                copy_text_to_clipboard(value)
+
+        qr_box = tk.Frame(wrap, bg="white", padx=10, pady=10)
+        qr_box.grid(row=2, column=0, pady=(0, 14))
+        qr_label = tk.Label(qr_box, bg="white")
+        qr_label.pack()
+        qr_error = tk.Label(
+            qr_box,
+            text="",
+            bg="white",
+            fg="#111827",
+            justify="center",
+            wraplength=300,
+            font=("Segoe UI", 9),
+        )
+
+        shortcut_frame = tk.Frame(wrap, bg=t.surface)
+        shortcut_frame.grid(row=3, column=0, sticky="ew", pady=(0, 12))
+        shortcut_frame.grid_columnconfigure(0, weight=1)
+        tk.Label(
+            shortcut_frame,
+            text=tr("journal.iphone_shortcut_url"),
+            bg=t.surface,
+            fg=t.muted,
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+        shortcut_entry = tk.Entry(
+            shortcut_frame,
+            readonlybackground=t.field,
+            fg=t.text,
+            relief="flat",
+            font=("Segoe UI", 9),
+        )
+        shortcut_entry.grid(row=1, column=0, sticky="ew", pady=(4, 0), ipady=4)
+
+        note = tk.Label(
+            wrap,
+            text=tr("journal.iphone_simple_note"),
+            bg=t.surface,
+            fg=t.muted,
+            justify="left",
+            anchor="w",
+            wraplength=420,
+            font=("Segoe UI", 9),
+        )
+        note.grid(row=4, column=0, sticky="ew", pady=(0, 14))
+
+        def _set_entry_value(value: str) -> None:
+            shortcut_entry.config(state="normal")
+            shortcut_entry.delete(0, "end")
+            shortcut_entry.insert(0, value)
+            shortcut_entry.config(state="readonly")
+
+        def _render_qr(qr_url: str) -> None:
+            try:
+                import qrcode
+                from PIL import ImageTk
+
+                qr = qrcode.QRCode(border=2, box_size=8)
+                qr.add_data(qr_url)
+                qr.make(fit=True)
+                image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+                photo = ImageTk.PhotoImage(image)
+                qr_label.configure(image=photo, text="")
+                qr_label.image = photo  # type: ignore[attr-defined]
+                qr_error.pack_forget()
+            except Exception:
+                qr_label.configure(image="", text="")
+                qr_label.image = None  # type: ignore[attr-defined]
+                qr_error.configure(text=tr("journal.iphone_qr_failed"))
+                qr_error.pack(padx=16, pady=16)
+
+        def _refresh_urls() -> None:
+            try:
+                port = int(iphone_receiver_state.get("port") or IPHONE_IMPORT_DEFAULT_PORT)
+            except (TypeError, ValueError):
+                port = IPHONE_IMPORT_DEFAULT_PORT
+            token_now = str(iphone_receiver_state.get("token") or token)
+            refreshed = build_iphone_receiver_urls(port, token_now)
+            iphone_receiver_state["urls"] = refreshed
+            iphone_receiver_state["url"] = refreshed.get("wifi", "")
+            if refreshed.get("wifi"):
+                _set_stt_saved_path_display(refreshed["wifi"])
+            _set_entry_value(refreshed.get("shortcut", refreshed.get("wifi", "")))
+            _render_qr(refreshed.get("mobile", refreshed.get("wifi", "")))
+
+        _refresh_urls()
+
+        button_row = tk.Frame(wrap, bg=t.surface)
+        button_row.grid(row=5, column=0, sticky="e")
+        copy_btn = tk.Button(
+            button_row,
+            text=tr("journal.iphone_copy_shortcut"),
+            command=lambda: _copy(shortcut_entry.get()),
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            relief="flat",
+            padx=18,
+            pady=6,
+            cursor="hand2",
+        )
+        copy_btn.pack(side="left", padx=(0, 8))
+        refresh_btn = tk.Button(
+            button_row,
+            text=tr("journal.iphone_refresh_qr"),
+            command=_refresh_urls,
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            relief="flat",
+            padx=18,
+            pady=6,
+            cursor="hand2",
+        )
+        refresh_btn.pack(side="left", padx=(0, 8))
+        close_btn = tk.Button(
+            button_row,
+            text=tr("find.close"),
+            command=win.destroy,
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            relief="flat",
+            padx=18,
+            pady=6,
+            cursor="hand2",
+        )
+        close_btn.pack(side="left")
+
+    def _make_iphone_upload_handler(token: str) -> type[BaseHTTPRequestHandler]:
+        class IPhoneUploadHandler(BaseHTTPRequestHandler):
+            server_version = "DailyLoggerIPhone/1.0"
+
+            def log_message(self, _fmt: str, *_args: Any) -> None:
+                return
+
+            def _send_text(self, status: int, text: str, content_type: str = "text/plain; charset=utf-8") -> None:
+                data = text.encode("utf-8", errors="replace")
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _authorized(self) -> bool:
+                parsed = urlparse(self.path)
+                qs = parse_qs(parsed.query)
+                provided = (
+                    (qs.get("token") or [""])[0]
+                    or self.headers.get("X-DailyLogger-Token", "")
+                    or self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+                )
+                return hmac.compare_digest(str(provided), token)
+
+            def do_GET(self) -> None:
+                parsed = urlparse(self.path)
+                if parsed.path == "/api/health":
+                    self._send_text(200, "ok")
+                    return
+                if parsed.path.rstrip("/") == "/iphone":
+                    if not self._authorized():
+                        body = (
+                            "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                            "<title>Daily Logger iPhone Inbox</title>"
+                            "<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;"
+                            "margin:36px auto;max-width:560px;padding:0 22px;line-height:1.45;color:#111}</style>"
+                            "<h1>Daily Logger iPhone Inbox</h1>"
+                            "<p>This link is missing or has an invalid upload token. Start Receive from iPhone again and scan the QR code.</p>"
+                        )
+                        self._send_text(403, body, "text/html; charset=utf-8")
+                        return
+                    body = (
+                        "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                        "<title>Daily Logger iPhone Inbox</title>"
+                        "<style>"
+                        ":root{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;color:#111;background:#f6f7fb}"
+                        "body{margin:0;padding:22px}.wrap{max-width:560px;margin:0 auto}"
+                        "h1{font-size:26px;margin:10px 0 8px}.hint{color:#4b5563;line-height:1.45}"
+                        ".panel{background:white;border:1px solid #e5e7eb;border-radius:14px;padding:18px;margin-top:18px;box-shadow:0 8px 28px rgba(15,23,42,.08)}"
+                        "input[type=file]{box-sizing:border-box;width:100%;padding:14px;border:1px dashed #94a3b8;border-radius:12px;background:#f8fafc}"
+                        "button{width:100%;margin-top:14px;padding:14px 16px;border:0;border-radius:12px;background:#2563eb;color:white;font-size:17px;font-weight:700}"
+                        "button:disabled{background:#94a3b8}.bar{height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin-top:14px}"
+                        ".fill{height:100%;width:0;background:#2563eb;transition:width .15s}.status{white-space:pre-wrap;margin-top:14px;color:#1f2937;line-height:1.45}"
+                        ".ok{color:#047857}.err{color:#b91c1c}"
+                        "</style></head><body><main class='wrap'>"
+                        "<h1>Daily Logger iPhone Inbox</h1>"
+                        "<p class='hint'>Choose iPhone videos or audio files. Daily Logger will receive them on the PC and transcribe them in recording-time order.</p>"
+                        "<section class='panel'>"
+                        "<input id='files' type='file' multiple accept='video/*,audio/*,.mov,.mp4,.m4a,.wav,.mp3,.webm,.ogg,.flac,.mpeg,.mpga,.qt'>"
+                        "<button id='upload'>Upload to Daily Logger</button>"
+                        "<div class='bar'><div id='fill' class='fill'></div></div>"
+                        "<div id='status' class='status'>Waiting for files.</div>"
+                        "</section></main>"
+                        "<script>"
+                        "const token=new URLSearchParams(location.search).get('token')||'';"
+                        "const input=document.getElementById('files');const btn=document.getElementById('upload');"
+                        "const statusEl=document.getElementById('status');const fill=document.getElementById('fill');"
+                        "function setStatus(text,cls=''){statusEl.className='status '+cls;statusEl.textContent=text}"
+                        "function endpoint(file){const q=new URLSearchParams({token,filename:file.name,lastModified:String(file.lastModified||0)});return '/upload?'+q.toString()}"
+                        "function uploadOne(file,index,total){return new Promise((resolve,reject)=>{"
+                        "const xhr=new XMLHttpRequest();xhr.open('POST',endpoint(file));"
+                        "xhr.setRequestHeader('Content-Type',file.type||'application/octet-stream');"
+                        "xhr.upload.onprogress=e=>{if(e.lengthComputable){const part=e.loaded/e.total;const overall=((index+part)/total)*100;fill.style.width=overall.toFixed(1)+'%';"
+                        "setStatus(`Uploading ${index+1}/${total}: ${file.name} (${Math.round(part*100)}%)`)}};"
+                        "xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300){fill.style.width=(((index+1)/total)*100).toFixed(1)+'%';resolve(xhr.responseText)}"
+                        "else{reject(new Error(xhr.responseText||`Upload failed (${xhr.status})`))}};"
+                        "xhr.onerror=()=>reject(new Error('Could not reach Daily Logger. Keep the app open and stay on the same Wi-Fi.'));"
+                        "xhr.send(file);});}"
+                        "btn.addEventListener('click',async()=>{const files=Array.from(input.files||[]).sort((a,b)=>(a.lastModified||0)-(b.lastModified||0)||a.name.localeCompare(b.name));"
+                        "if(!files.length){setStatus('Choose one or more files first.','err');return}"
+                        "btn.disabled=true;fill.style.width='0';"
+                        "try{for(let i=0;i<files.length;i++){await uploadOne(files[i],i,files.length)}setStatus(`Uploaded ${files.length} file(s). You can return to Daily Logger.`, 'ok')}"
+                        "catch(err){setStatus(err.message||String(err),'err')}"
+                        "finally{btn.disabled=false}});"
+                        "</script></body></html>"
+                    )
+                    self._send_text(200, body, "text/html; charset=utf-8")
+                    return
+                body = (
+                    "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                    "<title>Daily Logger iPhone Inbox</title>"
+                    "<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;"
+                    "margin:36px auto;max-width:560px;padding:0 22px;line-height:1.45;color:#111}</style>"
+                    "<h1>Daily Logger iPhone Inbox</h1>"
+                    "<p>Receiver is running. Open Daily Logger and scan the iPhone Inbox QR code to upload files.</p>"
+                )
+                self._send_text(200, body, "text/html; charset=utf-8")
+
+            def do_POST(self) -> None:
+                parsed = urlparse(self.path)
+                if parsed.path.rstrip("/") not in {"", "/upload", "/iphone-upload"}:
+                    self._send_text(404, "Upload endpoint not found.")
+                    return
+                if not self._authorized():
+                    self._send_text(403, "Invalid Daily Logger upload token.")
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0") or "0")
+                except ValueError:
+                    length = 0
+                if length <= 0:
+                    self._send_text(400, "No file body was uploaded.")
+                    return
+                if length > IPHONE_IMPORT_MAX_UPLOAD_BYTES:
+                    self._send_text(413, "That file is too large for the iPhone Inbox receiver.")
+                    return
+
+                content_type = self.headers.get_content_type()
+                if content_type.startswith("multipart/"):
+                    self._send_text(
+                        415,
+                        "Use iPhone Shortcuts request body: File, not Form Data.",
+                    )
+                    return
+                qs = parse_qs(parsed.query)
+                filename = unquote((qs.get("filename") or [""])[0]).strip()
+                if not filename:
+                    filename = self.headers.get("X-Filename", "").strip()
+                if not filename:
+                    filename = _filename_from_content_disposition(
+                        self.headers.get("Content-Disposition", "")
+                    ).strip()
+                dest, err_msg = _unique_iphone_inbox_path(filename, content_type)
+                if dest is None:
+                    self._send_text(415, err_msg)
+                    return
+                tmp = dest.with_suffix(dest.suffix + ".part")
+                remaining = length
+                try:
+                    with tmp.open("wb") as out:
+                        while remaining > 0:
+                            chunk = self.rfile.read(min(IPHONE_IMPORT_CHUNK_BYTES, remaining))
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            remaining -= len(chunk)
+                    if remaining != 0:
+                        try:
+                            tmp.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        self._send_text(400, "Upload ended before the full file was received.")
+                        return
+                    tmp.replace(dest)
+                    try:
+                        last_modified_raw = (qs.get("lastModified") or [""])[0]
+                        last_modified = float(last_modified_raw)
+                        if last_modified > 10_000_000_000:
+                            last_modified /= 1000.0
+                        if 946684800 <= last_modified <= 4102444800:
+                            os.utime(dest, (last_modified, last_modified))
+                    except (OSError, TypeError, ValueError):
+                        pass
+                except OSError as exc:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    self._send_text(500, f"Could not save upload: {exc}")
+                    return
+
+                root.after(0, lambda p=dest: enqueue_iphone_imports([p]))
+                self._send_text(200, f"Saved to Daily Logger iPhone Inbox: {dest.name}")
+
+        return IPhoneUploadHandler
+
+    def stop_iphone_receiver() -> None:
+        server = iphone_receiver_state.get("server")
+        iphone_receiver_state["active"] = False
+        iphone_receiver_state["server"] = None
+        iphone_receiver_state["thread"] = None
+        iphone_receiver_state["url"] = ""
+        iphone_receiver_state["urls"] = {}
+        if server is not None:
+            def _shutdown() -> None:
+                try:
+                    server.shutdown()
+                    server.server_close()
+                except Exception:
+                    pass
+
+            threading.Thread(target=_shutdown, daemon=True).start()
+        _update_iphone_receive_button()
+
+    def start_iphone_receiver() -> None:
+        if bool(iphone_receiver_state.get("active")):
+            return
+        token = str(iphone_receiver_state.get("token") or get_or_create_iphone_import_token())
+        handler = _make_iphone_upload_handler(token)
+        server = None
+        bound_port = 0
+        last_exc: Optional[BaseException] = None
+        for port in range(IPHONE_IMPORT_DEFAULT_PORT, IPHONE_IMPORT_DEFAULT_PORT + 25):
+            try:
+                server = ThreadingHTTPServer(("0.0.0.0", port), handler)
+                server.daemon_threads = True
+                bound_port = port
+                break
+            except OSError as exc:
+                last_exc = exc
+        if server is None:
+            messagebox.showerror(
+                tr("journal.iphone_inbox"),
+                tr("journal.iphone_start_failed").format(exc=last_exc or "port unavailable"),
+            )
+            return
+        urls = build_iphone_receiver_urls(bound_port, token)
+        url = urls.get("wifi", "")
+        iphone_receiver_state.update({
+            "active": True,
+            "server": server,
+            "port": bound_port,
+            "url": url,
+            "urls": urls,
+            "token": token,
+        })
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        iphone_receiver_state["thread"] = thread
+        thread.start()
+        _set_stt_saved_path_display(url)
+        _set_iphone_status(tr("journal.iphone_waiting"))
+        _update_iphone_receive_button()
+        show_iphone_setup_window(url, token)
+
+    def toggle_iphone_receiver() -> None:
+        if bool(iphone_receiver_state.get("active")):
+            stop_iphone_receiver()
+            return
+        start_iphone_receiver()
+
+    journal_cleanup_callbacks.append(stop_iphone_receiver)
+
     def update_transcribe_ui() -> None:
         t = th()
+        _update_iphone_receive_button()
 
         def _set_transcribe_file_button_enabled(enabled: bool) -> None:
             if enabled:
@@ -7150,6 +7884,11 @@ def open_journal_window_editor(
         if recording_ui_busy["v"]:
             return tr("journal.transcribe_tooltip_wait_recording")
         return tr("journal.transcribe_file_tooltip")
+
+    def receive_iphone_tooltip_text() -> str:
+        if bool(iphone_receiver_state.get("active")):
+            return tr("journal.iphone_active_tooltip")
+        return tr("journal.iphone_receive_tooltip")
 
     def begin_transcribe_path(use_path: Path, *, display_path: Optional[Path] = None) -> None:
         if not use_path.exists():
@@ -7336,7 +8075,12 @@ def open_journal_window_editor(
             mtime = float("inf")
         return (mtime, path.name.lower(), str(path).lower())
 
-    def begin_transcribe_paths(use_paths: List[Path]) -> None:
+    def begin_transcribe_paths(
+        use_paths: List[Path],
+        *,
+        display_label: Optional[str] = None,
+        after_done: Optional[Callable[[bool, List[Path]], None]] = None,
+    ) -> None:
         ordered_paths = sorted(use_paths, key=_transcription_file_sort_key)
         if not ordered_paths:
             return
@@ -7351,7 +8095,9 @@ def open_journal_window_editor(
                 "No OpenAI API key. Use TOKEN ADD in the main menu or set OPENAI_API_KEY.",
             )
             return
-        if len(ordered_paths) == 1:
+        if display_label:
+            _set_stt_saved_path_display(display_label)
+        elif len(ordered_paths) == 1:
             _set_stt_saved_path_display(f"Selected: {ordered_paths[0]}")
         else:
             _set_stt_saved_path_display(f"Selected: {len(ordered_paths)} files")
@@ -7452,6 +8198,9 @@ def open_journal_window_editor(
                 update_transcribe_ui()
                 stt_status.config(text="")
                 if error_result:
+                    if after_done is not None:
+                        after_done(False, ordered_paths)
+                    root.after(100, drain_iphone_pending)
                     messagebox.showerror("Speech to text", error_result[:4000])
                     return
                 if skipped_results:
@@ -7464,6 +8213,9 @@ def open_journal_window_editor(
                     )
                 save_draft()
                 refresh_save_entry_state()
+                if after_done is not None:
+                    after_done(True, ordered_paths)
+                root.after(100, drain_iphone_pending)
 
             root.after(0, done)
 
@@ -7500,8 +8252,10 @@ def open_journal_window_editor(
 
     transcribe_btn.config(command=run_transcribe)
     transcribe_file_btn.config(command=run_transcribe_file)
+    receive_iphone_btn.config(command=toggle_iphone_receiver)
     bind_hover_tooltip(transcribe_btn, transcribe_tooltip_text)
     bind_hover_tooltip(transcribe_file_btn, transcribe_file_tooltip_text)
+    bind_hover_tooltip(receive_iphone_btn, receive_iphone_tooltip_text)
 
     def transcribe_rest_style() -> Tuple[str, str, str, str, str]:
         t = th()
@@ -7526,6 +8280,9 @@ def open_journal_window_editor(
             return ("disabled", b0, b1, b2, b3)
         return t.side_action_bind_rest()
 
+    def receive_iphone_rest_style() -> Tuple[str, str, str, str, str]:
+        return th().side_action_bind_rest()
+
     bind_button_hover_if_enabled(
         transcribe_btn,
         transcribe_rest_style,
@@ -7538,7 +8295,14 @@ def open_journal_window_editor(
         lambda: th().hover_primary,
         lambda: "white",
     )
+    bind_button_hover_if_enabled(
+        receive_iphone_btn,
+        receive_iphone_rest_style,
+        lambda: th().hover_primary,
+        lambda: "white",
+    )
     update_transcribe_ui()
+    root.after(300, lambda: enqueue_iphone_imports(list_pending_iphone_inbox_files()))
     wave_canvas.bind("<Configure>", lambda _e: redraw_waveform_canvas())
     wave_canvas.after(80, redraw_waveform_canvas)
 
@@ -8802,6 +9566,11 @@ def open_journal_window_editor(
         stt_lang_lbl.config(text=tr("journal.lang_label"))
         transcribe_btn.config(text=tr("journal.transcribe"))
         transcribe_file_btn.config(text=tr("journal.transcribe_file"))
+        receive_iphone_btn.config(
+            text=tr("journal.iphone_stop")
+            if bool(iphone_receiver_state.get("active"))
+            else tr("journal.iphone_receive")
+        )
         gen_button.config(text=tr("journal.generate_report"))
         save_entry_btn.config(text=tr("journal.save_entry"))
         start_rec_button.config(text=tr("journal.rec.start"))
@@ -9086,6 +9855,7 @@ def open_journal_window_editor(
             highlightcolor=t.accent,
         )
         stt_scroll.config(bg=t.panel, troughcolor=t.field, activebackground=t.accent)
+        _update_iphone_receive_button()
         report_outer.configure(bg=t.surface)
         report_header.configure(bg=t.surface)
         report_title_lbl.configure(

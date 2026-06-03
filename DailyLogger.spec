@@ -15,7 +15,7 @@ a = Analysis(
         ('virtual-journal-reader/serve_reader.py', 'virtual-journal-reader'),
         *imageio_ffmpeg_datas,
     ],
-    hiddenimports=['imageio_ffmpeg'],
+    hiddenimports=['imageio_ffmpeg', 'qrcode', 'qrcode.image.pil'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

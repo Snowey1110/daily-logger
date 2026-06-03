@@ -76,6 +76,58 @@ _EN: Dict[str, str] = {
     "journal.lang_label": "Language:",
     "journal.transcribe": "Transcribe",
     "journal.transcribe_file": "Transcribe File",
+    "journal.iphone_receive": "Receive from iPhone",
+    "journal.iphone_stop": "Stop iPhone",
+    "journal.iphone_inbox": "iPhone Inbox",
+    "journal.iphone_waiting": "Waiting for iPhone upload...",
+    "journal.iphone_received": "Received {count} iPhone file(s), transcribing...",
+    "journal.iphone_pending": "Pending iPhone files: {count}",
+    "journal.iphone_start_failed": "Could not start iPhone receiver: {exc}",
+    "journal.iphone_receive_tooltip": "Start iPhone upload receiver.",
+    "journal.iphone_active_tooltip": "Receiver is running. Click to stop.",
+    "journal.iphone_upload_url": "Upload URL",
+    "journal.iphone_wifi_url": "Current Wi-Fi URL",
+    "journal.iphone_computer_url": "Computer-name URL",
+    "journal.iphone_local_url": "Computer-name .local URL",
+    "journal.iphone_setup_page_url": "Phone setup page",
+    "journal.iphone_token": "Passcode/token",
+    "journal.iphone_copy": "Copy",
+    "journal.iphone_refresh_url": "Refresh URLs",
+    "journal.iphone_shortcut_url": "Shortcut URL",
+    "journal.iphone_copy_shortcut": "Copy Shortcut URL",
+    "journal.iphone_refresh_qr": "Refresh QR / URL",
+    "journal.iphone_qr_hint": (
+        "Scan the QR code with your iPhone to pick videos or audio files and send them to Daily Logger."
+    ),
+    "journal.iphone_simple_note": (
+        "Shortcut option: copy the URL below into Get Contents of URL for stable Wi-Fi use."
+    ),
+    "journal.iphone_qr_failed": "QR preview is unavailable. Copy the Shortcut URL instead.",
+    "journal.iphone_url_note": (
+        "If Wi-Fi changes, click Refresh URLs and update only the URL field in your existing Shortcut. "
+        "If a computer-name URL works from your iPhone, use that one so the Shortcut usually survives IP changes."
+    ),
+    "journal.iphone_setup_steps": (
+        "One-time iPhone Shortcut setup:\n"
+        "1. Open Shortcuts and create \"Send to Daily Logger\".\n"
+        "2. In Shortcut Details, turn on \"Show in Share Sheet\" / \"Use as Quick Action\" and set it to receive files or media.\n"
+        "3. Add \"Get Contents of URL\".\n"
+        "4. Set URL to one upload URL above.\n"
+        "5. Set Method to POST, Request Body to File, and the File value to Shortcut Input.\n\n"
+        "Daily use: record video, tap Share, choose the Shortcut. If the PC IP changes, edit only the URL field."
+    ),
+    "journal.iphone_setup_guide": (
+        "Daily Logger is waiting for iPhone uploads.\n\n"
+        "Upload URL:\n{url}\n\n"
+        "Passcode/token:\n{token}\n\n"
+        "One-time iPhone Shortcut setup:\n"
+        "1. Open Shortcuts and create \"Send to Daily Logger\".\n"
+        "2. Enable \"Show in Share Sheet\" / \"Use as Quick Action\" and receive files/media.\n"
+        "3. Add \"Get Contents of URL\".\n"
+        "4. Set URL to the Upload URL above.\n"
+        "5. Set Method to POST, Request Body to File, and File to Shortcut Input.\n\n"
+        "Daily use: record video, tap Share, choose the Shortcut. If the PC IP changes, update only the URL field. Files save to:\n{inbox}"
+    ),
     "journal.transcribe_file_tooltip": (
         "Choose one or more audio/video files to transcribe.\n"
         "Files are transcribed oldest to newest. Supports app WAV recordings and iPhone videos."
@@ -296,6 +348,59 @@ _ZH: Dict[str, str] = {
     "journal.open": "打开",
     "journal.lang_label": "语言：",
     "journal.transcribe": "转写",
+    "journal.transcribe_file": "转写文件",
+    "journal.transcribe_file_tooltip": (
+        "选择一个或多个音频/视频文件转写。\n"
+        "文件会按时间从旧到新转写，支持应用 WAV 录音和 iPhone 视频。"
+    ),
+    "journal.iphone_receive": "从 iPhone 接收",
+    "journal.iphone_stop": "停止 iPhone",
+    "journal.iphone_inbox": "iPhone 收件箱",
+    "journal.iphone_waiting": "等待 iPhone 上传...",
+    "journal.iphone_received": "已收到 {count} 个 iPhone 文件，正在转写...",
+    "journal.iphone_pending": "待处理 iPhone 文件：{count}",
+    "journal.iphone_start_failed": "无法启动 iPhone 接收：{exc}",
+    "journal.iphone_receive_tooltip": "启动 iPhone 上传接收器。",
+    "journal.iphone_active_tooltip": "接收器正在运行，点击可停止。",
+    "journal.iphone_upload_url": "上传 URL",
+    "journal.iphone_wifi_url": "当前 Wi-Fi URL",
+    "journal.iphone_computer_url": "电脑名称 URL",
+    "journal.iphone_local_url": "电脑名称 .local URL",
+    "journal.iphone_setup_page_url": "手机设置页面",
+    "journal.iphone_token": "通行码/令牌",
+    "journal.iphone_copy": "复制",
+    "journal.iphone_refresh_url": "刷新 URL",
+    "journal.iphone_shortcut_url": "快捷指令 URL",
+    "journal.iphone_copy_shortcut": "复制快捷指令 URL",
+    "journal.iphone_refresh_qr": "刷新二维码 / URL",
+    "journal.iphone_qr_hint": "用 iPhone 扫二维码，选择视频或音频文件并发送到 Daily Logger。",
+    "journal.iphone_simple_note": "快捷指令选项：稳定 Wi-Fi 下，把下面的 URL 复制到“获取 URL 内容”。",
+    "journal.iphone_qr_failed": "二维码预览不可用。请改为复制快捷指令 URL。",
+    "journal.iphone_url_note": (
+        "如果 Wi-Fi 变化，点刷新 URL，然后只修改现有快捷指令里的 URL 字段。"
+        "如果电脑名称 URL 在 iPhone 上能打开，就用它，之后通常不用因为 IP 变化而修改。"
+    ),
+    "journal.iphone_setup_steps": (
+        "一次性 iPhone 快捷指令设置：\n"
+        "1. 打开快捷指令，创建 \"Send to Daily Logger\"。\n"
+        "2. 在详情里启用“在共享表单中显示”/“用作快速操作”，并设置接收文件或媒体。\n"
+        "3. 添加“获取 URL 内容”。\n"
+        "4. URL 填上面的一个上传 URL。\n"
+        "5. 方法选 POST，请求体选文件，文件值选快捷指令输入。\n\n"
+        "日常使用：录视频，点共享，选这个快捷指令。如果电脑 IP 变化，只改 URL 字段。"
+    ),
+    "journal.iphone_setup_guide": (
+        "Daily Logger 正在等待 iPhone 上传。\n\n"
+        "上传 URL：\n{url}\n\n"
+        "通行码/令牌：\n{token}\n\n"
+        "一次性 iPhone 快捷指令设置：\n"
+        "1. 打开快捷指令，创建 \"Send to Daily Logger\"。\n"
+        "2. 启用“在共享表单中显示”/“用作快速操作”，接收文件/媒体。\n"
+        "3. 添加“获取 URL 内容”。\n"
+        "4. URL 填上面的上传 URL。\n"
+        "5. 方法选 POST，请求体选文件，文件值选快捷指令输入。\n\n"
+        "日常使用：录视频，点共享，选这个快捷指令。如果电脑 IP 变化，只改 URL 字段。文件保存到：\n{inbox}"
+    ),
     "journal.transcribe_tooltip_busy": "正在转写…",
     "journal.transcribe_tooltip_no_audio": "请先录音",
     "journal.transcribe_tooltip_ok": "将上一段录音转为文字。\n会产生少量 API 费用。",
