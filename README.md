@@ -8,13 +8,20 @@ Daily Logger is a Windows-first journal app for fast daily notes, recordings, sp
 
 ## Downloads
 
+Most users only need **DailyLoggerPortable.zip**. The add-ons are optional tools for heavier features, and Daily Logger can install them for you from **Settings > Download Manager** after the app is running.
+
 | Package | Use it for | Link |
 | --- | --- | --- |
-| Daily Logger Portable | Main app with journal, cloud transcription, AI tools, reader, settings, and backups. | [Download](https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerPortable.zip) |
-| Local Transcription Addon | Optional offline Whisper helper for local `tiny`, `base`, `small`, and `medium` transcription models. | [Download](https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerLocalTranscriptionAddon.zip) |
-| Media Tools Addon | Optional video/audio conversion tools for iPhone videos, Voice Memos, large media splitting, and file preparation. | [Download](https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerMediaToolsAddon.zip) |
+| Daily Logger Portable | Start here. This is the main app with journal, cloud transcription, AI tools, reader, settings, and backups. | [Download](https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerPortable.zip) |
+| Local Transcription Addon | Only needed if you want transcription without using OpenAI API tokens. It adds the offline transcription engine; after installing it, open **Download Manager** and download a local model such as `small`. | [Download](https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerLocalTranscriptionAddon.zip) |
+| Media Tools Addon | Needed for iPhone videos, Voice Memos that need conversion, very large media files, and video-to-audio preparation. Daily Logger will prompt for it when a file needs it. | [Download](https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerMediaToolsAddon.zip) |
 
-The app can also install supported add-ons from **Settings > Download Manager**.
+### Which Download Do I Need?
+
+- If you just want to write journals, use AI with an API key, or try the app: download **DailyLoggerPortable.zip**.
+- If you want speech-to-text without API cost or internet transcription: install the **Local Transcription Addon**, then download one local model inside **Download Manager**.
+- If you want to import iPhone videos, Voice Memos, or long media files: install the **Media Tools Addon** when Daily Logger asks for it.
+- You do not need to manually place add-on files into a folder. The easiest path is **Settings > Download Manager > Download**.
 
 ## Screenshots
 
