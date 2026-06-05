@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 import unicodedata
 import uuid
 import wave
@@ -90,8 +91,14 @@ USER_DATA_ROOT = get_user_data_root()
 DATA_DIR = USER_DATA_ROOT / "daily_logs"
 RECORDING_DIR = DATA_DIR / "Recording"
 IPHONE_INBOX_DIR = RECORDING_DIR / "iPhone Inbox"
+IPHONE_INCOMING_DIR = IPHONE_INBOX_DIR / "Incoming"
+IPHONE_DECLINED_DIR = IPHONE_INBOX_DIR / "Declined"
 BACKUP_DIR = DATA_DIR / "backup"
 SETTINGS_DIR = USER_DATA_ROOT / "settings"
+LOCAL_TRANSCRIPTION_ADDON_DIR = USER_DATA_ROOT / "addons" / "local_transcription"
+MEDIA_TOOLS_ADDON_DIR = USER_DATA_ROOT / "addons" / "media_tools"
+LOCAL_TRANSCRIPTION_MODEL_DIR = USER_DATA_ROOT / "models" / "whisper"
+ADDON_DOWNLOAD_DIR = USER_DATA_ROOT / "downloads"
 LEGACY_DATA_DIR = BASE_DIR / "daily_logs"
 LEGACY_SETTINGS_DIR = BASE_DIR / "settings"
 MASTER_JOURNAL_SHEET = "Master Journal"
@@ -138,6 +145,8 @@ WHISPER_REPEAT_SENTENCE_KEEP = 1
 WHISPER_UNSUPPORTED_SCRIPT_RATIO = 0.25
 WHISPER_UNSUPPORTED_SCRIPT_MIN_LETTERS = 8
 TRANSCRIPTION_DIRECT_SUFFIXES = {
+    ".aac",
+    ".caf",
     ".flac",
     ".m4a",
     ".mp3",
@@ -150,7 +159,10 @@ TRANSCRIPTION_DIRECT_SUFFIXES = {
 }
 TRANSCRIPTION_VIDEO_SUFFIXES = {".mov", ".mp4", ".qt", ".webm"}
 TRANSCRIPTION_MEDIA_SUFFIXES = TRANSCRIPTION_DIRECT_SUFFIXES | {".mov", ".qt"}
+TRANSCRIPTION_FORCE_CONVERT_SUFFIXES = {".aac", ".caf"}
 TRANSCRIPTION_CONTENT_TYPES = {
+    ".aac": "audio/aac",
+    ".caf": "audio/x-caf",
     ".flac": "audio/flac",
     ".m4a": "audio/mp4",
     ".mov": "audio/mp4",
@@ -164,12 +176,102 @@ TRANSCRIPTION_CONTENT_TYPES = {
     ".webm": "audio/webm",
 }
 IPHONE_IMPORT_TOKEN_PREF_KEY = "iphone_import_token"
+IPHONE_PASSIVE_RECEIVE_PREF_KEY = "iphone_passive_receive_enabled"
+TRANSCRIPTION_MODEL_PREF_KEY = "transcription_model"
+TRANSCRIPTION_MODEL_CLOUD = "cloud"
+TRANSCRIPTION_DEFAULT_MODEL = TRANSCRIPTION_MODEL_CLOUD
+_TRANSCRIPTION_CLOUD_MODEL_ORDER = [
+    "gpt-4o-mini-transcribe",
+    "gpt-4o-transcribe",
+]
+TRANSCRIPTION_CLOUD_MODEL_NAMES = tuple(_TRANSCRIPTION_CLOUD_MODEL_ORDER)
+TRANSCRIPTION_DEFAULT_CLOUD_MODEL = TRANSCRIPTION_CLOUD_MODEL_NAMES[0]
+TRANSCRIPTION_LOCAL_MODEL_NAMES = (
+    "tiny",
+    "base",
+    "small",
+    "medium",
+    "large-v3-turbo",
+    "large-v3",
+)
+TRANSCRIPTION_SUGGESTED_LOCAL_MODEL = "small"
+TRANSCRIPTION_LOCAL_MODEL_STATS = {
+    "tiny": {
+        "disk": "~75 MB",
+        "bytes": 75 * 1024 * 1024,
+        "speed": "Fastest",
+        "quality": "Basic",
+        "note": "Good for quick rough drafts.",
+    },
+    "base": {
+        "disk": "~150 MB",
+        "bytes": 150 * 1024 * 1024,
+        "speed": "Very fast",
+        "quality": "Better",
+        "note": "A light upgrade when tiny is too rough.",
+    },
+    "small": {
+        "disk": "~500 MB",
+        "bytes": 500 * 1024 * 1024,
+        "speed": "Balanced",
+        "quality": "Recommended",
+        "note": "Best default for this PC without using API tokens.",
+    },
+    "medium": {
+        "disk": "~1.5 GB",
+        "bytes": int(1.5 * 1024 * 1024 * 1024),
+        "speed": "Slower",
+        "quality": "Higher accuracy",
+        "note": "Use when quality matters more than speed.",
+    },
+    "large-v3-turbo": {
+        "disk": "~1.6 GB",
+        "bytes": int(1.6 * 1024 * 1024 * 1024),
+        "speed": "Medium-heavy",
+        "quality": "Turbo large",
+        "note": "Faster large-v3 family option, still a bigger download.",
+    },
+    "large-v3": {
+        "disk": "~3 GB",
+        "bytes": 3 * 1024 * 1024 * 1024,
+        "speed": "Heavy",
+        "quality": "Most powerful",
+        "note": "Best quality class, but can impact this laptop a lot.",
+    },
+}
+TRANSCRIPTION_CLOUD_MODEL_STATS = {
+    "gpt-4o-mini-transcribe": {
+        "quality": "Good",
+        "speed": "Fast",
+        "cost": "Lower cloud cost",
+        "note": "Best cloud default for normal daily notes.",
+    },
+    "gpt-4o-transcribe": {
+        "quality": "Higher",
+        "speed": "Fast",
+        "cost": "Higher cloud cost",
+        "note": "Use when accuracy matters more than cost.",
+    },
+}
+ADDON_RELEASE_BASE_URL = "https://github.com/Snowey1110/daily-logger/releases/latest/download"
+LOCAL_TRANSCRIPTION_ADDON_ZIP_NAME = "DailyLoggerLocalTranscriptionAddon.zip"
+MEDIA_TOOLS_ADDON_ZIP_NAME = "DailyLoggerMediaToolsAddon.zip"
+LOCAL_TRANSCRIPTION_ADDON_ESTIMATED_BYTES = 70 * 1024 * 1024
+MEDIA_TOOLS_ADDON_ESTIMATED_BYTES = 85 * 1024 * 1024
+TRANSCRIPTION_LOCAL_CPU_THREADS = 4
+TRANSCRIPTION_LOCAL_COMPUTE_TYPE = "int8"
 IPHONE_IMPORT_DEFAULT_PORT = 8768
-IPHONE_IMPORT_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+IPHONE_IMPORT_MAX_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024
 IPHONE_IMPORT_CHUNK_BYTES = 1024 * 1024
+IPHONE_IMPORT_BROWSER_CHUNK_BYTES = 64 * 1024 * 1024
+IPHONE_IMPORT_CHUNK_MAX_BYTES = 128 * 1024 * 1024
 IPHONE_IMPORT_CONTENT_TYPE_SUFFIXES = {
-    "application/octet-stream": ".mov",
     "application/quicktime": ".mov",
+    "application/x-caf": ".caf",
+    "audio/aac": ".aac",
+    "audio/aiff": ".caf",
+    "audio/caf": ".caf",
+    "audio/x-caf": ".caf",
     "audio/flac": ".flac",
     "audio/m4a": ".m4a",
     "audio/mp4": ".m4a",
@@ -183,7 +285,7 @@ IPHONE_IMPORT_CONTENT_TYPE_SUFFIXES = {
     "video/webm": ".webm",
     "video/x-msvideo": ".mp4",
 }
-# Hover tooltips: narrow wrap → shorter line length, more lines (taller block).
+# Hover tooltips: narrow wrap -> shorter line length, more lines (taller block).
 TOOLTIP_WRAP_PX = 220
 TOOLTIP_WRAP_PX_MAX = 280
 JOURNAL_PREF_THEME_KEY = "journal_window_theme"
@@ -1742,9 +1844,713 @@ def save_preferences(prefs: Dict[str, str]) -> bool:
         return False
 
 
+LOCAL_TRANSCRIPTION_ADDON_STAGE_PREFIX = "local_transcription_pending"
+LOCAL_TRANSCRIPTION_HELPER_EXE_NAME = "DailyLoggerLocalTranscriber.exe"
+LOCAL_TRANSCRIPTION_CURRENT_FILE = LOCAL_TRANSCRIPTION_ADDON_DIR / "current.json"
+MEDIA_TOOLS_ADDON_MARKER = MEDIA_TOOLS_ADDON_DIR / "addon.json"
+MEDIA_TOOLS_FFMPEG_EXE = MEDIA_TOOLS_ADDON_DIR / "ffmpeg.exe"
+_LOCAL_TRANSCRIPTION_HELPER_HEALTH: Dict[str, Any] = {"path": "", "time": 0.0, "ok": False, "err": ""}
+
+
+def directory_size_bytes(path: Path) -> int:
+    try:
+        if path.is_file():
+            return int(path.stat().st_size)
+        if not path.is_dir():
+            return 0
+    except OSError:
+        return 0
+    total = 0
+    try:
+        for child in path.rglob("*"):
+            try:
+                if child.is_file():
+                    total += int(child.stat().st_size)
+            except OSError:
+                continue
+    except OSError:
+        return total
+    return total
+
+
+def format_size_short(num_bytes: int) -> str:
+    value = float(max(0, int(num_bytes)))
+    units = ("B", "KB", "MB", "GB")
+    unit = units[0]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            break
+        value /= 1024
+    if unit in ("B", "KB"):
+        return f"{value:.0f} {unit}"
+    if value >= 100:
+        return f"{value:.0f} {unit}"
+    return f"{value:.1f} {unit}"
+
+
+def _local_helper_exe_in_dir(path: Path) -> Optional[Path]:
+    candidate = path / LOCAL_TRANSCRIPTION_HELPER_EXE_NAME
+    if candidate.is_file():
+        return candidate
+    try:
+        matches = sorted(path.rglob(LOCAL_TRANSCRIPTION_HELPER_EXE_NAME), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    return matches[0] if matches else None
+
+
+def _read_local_transcription_current() -> str:
+    try:
+        data = json.loads(LOCAL_TRANSCRIPTION_CURRENT_FILE.read_text(encoding="utf-8"))
+        return str(data.get("runtime") or "").strip()
+    except Exception:
+        return ""
+
+
+def _local_transcription_helper_path() -> Optional[Path]:
+    runtime_name = _read_local_transcription_current()
+    if runtime_name:
+        helper = _local_helper_exe_in_dir(LOCAL_TRANSCRIPTION_ADDON_DIR / runtime_name)
+        if helper is not None:
+            return helper
+    try:
+        runtimes = [
+            p for p in LOCAL_TRANSCRIPTION_ADDON_DIR.iterdir()
+            if p.is_dir() and p.name.startswith("runtime-")
+        ]
+        runtimes.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        runtimes = []
+    for runtime in runtimes:
+        helper = _local_helper_exe_in_dir(runtime)
+        if helper is not None:
+            return helper
+    helper = _local_helper_exe_in_dir(LOCAL_TRANSCRIPTION_ADDON_DIR)
+    if helper is not None:
+        return helper
+    if not getattr(sys, "frozen", False):
+        source_helper = BASE_DIR / "local_transcriber_helper.py"
+        if source_helper.is_file():
+            return source_helper
+    return None
+
+
+def _local_transcription_helper_command() -> Optional[List[str]]:
+    helper = _local_transcription_helper_path()
+    if helper is None:
+        return None
+    if helper.suffix.lower() == ".py":
+        return [sys.executable, str(helper)]
+    return [str(helper)]
+
+
+def local_transcription_addon_is_installed() -> bool:
+    return _local_transcription_helper_command() is not None
+
+
+def local_transcription_runtime_available() -> bool:
+    return local_transcription_addon_is_installed()
+
+
+def _hidden_subprocess_kwargs() -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return kwargs
+
+
+def _local_helper_environment() -> Dict[str, str]:
+    env = os.environ.copy()
+    ffmpeg = _find_ffmpeg_executable()
+    if ffmpeg:
+        env["DAILYLOGGER_FFMPEG"] = ffmpeg
+    return env
+
+
+def _run_local_transcriber_json(
+    args: List[str],
+    *,
+    on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    timeout: Optional[float] = None,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    command = _local_transcription_helper_command()
+    if command is None:
+        return False, "Local transcription add-on is not installed.", {}
+    full_command = command + args + ["--json"]
+    try:
+        proc = subprocess.Popen(full_command, env=_local_helper_environment(), **_hidden_subprocess_kwargs())
+    except OSError as exc:
+        return False, f"Could not start local transcription helper: {exc}", {}
+
+    last_event: Dict[str, Any] = {}
+    error_message = ""
+    started = time.monotonic()
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if timeout is not None and time.monotonic() - started > timeout:
+                proc.kill()
+                return False, "Local transcription helper timed out.", last_event
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            last_event = event if isinstance(event, dict) else {}
+            if callable(on_event) and last_event:
+                try:
+                    on_event(last_event)
+                except Exception:
+                    pass
+            if last_event.get("event") == "error":
+                error_message = str(last_event.get("message") or "Local transcription helper failed.")
+        stderr = ""
+        if proc.stderr is not None:
+            try:
+                stderr = proc.stderr.read().strip()
+            except Exception:
+                stderr = ""
+        code = proc.wait(timeout=5)
+    except Exception as exc:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return False, f"Local transcription helper failed: {exc}", last_event
+    if code != 0:
+        return False, error_message or stderr or f"Local transcription helper exited with code {code}.", last_event
+    if error_message:
+        return False, error_message, last_event
+    return True, "", last_event
+
+
+def ensure_local_transcription_runtime_loaded(force: bool = False) -> Tuple[bool, str]:
+    helper = _local_transcription_helper_path()
+    helper_key = str(helper.resolve()) if helper is not None else ""
+    now = time.monotonic()
+    if (
+        not force
+        and helper_key
+        and _LOCAL_TRANSCRIPTION_HELPER_HEALTH.get("path") == helper_key
+        and now - float(_LOCAL_TRANSCRIPTION_HELPER_HEALTH.get("time") or 0.0) < 8.0
+    ):
+        return bool(_LOCAL_TRANSCRIPTION_HELPER_HEALTH.get("ok")), str(_LOCAL_TRANSCRIPTION_HELPER_HEALTH.get("err") or "")
+    if helper is None:
+        _LOCAL_TRANSCRIPTION_HELPER_HEALTH.update({"path": "", "time": now, "ok": False, "err": "Local transcription add-on is not installed."})
+        return False, "Local transcription add-on is not installed."
+    ok, err, _event = _run_local_transcriber_json(["health"], timeout=30)
+    _LOCAL_TRANSCRIPTION_HELPER_HEALTH.update({"path": helper_key, "time": now, "ok": ok, "err": err})
+    return ok, err
+
+
+def _safe_extract_zip(zip_path: Path, target_dir: Path) -> Tuple[bool, str]:
+    try:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            for info in archive.infolist():
+                name = info.filename.replace("\\", "/")
+                if not name or name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+                    return False, "Add-on ZIP contains an unsafe path."
+                parts = [part for part in PurePosixPath(name).parts if part not in ("", ".")]
+                if any(part == ".." for part in parts):
+                    return False, "Add-on ZIP contains an unsafe path."
+            archive.extractall(target_dir)
+        return True, ""
+    except (OSError, zipfile.BadZipFile) as exc:
+        return False, f"Could not extract add-on ZIP: {exc}"
+
+
+def _addon_zip_candidate_paths(zip_name: str) -> List[Path]:
+    candidates = [
+        BASE_DIR / zip_name,
+        BASE_DIR.parent / zip_name,
+        BASE_DIR / "dist" / zip_name,
+        BASE_DIR.parent / "dist" / zip_name,
+        ADDON_DOWNLOAD_DIR / zip_name,
+    ]
+    try:
+        candidates.append(Path(sys.executable).resolve().parent / zip_name)
+        candidates.append(Path(sys.executable).resolve().parent.parent / zip_name)
+    except Exception:
+        pass
+    seen: set[str] = set()
+    unique: List[Path] = []
+    for path in candidates:
+        try:
+            key = str(path.resolve()).casefold()
+        except OSError:
+            key = str(path).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def _find_local_addon_zip(zip_name: str) -> Optional[Path]:
+    for candidate in _addon_zip_candidate_paths(zip_name):
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _download_release_addon_zip(
+    zip_name: str,
+    progress: Optional[Callable[[int, int], None]] = None,
+) -> Tuple[Optional[Path], str]:
+    url = f"{ADDON_RELEASE_BASE_URL}/{zip_name}"
+    try:
+        ADDON_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        target = ADDON_DOWNLOAD_DIR / zip_name
+        tmp = target.with_suffix(target.suffix + ".part")
+        req = request.Request(url, headers={"User-Agent": "DailyLogger"})
+        with request.urlopen(req, timeout=120) as response, tmp.open("wb") as out:
+            try:
+                total = int(response.headers.get("Content-Length") or "0")
+            except (TypeError, ValueError):
+                total = 0
+            downloaded = 0
+            last_percent = -1
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                downloaded += len(chunk)
+                if progress is not None:
+                    percent = int(downloaded * 100 / total) if total > 0 else 0
+                    if percent != last_percent or total <= 0:
+                        last_percent = percent
+                        try:
+                            progress(downloaded, total)
+                        except Exception:
+                            pass
+        tmp.replace(target)
+        if not zipfile.is_zipfile(target):
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None, f"Downloaded file is not a valid add-on ZIP:\n{url}"
+        return target, ""
+    except (OSError, error.URLError, TimeoutError) as exc:
+        return None, f"Could not download add-on from GitHub:\n{url}\n\n{exc}"
+
+
+def resolve_or_download_addon_zip(
+    zip_name: str,
+    progress: Optional[Callable[[int, int], None]] = None,
+) -> Tuple[Optional[Path], str]:
+    local_zip = _find_local_addon_zip(zip_name)
+    if local_zip is not None:
+        return local_zip, ""
+    return _download_release_addon_zip(zip_name, progress=progress)
+
+
+def _find_extracted_local_addon_root(extracted_dir: Path) -> Optional[Path]:
+    try:
+        matches = sorted(extracted_dir.rglob(LOCAL_TRANSCRIPTION_HELPER_EXE_NAME))
+    except OSError:
+        return None
+    if not matches:
+        return None
+    return matches[0].parent
+
+
+def finalize_pending_local_transcription_addon() -> Tuple[bool, str]:
+    try:
+        LOCAL_TRANSCRIPTION_ADDON_DIR.mkdir(parents=True, exist_ok=True)
+        if _local_transcription_helper_path() is None:
+            runtimes = [
+                p for p in LOCAL_TRANSCRIPTION_ADDON_DIR.iterdir()
+                if p.is_dir() and p.name.startswith("runtime-") and _local_helper_exe_in_dir(p) is not None
+            ]
+            runtimes.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            if runtimes:
+                LOCAL_TRANSCRIPTION_CURRENT_FILE.write_text(
+                    json.dumps({"runtime": runtimes[0].name, "version": "helper-v3"}, indent=2),
+                    encoding="utf-8",
+                )
+        return True, ""
+    except OSError as exc:
+        return (
+            False,
+            f"Could not finish local transcription add-on startup cleanup: {exc}",
+        )
+
+
+def _cleanup_staged_local_transcription_addons(keep: Optional[Path] = None) -> None:
+    parent = LOCAL_TRANSCRIPTION_ADDON_DIR.parent
+    try:
+        keep_resolved = keep.resolve() if keep is not None else None
+    except OSError:
+        keep_resolved = keep
+    try:
+        staged_dirs = [
+            p for p in parent.iterdir()
+            if p.is_dir() and p.name.startswith(LOCAL_TRANSCRIPTION_ADDON_STAGE_PREFIX)
+        ]
+    except OSError:
+        return
+    for staged in staged_dirs:
+        try:
+            if keep_resolved is not None and staged.resolve() == keep_resolved:
+                continue
+        except OSError:
+            pass
+        try:
+            shutil.rmtree(staged)
+        except OSError:
+            continue
+
+
+def _cleanup_old_local_transcription_runtimes(keep: Optional[Path] = None) -> None:
+    try:
+        keep_resolved = keep.resolve() if keep is not None else None
+    except OSError:
+        keep_resolved = keep
+    try:
+        runtime_dirs = [
+            p for p in LOCAL_TRANSCRIPTION_ADDON_DIR.iterdir()
+            if p.is_dir() and p.name.startswith("runtime-")
+        ]
+    except OSError:
+        return
+    for runtime_dir in runtime_dirs:
+        try:
+            if keep_resolved is not None and runtime_dir.resolve() == keep_resolved:
+                continue
+        except OSError:
+            pass
+        try:
+            shutil.rmtree(runtime_dir)
+        except OSError:
+            continue
+
+
+def install_local_transcription_addon(zip_path: Path) -> Tuple[bool, str]:
+    if not zip_path.is_file():
+        return False, "Choose DailyLoggerLocalTranscriptionAddon.zip first."
+    parent = LOCAL_TRANSCRIPTION_ADDON_DIR
+    temp_dir = LOCAL_TRANSCRIPTION_ADDON_DIR.parent / f".local_transcription_install_{secrets.token_hex(4)}"
+    runtime_name = f"runtime-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}"
+    runtime_dir = LOCAL_TRANSCRIPTION_ADDON_DIR / runtime_name
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        temp_dir.mkdir(parents=True, exist_ok=False)
+        ok, err_msg = _safe_extract_zip(zip_path, temp_dir)
+        if not ok:
+            return False, err_msg
+        extracted_root = _find_extracted_local_addon_root(temp_dir)
+        if extracted_root is None:
+            return False, "That ZIP does not contain DailyLoggerLocalTranscriber.exe."
+        shutil.move(str(extracted_root), str(runtime_dir))
+        if _local_helper_exe_in_dir(runtime_dir) is None:
+            return False, "That local transcription add-on is incomplete."
+        LOCAL_TRANSCRIPTION_CURRENT_FILE.write_text(
+            json.dumps(
+                {
+                    "runtime": runtime_name,
+                    "version": "helper-v3",
+                    "installed_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        _LOCAL_TRANSCRIPTION_HELPER_HEALTH.update({"path": "", "time": 0.0, "ok": False, "err": ""})
+        _cleanup_staged_local_transcription_addons()
+        _cleanup_old_local_transcription_runtimes(keep=runtime_dir)
+        return True, ""
+    except OSError as exc:
+        return False, f"Could not install local transcription add-on: {exc}"
+    finally:
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def uninstall_local_transcription_addon() -> Tuple[bool, str]:
+    _clear_local_transcription_model_cache()
+    _LOCAL_TRANSCRIPTION_HELPER_HEALTH.update({"path": "", "time": 0.0, "ok": False, "err": ""})
+    try:
+        _cleanup_staged_local_transcription_addons()
+        if LOCAL_TRANSCRIPTION_ADDON_DIR.exists():
+            shutil.rmtree(LOCAL_TRANSCRIPTION_ADDON_DIR)
+        return True, ""
+    except OSError as exc:
+        return (
+            False,
+            "Could not remove the local transcription add-on. Close and reopen Daily Logger, then try again. "
+            f"Details: {exc}",
+        )
+
+
+def media_tools_addon_is_installed() -> bool:
+    return MEDIA_TOOLS_FFMPEG_EXE.is_file()
+
+
+def _find_extracted_media_tools_root(extracted_dir: Path) -> Optional[Path]:
+    candidates = [extracted_dir, extracted_dir / "media_tools"]
+    try:
+        candidates.extend([p for p in extracted_dir.iterdir() if p.is_dir()])
+    except OSError:
+        pass
+    for candidate in candidates:
+        if (candidate / "ffmpeg.exe").is_file():
+            return candidate
+    return None
+
+
+def install_media_tools_addon(zip_path: Path) -> Tuple[bool, str]:
+    if not zip_path.is_file():
+        return False, "Choose DailyLoggerMediaToolsAddon.zip first."
+    parent = MEDIA_TOOLS_ADDON_DIR.parent
+    temp_dir = parent / f".media_tools_install_{secrets.token_hex(4)}"
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        temp_dir.mkdir(parents=True, exist_ok=False)
+        ok, err_msg = _safe_extract_zip(zip_path, temp_dir)
+        if not ok:
+            return False, err_msg
+        extracted_root = _find_extracted_media_tools_root(temp_dir)
+        if extracted_root is None:
+            return False, "That ZIP does not look like a Daily Logger Media Tools add-on."
+        if MEDIA_TOOLS_ADDON_DIR.exists():
+            shutil.rmtree(MEDIA_TOOLS_ADDON_DIR)
+        shutil.move(str(extracted_root), str(MEDIA_TOOLS_ADDON_DIR))
+        return True, ""
+    except OSError as exc:
+        return False, f"Could not install Media Tools add-on: {exc}"
+    finally:
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def uninstall_media_tools_addon() -> Tuple[bool, str]:
+    try:
+        if MEDIA_TOOLS_ADDON_DIR.exists():
+            shutil.rmtree(MEDIA_TOOLS_ADDON_DIR)
+        return True, ""
+    except OSError as exc:
+        return (
+            False,
+            "Could not remove the Media Tools add-on. Close and reopen Daily Logger, then try again. "
+            f"Details: {exc}",
+        )
+
+
+def normalize_transcription_model_choice(value: str) -> str:
+    raw = (value or "").strip().lower()
+    cloud_map = {m.lower(): m for m in TRANSCRIPTION_CLOUD_MODEL_NAMES}
+    if raw in ("", "local", "local:"):
+        return TRANSCRIPTION_DEFAULT_MODEL
+        if raw in (TRANSCRIPTION_MODEL_CLOUD, "openai", "cloud:openai"):
+            return TRANSCRIPTION_MODEL_CLOUD
+    if raw in cloud_map:
+        cloud_name = cloud_map[raw]
+        if cloud_name == OPENAI_TRANSCRIPTION_MODEL:
+            return TRANSCRIPTION_MODEL_CLOUD
+        return f"cloud:{cloud_name}"
+    if raw.startswith("cloud:"):
+        cloud_name = raw.split(":", 1)[1].strip()
+        if not cloud_name or cloud_name == TRANSCRIPTION_DEFAULT_CLOUD_MODEL.lower():
+            return TRANSCRIPTION_MODEL_CLOUD
+        if cloud_name in cloud_map:
+            return f"cloud:{cloud_map[cloud_name]}"
+        return TRANSCRIPTION_MODEL_CLOUD
+    if raw.startswith("local:"):
+        model_name = raw.split(":", 1)[1].strip()
+    else:
+        model_name = raw
+    if model_name in TRANSCRIPTION_LOCAL_MODEL_NAMES:
+        return f"local:{model_name}"
+    return TRANSCRIPTION_DEFAULT_MODEL
+
+
+def get_selected_transcription_model_choice() -> str:
+    prefs = load_preferences()
+    return normalize_transcription_model_choice(
+        prefs.get(TRANSCRIPTION_MODEL_PREF_KEY, TRANSCRIPTION_DEFAULT_MODEL)
+    )
+
+
+def save_selected_transcription_model_choice(choice: str) -> bool:
+    prefs = load_preferences()
+    prefs[TRANSCRIPTION_MODEL_PREF_KEY] = normalize_transcription_model_choice(choice)
+    return save_preferences(prefs)
+
+
+def iphone_passive_receive_enabled() -> bool:
+    prefs = load_preferences()
+    return prefs.get(IPHONE_PASSIVE_RECEIVE_PREF_KEY, "true").strip().lower() != "false"
+
+
+def save_iphone_passive_receive_enabled(enabled: bool) -> bool:
+    prefs = load_preferences()
+    prefs[IPHONE_PASSIVE_RECEIVE_PREF_KEY] = "true" if enabled else "false"
+    return save_preferences(prefs)
+
+
+def transcription_model_is_local(choice: str) -> bool:
+    return normalize_transcription_model_choice(choice).startswith("local:")
+
+
+def transcription_model_is_cloud(choice: str) -> bool:
+    normalized = normalize_transcription_model_choice(choice)
+    return normalized == TRANSCRIPTION_MODEL_CLOUD or normalized.startswith("cloud:")
+
+
+def transcription_cloud_model_name(choice: str) -> str:
+    normalized = normalize_transcription_model_choice(choice)
+    if normalized.startswith("cloud:"):
+        return normalized.split(":", 1)[1]
+    return TRANSCRIPTION_DEFAULT_CLOUD_MODEL
+
+
+def transcription_local_model_name(choice: str) -> str:
+    normalized = normalize_transcription_model_choice(choice)
+    if not normalized.startswith("local:"):
+        return ""
+    return normalized.split(":", 1)[1]
+
+
+def local_transcription_model_path(model_name: str) -> Path:
+    safe_name = model_name if model_name in TRANSCRIPTION_LOCAL_MODEL_NAMES else "small"
+    return LOCAL_TRANSCRIPTION_MODEL_DIR / safe_name
+
+
+def local_transcription_model_is_downloaded(model_name: str) -> bool:
+    path = local_transcription_model_path(model_name)
+    return (
+        path.is_dir()
+        and (path / "config.json").is_file()
+        and (path / "model.bin").is_file()
+        and (path / "tokenizer.json").is_file()
+    )
+
+
+def downloaded_local_transcription_model_names() -> List[str]:
+    return [
+        model_name
+        for model_name in TRANSCRIPTION_LOCAL_MODEL_NAMES
+        if local_transcription_model_is_downloaded(model_name)
+    ]
+
+
+def usable_local_transcription_model_names() -> List[str]:
+    runtime_ok, _runtime_err = ensure_local_transcription_runtime_loaded()
+    if not runtime_ok:
+        return []
+    return downloaded_local_transcription_model_names()
+
+
+def first_usable_local_transcription_choice() -> str:
+    names = usable_local_transcription_model_names()
+    if not names:
+        return ""
+    return f"local:{names[0]}"
+
+
+def transcription_cloud_is_ready() -> bool:
+    return bool(get_openai_api_key())
+
+
+def transcription_has_any_ready_model() -> bool:
+    return transcription_cloud_is_ready() or bool(usable_local_transcription_model_names())
+
+
+def download_local_transcription_model(
+    model_name: str,
+    *,
+    progress: Optional[Callable[[int], None]] = None,
+    status: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
+    if model_name not in TRANSCRIPTION_LOCAL_MODEL_NAMES:
+        return False, f"Unsupported local transcription model: {model_name}"
+    ok, err_msg = ensure_local_transcription_runtime_loaded()
+    if not ok:
+        return False, err_msg
+
+    def _event(event: Dict[str, Any]) -> None:
+        if event.get("event") in ("status", "progress"):
+            message = str(event.get("message") or "").strip()
+            if message and status is not None:
+                try:
+                    status(message)
+                except Exception:
+                    pass
+            if progress is not None and "percent" in event:
+                try:
+                    progress(int(float(event.get("percent") or 0)))
+                except Exception:
+                    pass
+
+    ok, err_msg, _last = _run_local_transcriber_json(
+        [
+            "download",
+            "--model",
+            model_name,
+            "--models-dir",
+            str(LOCAL_TRANSCRIPTION_MODEL_DIR),
+        ],
+        on_event=_event,
+        timeout=None,
+    )
+    if not ok:
+        return False, err_msg
+    if not local_transcription_model_is_downloaded(model_name):
+        return False, f"Downloaded model '{model_name}' is incomplete."
+    return True, ""
+
+
+def uninstall_local_transcription_model(model_name: str) -> Tuple[bool, str]:
+    if model_name not in TRANSCRIPTION_LOCAL_MODEL_NAMES:
+        return False, f"Unsupported local transcription model: {model_name}"
+    try:
+        root = LOCAL_TRANSCRIPTION_MODEL_DIR.resolve()
+        target = local_transcription_model_path(model_name).resolve()
+    except OSError as exc:
+        return False, f"Could not locate local model folder: {exc}"
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return False, "Refusing to remove a folder outside the Daily Logger model directory."
+    try:
+        if target.exists():
+            shutil.rmtree(target)
+        return True, ""
+    except OSError as exc:
+        return False, f"Could not uninstall local transcription model '{model_name}': {exc}"
+
+
 def ensure_iphone_inbox_dir() -> Path:
     IPHONE_INBOX_DIR.mkdir(parents=True, exist_ok=True)
     return IPHONE_INBOX_DIR
+
+
+def ensure_iphone_incoming_dir() -> Path:
+    IPHONE_INCOMING_DIR.mkdir(parents=True, exist_ok=True)
+    return IPHONE_INCOMING_DIR
+
+
+def ensure_iphone_declined_dir() -> Path:
+    IPHONE_DECLINED_DIR.mkdir(parents=True, exist_ok=True)
+    return IPHONE_DECLINED_DIR
 
 
 def get_or_create_iphone_import_token() -> str:
@@ -1837,9 +2643,46 @@ def _safe_iphone_upload_suffix(filename: str, content_type: str) -> str:
     return ""
 
 
-def _sanitize_iphone_upload_name(filename: str, content_type: str) -> Tuple[str, str]:
+def _infer_iphone_upload_suffix_from_file(path: Path, filename: str, content_type: str) -> str:
     suffix = _safe_iphone_upload_suffix(filename, content_type)
-    if not suffix:
+    if suffix:
+        return suffix
+    try:
+        header = path.read_bytes()[:512]
+    except OSError:
+        header = b""
+    if header.startswith(b"RIFF") and header[8:12] == b"WAVE":
+        return ".wav"
+    if header.startswith(b"ID3") or header[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return ".mp3"
+    if header.startswith(b"OggS"):
+        return ".ogg"
+    if header.startswith(b"fLaC"):
+        return ".flac"
+    if header.startswith(b"caff"):
+        return ".caf"
+    if len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xF0) == 0xF0:
+        return ".aac"
+    if header.startswith(b"\x1a\x45\xdf\xa3"):
+        return ".webm"
+    if len(header) >= 12 and header[4:8] == b"ftyp":
+        brands = header[8:80]
+        if any(brand in brands for brand in (b"M4A", b"M4B", b"M4P")):
+            return ".m4a"
+        if b"qt  " in brands:
+            return ".mov"
+        ctype = (content_type or "").split(";", 1)[0].strip().lower()
+        if ctype.startswith("audio/"):
+            return ".m4a"
+        if ctype.startswith("video/"):
+            return ".mov"
+        return ".mp4"
+    return ""
+
+
+def _sanitize_iphone_upload_name_with_suffix(filename: str, suffix: str) -> Tuple[str, str]:
+    suffix = (suffix or "").lower()
+    if suffix not in TRANSCRIPTION_MEDIA_SUFFIXES:
         return "", ""
     raw_stem = Path(filename).stem if filename else ""
     stem = re.sub(r"[^A-Za-z0-9._ -]+", "_", raw_stem).strip(" ._-")
@@ -1850,12 +2693,25 @@ def _sanitize_iphone_upload_name(filename: str, content_type: str) -> Tuple[str,
     return stem, suffix
 
 
-def _unique_iphone_inbox_path(filename: str, content_type: str) -> Tuple[Optional[Path], str]:
-    stem, suffix = _sanitize_iphone_upload_name(filename, content_type)
+def _sanitize_iphone_upload_name(filename: str, content_type: str) -> Tuple[str, str]:
+    return _sanitize_iphone_upload_name_with_suffix(
+        filename,
+        _safe_iphone_upload_suffix(filename, content_type),
+    )
+
+
+def _unique_iphone_inbox_path_for_suffix(
+    filename: str,
+    suffix: str,
+    *,
+    folder: Optional[Path] = None,
+) -> Tuple[Optional[Path], str]:
+    stem, suffix = _sanitize_iphone_upload_name_with_suffix(filename, suffix)
     if not suffix:
         allowed = ", ".join(sorted(TRANSCRIPTION_MEDIA_SUFFIXES))
         return None, f"Unsupported upload type. Use: {allowed}"
-    inbox = ensure_iphone_inbox_dir()
+    inbox = folder or ensure_iphone_inbox_dir()
+    inbox.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     for attempt in range(200):
         nonce = secrets.token_hex(3)
@@ -1864,6 +2720,47 @@ def _unique_iphone_inbox_path(filename: str, content_type: str) -> Tuple[Optiona
         if not candidate.exists() and not candidate.with_suffix(candidate.suffix + ".part").exists():
             return candidate, ""
     return None, "Could not create a unique iPhone Inbox filename."
+
+
+def _unique_iphone_inbox_path(
+    filename: str,
+    content_type: str,
+    *,
+    folder: Optional[Path] = None,
+) -> Tuple[Optional[Path], str]:
+    stem, suffix = _sanitize_iphone_upload_name(filename, content_type)
+    if not suffix:
+        allowed = ", ".join(sorted(TRANSCRIPTION_MEDIA_SUFFIXES))
+        return None, f"Unsupported upload type. Use: {allowed}"
+    return _unique_iphone_inbox_path_for_suffix(filename, suffix, folder=folder)
+
+
+def _unique_existing_file_dest(folder: Path, src: Path) -> Optional[Path]:
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    dest = folder / src.name
+    if not dest.exists():
+        return dest
+    stem = dest.stem
+    suffix = dest.suffix
+    for attempt in range(1, 500):
+        alt = folder / f"{stem}_{attempt}{suffix}"
+        if not alt.exists():
+            return alt
+    return None
+
+
+def apply_iphone_last_modified(path: Path, raw_value: str) -> None:
+    try:
+        last_modified = float(raw_value)
+        if last_modified > 10_000_000_000:
+            last_modified /= 1000.0
+        if 946684800 <= last_modified <= 4102444800:
+            os.utime(path, (last_modified, last_modified))
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 def list_pending_iphone_inbox_files() -> List[Path]:
@@ -1885,6 +2782,25 @@ def list_pending_iphone_inbox_files() -> List[Path]:
     return sorted(items, key=lambda p: (p.stat().st_mtime if p.exists() else float("inf"), p.name.lower()))
 
 
+def list_incoming_iphone_files() -> List[Path]:
+    try:
+        incoming = ensure_iphone_incoming_dir()
+    except OSError:
+        return []
+    items: List[Path] = []
+    try:
+        for path in incoming.iterdir():
+            if (
+                path.is_file()
+                and not path.name.lower().endswith(".part")
+                and is_transcription_media_file(path)
+            ):
+                items.append(path)
+    except OSError:
+        return []
+    return sorted(items, key=lambda p: (p.stat().st_mtime if p.exists() else float("inf"), p.name.lower()))
+
+
 def mark_iphone_inbox_files_processed(paths: List[Path]) -> None:
     try:
         processed_dir = ensure_iphone_inbox_dir() / "Processed"
@@ -1895,18 +2811,38 @@ def mark_iphone_inbox_files_processed(paths: List[Path]) -> None:
         try:
             if not src.is_file() or src.parent.resolve() != IPHONE_INBOX_DIR.resolve():
                 continue
-            dest = processed_dir / src.name
-            if dest.exists():
-                stem = dest.stem
-                suffix = dest.suffix
-                for attempt in range(1, 200):
-                    alt = processed_dir / f"{stem}_{attempt}{suffix}"
-                    if not alt.exists():
-                        dest = alt
-                        break
+            dest = _unique_existing_file_dest(processed_dir, src)
+            if dest is None:
+                continue
             shutil.move(str(src), str(dest))
         except OSError:
             continue
+
+
+def move_iphone_file_to_inbox(src: Path) -> Optional[Path]:
+    try:
+        if not src.is_file() or not is_transcription_media_file(src):
+            return None
+        dest = _unique_existing_file_dest(ensure_iphone_inbox_dir(), src)
+        if dest is None:
+            return None
+        shutil.move(str(src), str(dest))
+        return dest
+    except OSError:
+        return None
+
+
+def decline_iphone_file(src: Path) -> bool:
+    try:
+        if not src.is_file():
+            return False
+        dest = _unique_existing_file_dest(ensure_iphone_declined_dir(), src)
+        if dest is None:
+            return False
+        shutil.move(str(src), str(dest))
+        return True
+    except OSError:
+        return False
 
 
 def _is_pref_true(value: str) -> bool:
@@ -2608,14 +3544,31 @@ def is_transcription_video_file(path: Path) -> bool:
     return path.suffix.lower() in TRANSCRIPTION_VIDEO_SUFFIXES
 
 
-def _find_ffmpeg_executable() -> Optional[str]:
-    candidates: List[Optional[str]] = []
+def transcription_path_needs_media_tools(path: Path) -> bool:
+    suffix = path.suffix.lower()
+    if suffix in TRANSCRIPTION_VIDEO_SUFFIXES or suffix in TRANSCRIPTION_FORCE_CONVERT_SUFFIXES:
+        return True
+    if suffix not in TRANSCRIPTION_MEDIA_SUFFIXES or suffix == ".wav":
+        return False
     try:
-        import imageio_ffmpeg
+        return int(path.stat().st_size) >= TRANSCRIPTION_DIRECT_UPLOAD_MAX_BYTES
+    except OSError:
+        return False
 
-        candidates.append(str(imageio_ffmpeg.get_ffmpeg_exe()))
-    except Exception:
-        pass
+
+def any_transcription_path_needs_media_tools(paths: List[Path]) -> bool:
+    return any(transcription_path_needs_media_tools(path) for path in paths)
+
+
+def _find_ffmpeg_executable() -> Optional[str]:
+    candidates: List[Optional[str]] = [str(MEDIA_TOOLS_FFMPEG_EXE)]
+    if not getattr(sys, "frozen", False):
+        try:
+            import imageio_ffmpeg
+
+            candidates.append(str(imageio_ffmpeg.get_ffmpeg_exe()))
+        except Exception:
+            pass
     candidates.extend([
         shutil.which("ffmpeg"),
         str(BASE_DIR / "ffmpeg.exe"),
@@ -2662,7 +3615,7 @@ def _cleanup_transcription_temp(temp_path: Optional[Path]) -> None:
 def _run_ffmpeg_extract(source: Path, target: Path, *, copy_audio: bool = False) -> Tuple[bool, str]:
     ffmpeg = _find_ffmpeg_executable()
     if not ffmpeg:
-        return False, "ffmpeg is not installed or bundled."
+        return False, "Media Tools add-on is not installed. Open Download Manager and install Media Tools first."
     codec_args = (
         ["-c:a", "copy"]
         if copy_audio
@@ -2698,7 +3651,7 @@ def _run_ffmpeg_extract(source: Path, target: Path, *, copy_audio: bool = False)
 def _run_ffmpeg_segment_audio(source: Path, target_pattern: Path) -> Tuple[bool, str]:
     ffmpeg = _find_ffmpeg_executable()
     if not ffmpeg:
-        return False, "ffmpeg is not installed or bundled."
+        return False, "Media Tools add-on is not installed. Open Download Manager and install Media Tools first."
     cmd = [
         ffmpeg,
         "-y",
@@ -2810,6 +3763,8 @@ def prepare_paths_for_transcription(source: Path) -> Tuple[List[Path], Optional[
 
     if is_transcription_video_file(source):
         return _extract_media_audio_for_transcription(source)
+    if suffix in TRANSCRIPTION_FORCE_CONVERT_SUFFIXES:
+        return _extract_media_audio_for_transcription(source)
     if source_size >= TRANSCRIPTION_DIRECT_UPLOAD_MAX_BYTES:
         return _extract_media_audio_for_transcription(source)
     return [source], None, None
@@ -2830,9 +3785,12 @@ def _default_whisper_prompt(language: Optional[str]) -> str:
     if lang == "en":
         lang_hint = "The speech is English."
     elif lang == "zh":
-        lang_hint = "The speech is Mandarin Chinese."
+        lang_hint = "The speech is Mandarin Chinese. Use Simplified Chinese characters."
     else:
-        lang_hint = "The speech is English, Mandarin Chinese, or a mix of those two."
+        lang_hint = (
+            "The speech is English, Mandarin Chinese, or a mix of those two. "
+            "Use Simplified Chinese characters for Chinese speech."
+        )
     return (
         f"{lang_hint} Transcribe verbatim in the spoken language. Do not translate. "
         "Do not output any other language. Do not add subtitles, timestamps, filler, "
@@ -2972,30 +3930,174 @@ def _unsupported_transcript_script_ratio(text: str) -> Tuple[int, float]:
 
 JOURNAL_PUNCTUATION_TRANSLATION = str.maketrans(
     {
-        "，": ",",
-        "。": ".",
-        "、": ",",
-        "；": ";",
-        "：": ":",
-        "？": "?",
-        "！": "!",
-        "（": "(",
-        "）": ")",
-        "【": "[",
-        "】": "]",
-        "“": '"',
-        "”": '"',
-        "‘": "'",
-        "’": "'",
+        "\uff0c": ",",
+        "\u3002": ".",
+        "\u3001": ",",
+        "\uff1b": ";",
+        "\uff1a": ":",
+        "\uff1f": "?",
+        "\uff01": "!",
+        "\uff08": "(",
+        "\uff09": ")",
+        "\u3010": "[",
+        "\u3011": "]",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2018": "'",
+        "\u2019": "'",
     }
 )
+
+
+TRADITIONAL_CHINESE_TRANSLATION = str.maketrans(
+    {
+        "\u807d": "\u542c",
+        "\u898b": "\u89c1",
+        "\u55ce": "\u5417",
+        "\u8207": "\u4e0e",
+        "\u9019": "\u8fd9",
+        "\u500b": "\u4e2a",
+        "\u6703": "\u4f1a",
+        "\u8eca": "\u8f66",
+        "\u9304": "\u5f55",
+        "\u8a18": "\u8bb0",
+        "\u9ede": "\u70b9",
+        "\u958b": "\u5f00",
+        "\u95dc": "\u5173",
+        "\u9580": "\u95e8",
+        "\u88e1": "\u91cc",
+        "\u9084": "\u8fd8",
+        "\u8b93": "\u8ba9",
+        "\u8aaa": "\u8bf4",
+        "\u8a71": "\u8bdd",
+        "\u5f8c": "\u540e",
+        "\u6642": "\u65f6",
+        "\u9593": "\u95f4",
+        "\u7121": "\u65e0",
+        "\u767c": "\u53d1",
+        "\u8655": "\u5904",
+        "\u5099": "\u5907",
+        "\u6a94": "\u6863",
+        "\u8f49": "\u8f6c",
+        "\u5beb": "\u5199",
+        "\u8072": "\u58f0",
+        "\u8996": "\u89c6",
+        "\u8a0a": "\u8baf",
+        "\u9ad4": "\u4f53",
+        "\u7d71": "\u7edf",
+        "\u6a5f": "\u673a",
+        "\u4e26": "\u5e76",
+        "\u96d9": "\u53cc",
+        "\u9801": "\u9875",
+        "\u5716": "\u56fe",
+        "\u5831": "\u62a5",
+        "\u8acb": "\u8bf7",
+        "\u8f38": "\u8f93",
+        "\u9078": "\u9009",
+        "\u64c7": "\u62e9",
+        "\u555f": "\u542f",
+        "\u52d5": "\u52a8",
+        "\u61c9": "\u5e94",
+        "\u8a72": "\u8be5",
+        "\u984c": "\u9898",
+        "\u8abf": "\u8c03",
+        "\u8a66": "\u8bd5",
+        "\u932f": "\u9519",
+        "\u8aa4": "\u8bef",
+        "\u96f2": "\u4e91",
+        "\u5fa9": "\u590d",
+        "\u88fd": "\u5236",
+        "\u9ebc": "\u4e48",
+        "\u70ba": "\u4e3a",
+        "\u5f9e": "\u4ece",
+        "\u5c0d": "\u5bf9",
+        "\u8b1b": "\u8bb2",
+        "\u73fe": "\u73b0",
+        "\u5be6": "\u5b9e",
+        "\u9a57": "\u9a8c",
+        "\u865f": "\u53f7",
+        "\u78bc": "\u7801",
+        "\u8a08": "\u8ba1",
+        "\u5283": "\u5212",
+        "\u9577": "\u957f",
+        "\u986f": "\u663e",
+        "\u7c21": "\u7b80",
+        "\u6f22": "\u6c49",
+        "\u8a9e": "\u8bed",
+        "\u8b80": "\u8bfb",
+        "\u66f8": "\u4e66",
+        "\u5132": "\u50a8",
+        "\u8a2d": "\u8bbe",
+        "\u96fb": "\u7535",
+        "\u8166": "\u8111",
+        "\u7db2": "\u7f51",
+        "\u7d61": "\u7edc",
+        "\u9023": "\u8fde",
+        "\u6e2c": "\u6d4b",
+        "\u6578": "\u6570",
+        "\u64da": "\u636e",
+        "\u5eab": "\u5e93",
+        "\u96e2": "\u79bb",
+        "\u7dda": "\u7ebf",
+        "\u8cc7": "\u8d44",
+        "\u54e1": "\u5458",
+        "\u5b78": "\u5b66",
+        "\u7fd2": "\u4e60",
+        "\u5be9": "\u5ba1",
+        "\u7522": "\u4ea7",
+        "\u696d": "\u4e1a",
+        "\u52d9": "\u52a1",
+        "\u9810": "\u9884",
+        "\u89bd": "\u89c8",
+        "\u58d3": "\u538b",
+        "\u7e2e": "\u7f29",
+        "\u91cb": "\u91ca",
+        "\u7a2e": "\u79cd",
+        "\u985e": "\u7c7b",
+        "\u5c0e": "\u5bfc",
+        "\u6a19": "\u6807",
+        "\u7c64": "\u7b7e",
+        "\u7c3d": "\u7b7e",
+        "\u7e6a": "\u7ed8",
+        "\u756b": "\u753b",
+        "\u984f": "\u989c",
+        "\u64ca": "\u51fb",
+        "\u522a": "\u5220",
+        "\u6aa2": "\u68c0",
+        "\u7576": "\u5f53",
+        "\u7e8c": "\u7eed",
+        "\u65b7": "\u65ad",
+        "\u554f": "\u95ee",
+    }
+)
+
+
+def simplify_chinese_text(text: str) -> str:
+    return (text or "").translate(TRADITIONAL_CHINESE_TRANSLATION)
+
+
+def normalize_common_short_chinese_transcription_misses(text: str) -> str:
+    fixed = simplify_chinese_text(text or "")
+    if not fixed:
+        return ""
+    fixed = re.sub(
+        r"(?i)\bwei\s+wei\s+wei\b[,\s]*(?=\u542c\u5f97\u89c1\u5417)",
+        "\u5582\u5582\u5582,",
+        fixed,
+    )
+    fixed = re.sub(
+        r"(?i)\bwei\s+(?:lu\s*)?wei\b[,\s]*(?=\u542c\u5f97\u89c1\u5417)",
+        "\u5582\u5582\u5582,",
+        fixed,
+    )
+    return fixed
 
 
 def normalize_journal_text_punctuation(text: str) -> str:
     """Use baseline-friendly ASCII punctuation in mixed Chinese/English journal text."""
     if not text:
         return ""
-    fixed = text.translate(JOURNAL_PUNCTUATION_TRANSLATION)
+    fixed = normalize_common_short_chinese_transcription_misses(text).translate(JOURNAL_PUNCTUATION_TRANSLATION)
     fixed = re.sub(r"\s+([,.;:?!])", r"\1", fixed)
     return fixed
 
@@ -3020,12 +4122,17 @@ def clean_whisper_transcript(text: str, language: Optional[str]) -> str:
     return cleaned
 
 
+def _is_whisper_rejection_message(text: str) -> bool:
+    return (text or "").strip().startswith("Whisper transcription rejected:")
+
+
 
 
 def _transcribe_audio_openai_single(
     file_path: Path,
     language: Optional[str],
     *,
+    model_name: Optional[str] = None,
     prompt: Optional[str] = None,
     temperature: float = 0.0,
     content_type: Optional[str] = None,
@@ -3057,13 +4164,19 @@ def _transcribe_audio_openai_single(
         return "OPENAI_API_KEY is not set. Use TOKEN ADD in the main menu or set the environment variable."
 
     _pg(14)
-    add_field("model", OPENAI_TRANSCRIPTION_MODEL)
+    selected_cloud_model = (model_name or TRANSCRIPTION_DEFAULT_CLOUD_MODEL).strip() or TRANSCRIPTION_DEFAULT_CLOUD_MODEL
+    add_field("model", selected_cloud_model)
     if language:
         add_field("language", language)
-    prompt_text = _whisper_prompt(language, prompt)
-    if prompt_text:
-        add_field("prompt", prompt_text)
-    add_field("temperature", str(temperature))
+    is_diarize_model = selected_cloud_model == "gpt-4o-transcribe-diarize"
+    if is_diarize_model:
+        add_field("response_format", "diarized_json")
+        add_field("chunking_strategy", "auto")
+    else:
+        prompt_text = _whisper_prompt(language, prompt)
+        if prompt_text:
+            add_field("prompt", prompt_text)
+        add_field("temperature", str(temperature))
 
     _pg(22)
     filename = file_path.name
@@ -3114,7 +4227,19 @@ def _transcribe_audio_openai_single(
         try:
             parsed = json.loads(raw)
             text = parsed.get("text")
-            if isinstance(text, str):
+            if is_diarize_model and isinstance(parsed.get("segments"), list):
+                segment_texts: List[str] = []
+                for segment in parsed.get("segments", []):
+                    if not isinstance(segment, dict):
+                        continue
+                    speaker = str(segment.get("speaker") or "").strip()
+                    part = clean_whisper_transcript(str(segment.get("text") or ""), language)
+                    if not part:
+                        continue
+                    segment_texts.append(f"{speaker}: {part}" if speaker else part)
+                result = normalize_journal_text_punctuation(" ".join(segment_texts).strip())
+                _pg(94)
+            elif isinstance(text, str):
                 result = clean_whisper_transcript(text, language)
                 _pg(94)
             else:
@@ -3163,6 +4288,12 @@ def _is_likely_api_error_message_global(text: str) -> bool:
         "Whisper request failed",
         "Whisper returned",
         "Whisper transcription rejected",
+        "Local transcription failed",
+        "Local transcription add-on",
+        "Local transcription model",
+        "Could not load local transcription add-on",
+        "Could not load local transcription model",
+        "Media Tools add-on",
         "Unsupported transcription file type",
         "That media file is too large",
         "That iPhone video is too large",
@@ -3190,6 +4321,7 @@ def _transcribe_audio_openai_chunked(
     file_path: Path,
     language: Optional[str],
     *,
+    model_name: Optional[str] = None,
     prompt: Optional[str] = None,
     temperature: float = 0.0,
     on_part: Optional[Callable[[str], None]] = None,
@@ -3210,6 +4342,7 @@ def _transcribe_audio_openai_chunked(
         return _transcribe_audio_openai_single(
             file_path,
             language,
+            model_name=model_name,
             prompt=prompt,
             temperature=temperature,
             progress=progress,
@@ -3220,6 +4353,7 @@ def _transcribe_audio_openai_chunked(
         return _transcribe_audio_openai_single(
             file_path,
             language,
+            model_name=model_name,
             prompt=prompt,
             temperature=temperature,
             progress=progress,
@@ -3245,6 +4379,7 @@ def _transcribe_audio_openai_chunked(
             chunk_result = _transcribe_audio_openai_single(
                 tmp,
                 language,
+                model_name=model_name,
                 prompt=prompt,
                 temperature=temperature,
                 progress=None,
@@ -3278,6 +4413,7 @@ def _transcribe_prepared_upload_openai(
     upload_path: Path,
     language: Optional[str],
     *,
+    model_name: Optional[str] = None,
     prompt: Optional[str] = None,
     temperature: float = 0.0,
     on_part: Optional[Callable[[str], None]] = None,
@@ -3294,6 +4430,7 @@ def _transcribe_prepared_upload_openai(
         return _transcribe_audio_openai_chunked(
             upload_path,
             language,
+            model_name=model_name,
             prompt=prompt,
             temperature=temperature,
             on_part=on_part,
@@ -3307,6 +4444,7 @@ def _transcribe_prepared_upload_openai(
     result = _transcribe_audio_openai_single(
         upload_path,
         language,
+        model_name=model_name,
         prompt=prompt,
         temperature=temperature,
         content_type=upload_content_type,
@@ -3316,6 +4454,7 @@ def _transcribe_prepared_upload_openai(
         return _transcribe_audio_openai_chunked(
             upload_path,
             language,
+            model_name=model_name,
             prompt=prompt,
             temperature=temperature,
             on_part=on_part,
@@ -3331,14 +4470,204 @@ def _transcribe_prepared_upload_openai(
     return result
 
 
-def transcribe_audio_openai(
+_LOCAL_TRANSCRIPTION_MODEL_CACHE: Dict[str, Any] = {}
+_LOCAL_TRANSCRIPTION_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def _get_local_transcription_model(model_name: str) -> Tuple[Optional[Any], Optional[str]]:
+    return None, "Local transcription models are loaded by the helper add-on."
+
+
+def _clear_local_transcription_model_cache(model_name: Optional[str] = None) -> None:
+    with _LOCAL_TRANSCRIPTION_MODEL_CACHE_LOCK:
+        if not model_name:
+            _LOCAL_TRANSCRIPTION_MODEL_CACHE.clear()
+            return
+        prefix = f"{model_name}:"
+        for key in list(_LOCAL_TRANSCRIPTION_MODEL_CACHE.keys()):
+            if key.startswith(prefix):
+                _LOCAL_TRANSCRIPTION_MODEL_CACHE.pop(key, None)
+
+
+def _transcribe_prepared_upload_local(
+    upload_path: Path,
+    model_name: str,
+    language: Optional[str],
+    *,
+    prompt: Optional[str] = None,
+    on_part: Optional[Callable[[str], None]] = None,
+    progress: Optional[Callable[[int], None]] = None,
+) -> str:
+    def _pg(p: int) -> None:
+        if progress is not None:
+            try:
+                progress(min(100, max(0, int(p))))
+            except Exception:
+                pass
+
+    _pg(8)
+    runtime_ok, runtime_err = ensure_local_transcription_runtime_loaded()
+    if not runtime_ok:
+        return runtime_err
+    transcripts: List[str] = []
+
+    def _event(event: Dict[str, Any]) -> None:
+        name = str(event.get("event") or "")
+        if "percent" in event:
+            try:
+                _pg(int(float(event.get("percent") or 0)))
+            except Exception:
+                pass
+        if name == "segment":
+            text = clean_whisper_transcript(str(event.get("text") or ""), language).strip()
+            if not text or _is_whisper_rejection_message(text):
+                return
+            if transcripts and _transcript_repeat_key(text) == _transcript_repeat_key(transcripts[-1]):
+                return
+            transcripts.append(text)
+            if on_part is not None:
+                try:
+                    on_part(text)
+                except Exception:
+                    pass
+
+    helper_prompt = _whisper_prompt(language, prompt) if language or (prompt or "").strip() else ""
+    helper_args = [
+        "transcribe",
+        "--model",
+        model_name,
+        "--input",
+        str(upload_path),
+        "--models-dir",
+        str(LOCAL_TRANSCRIPTION_MODEL_DIR),
+        "--language",
+        language or "auto",
+        "--prompt",
+        helper_prompt,
+        "--compute-type",
+        TRANSCRIPTION_LOCAL_COMPUTE_TYPE,
+        "--cpu-threads",
+        str(TRANSCRIPTION_LOCAL_CPU_THREADS),
+    ]
+    if language is None:
+        helper_args.append("--auto-fallback-zh")
+
+    ok, err_msg, last = _run_local_transcriber_json(
+        helper_args,
+        on_event=_event,
+        timeout=None,
+    )
+    if not ok:
+        return err_msg
+    final_text = str(last.get("text") or "").strip() if last.get("event") == "complete" else ""
+    if final_text:
+        merged = clean_whisper_transcript(final_text, language)
+        if _is_whisper_rejection_message(merged) and transcripts:
+            merged = clean_whisper_transcript(" ".join(t for t in transcripts if t.strip()).strip(), language)
+    else:
+        merged = clean_whisper_transcript(" ".join(t for t in transcripts if t.strip()).strip(), language)
+    _pg(98)
+    return merged or "Whisper returned empty text."
+
+
+def transcribe_audio_with_model(
     file_path: Path,
     language: Optional[str],
+    model_choice: str,
     *,
     prompt: Optional[str] = None,
     temperature: float = 0.0,
     on_part: Optional[Callable[[str], None]] = None,
     progress: Optional[Callable[[int], None]] = None,
+    status: Optional[Callable[[str], None]] = None,
+) -> str:
+    choice = normalize_transcription_model_choice(model_choice)
+    if transcription_model_is_cloud(choice):
+        return transcribe_audio_openai(
+            file_path,
+            language,
+            model_name=transcription_cloud_model_name(choice),
+            prompt=prompt,
+            temperature=temperature,
+            on_part=on_part,
+            progress=progress,
+            status=status,
+        )
+
+    model_name = transcription_local_model_name(choice)
+    last_pct = [0]
+
+    def _p(pct: int) -> None:
+        v = min(100, max(0, int(pct)))
+        if v < last_pct[0]:
+            v = last_pct[0]
+        else:
+            last_pct[0] = v
+        if progress is not None:
+            try:
+                progress(v)
+            except Exception:
+                pass
+
+    def _status(text: str) -> None:
+        if status is not None:
+            try:
+                status(text)
+            except Exception:
+                pass
+
+    _p(2)
+    _status("Preparing audio for local transcription...")
+    upload_paths, prep_err, temp_upload = prepare_paths_for_transcription(file_path)
+    if prep_err is not None:
+        return prep_err
+    if not upload_paths:
+        return "Whisper returned empty text."
+    _p(6)
+    try:
+        transcripts: List[str] = []
+        n_uploads = max(len(upload_paths), 1)
+        if n_uploads > 1:
+            _status(f"Prepared {n_uploads} audio parts. Transcribing part 1/{n_uploads}...")
+        for idx, upload_path in enumerate(upload_paths):
+            def _part_progress(pct: int, _idx: int = idx) -> None:
+                base = 6 + int(92 * (_idx / n_uploads))
+                span = max(1, int(92 / n_uploads))
+                _p(base + int(span * min(100, max(0, int(pct))) / 100))
+
+            _status(f"Transcribing audio part {idx + 1}/{n_uploads}...")
+            result = _transcribe_prepared_upload_local(
+                upload_path,
+                model_name,
+                language,
+                prompt=prompt,
+                on_part=on_part,
+                progress=_part_progress,
+            )
+            if _is_likely_api_error_message_global(result):
+                return result
+            if result.strip():
+                transcripts.append(result.strip())
+            _status(f"Finished audio part {idx + 1}/{n_uploads}.")
+        _p(99)
+        merged = clean_whisper_transcript(" ".join(transcripts).strip(), language)
+        _status("Transcription complete.")
+        return merged or "Whisper returned empty text."
+    finally:
+        if temp_upload is not None:
+            _cleanup_transcription_temp(temp_upload)
+
+
+def transcribe_audio_openai(
+    file_path: Path,
+    language: Optional[str],
+    *,
+    model_name: Optional[str] = None,
+    prompt: Optional[str] = None,
+    temperature: float = 0.0,
+    on_part: Optional[Callable[[str], None]] = None,
+    progress: Optional[Callable[[int], None]] = None,
+    status: Optional[Callable[[str], None]] = None,
 ) -> str:
     """Send local audio to Whisper with fallback for long context/uploads."""
     last_pct = [0]
@@ -3355,7 +4684,15 @@ def transcribe_audio_openai(
             except Exception:
                 pass
 
+    def _status(text: str) -> None:
+        if status is not None:
+            try:
+                status(text)
+            except Exception:
+                pass
+
     _p(2)
+    _status("Preparing audio for transcription...")
     upload_paths, prep_err, temp_upload = prepare_paths_for_transcription(file_path)
     if prep_err is not None:
         return prep_err
@@ -3365,15 +4702,19 @@ def transcribe_audio_openai(
     try:
         transcripts: List[str] = []
         n_uploads = max(len(upload_paths), 1)
+        if n_uploads > 1:
+            _status(f"Prepared {n_uploads} audio parts. Transcribing part 1/{n_uploads}...")
         for idx, upload_path in enumerate(upload_paths):
             def _part_progress(pct: int, _idx: int = idx) -> None:
                 base = 6 + int(92 * (_idx / n_uploads))
                 span = max(1, int(92 / n_uploads))
                 _p(base + int(span * min(100, max(0, int(pct))) / 100))
 
+            _status(f"Transcribing audio part {idx + 1}/{n_uploads}...")
             result = _transcribe_prepared_upload_openai(
                 upload_path,
                 language,
+                model_name=model_name,
                 prompt=prompt,
                 temperature=temperature,
                 on_part=on_part,
@@ -3383,8 +4724,10 @@ def transcribe_audio_openai(
                 return result
             if result.strip():
                 transcripts.append(result.strip())
+            _status(f"Finished audio part {idx + 1}/{n_uploads}.")
         _p(99)
         merged = clean_whisper_transcript(" ".join(transcripts).strip(), language)
+        _status("Transcription complete.")
         return merged or "Whisper returned empty text."
     finally:
         if temp_upload is not None:
@@ -3394,7 +4737,7 @@ def transcribe_audio_openai(
 def archive_journal_recording(wav_path: Path) -> Optional[Path]:
     """Copy a session WAV into RECORDING_DIR.
 
-    Files are named rcdYYYYMMDD.wav, then rcdYYYYMMDD1.wav, rcdYYYYMMDD2.wav, … for the same day.
+    Files are named rcdYYYYMMDD.wav, then rcdYYYYMMDD1.wav, rcdYYYYMMDD2.wav, ... for the same day.
     """
     try:
         RECORDING_DIR.mkdir(parents=True, exist_ok=True)
@@ -3924,6 +5267,9 @@ def open_journal_window_editor(
     content_host.grid_rowconfigure(1, weight=0)
     content_host.grid_columnconfigure(0, weight=1)
     console_input_holder: Dict[str, Any] = {"row": None}
+    console_output_holder: Dict[str, Any] = {"widget": None}
+    console_session_updates: List[str] = []
+    console_session_last: Dict[str, str] = {}
 
     journal_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
     ai_recap_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
@@ -4012,7 +5358,7 @@ def open_journal_window_editor(
     page_toggle_buttons: List[Any] = []
     nav_summon_btn = tk.Button(
         content_host,
-        text="▶",
+        text="\u25b6",
         bg=t_init.toolbar_btn_config()[0],
         fg=t_init.toolbar_btn_config()[1],
         activebackground=t_init.toolbar_btn_config()[2],
@@ -4054,7 +5400,7 @@ def open_journal_window_editor(
             return page_toggle_buttons[0]
         btn = tk.Button(
             nav_rail,
-            text="◀",
+            text="\u25c0",
             bg=t_init.toolbar_btn_config()[0],
             fg=t_init.toolbar_btn_config()[1],
             activebackground=t_init.toolbar_btn_config()[2],
@@ -4563,13 +5909,13 @@ def open_journal_window_editor(
         lang_combo = ttk.Combobox(
             stt_top,
             textvariable=lang_var,
-            values=("Auto", "English", "简体中文"),
+            values=("Auto", "English", "ç®€ä½“ä¸­æ–‡"),
             state="readonly",
             width=11,
             style="Journal.TCombobox",
         )
     else:
-        lang_combo = tk.OptionMenu(stt_top, lang_var, "Auto", "English", "简体中文")
+        lang_combo = tk.OptionMenu(stt_top, lang_var, "Auto", "English", "ç®€ä½“ä¸­æ–‡")
         lang_combo.config(bg=t_init.panel, fg=t_init.text, highlightthickness=0)
 
     stt_frame = tk.Frame(stt_outer, bg=t_init.panel, bd=0, highlightthickness=0)
@@ -4624,11 +5970,13 @@ def open_journal_window_editor(
     transcribe_hover = tk.Frame(stt_frame, bg=t_init.panel)
     transcribe_hover.grid(row=1, column=2, sticky="ns", padx=(2, 10), pady=(4, 10))
     _tid = t_init.transcribe_idle_disabled_config()
+    transcribe_btn_row = tk.Frame(transcribe_hover, bg=t_init.panel)
+    transcribe_btn_row.pack()
     transcribe_btn = tk.Button(
-        transcribe_hover,
+        transcribe_btn_row,
         text="Transcribe",
         state="disabled",
-        width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+        width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH - 3,
         bg=_tid[0],
         fg=_tid[1],
         activebackground=_tid[2],
@@ -4640,12 +5988,31 @@ def open_journal_window_editor(
         pady=8,
         cursor="hand2",
     )
-    transcribe_btn.pack()
+    transcribe_btn.pack(side="left")
+    transcribe_model_btn = tk.Button(
+        transcribe_btn_row,
+        text="v",
+        state="normal",
+        width=2,
+        bg=_tid[0],
+        fg=_tid[1],
+        activebackground=_tid[2],
+        activeforeground=_tid[3],
+        disabledforeground=_tid[4],
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=0,
+        pady=8,
+        cursor="hand2",
+    )
+    transcribe_model_btn.pack(side="left", padx=(2, 0))
+    transcribe_file_btn_row = tk.Frame(transcribe_hover, bg=t_init.panel)
+    transcribe_file_btn_row.pack(pady=(6, 0))
     transcribe_file_btn = tk.Button(
-        transcribe_hover,
+        transcribe_file_btn_row,
         text="Transcribe File",
         state="disabled",
-        width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+        width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH - 3,
         bg=_tid[0],
         fg=_tid[1],
         activebackground=_tid[2],
@@ -4657,7 +6024,24 @@ def open_journal_window_editor(
         pady=8,
         cursor="hand2",
     )
-    transcribe_file_btn.pack(pady=(6, 0))
+    transcribe_file_btn.pack(side="left")
+    transcribe_file_model_btn = tk.Button(
+        transcribe_file_btn_row,
+        text="v",
+        state="normal",
+        width=2,
+        bg=_tid[0],
+        fg=_tid[1],
+        activebackground=_tid[2],
+        activeforeground=_tid[3],
+        disabledforeground=_tid[4],
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=0,
+        pady=8,
+        cursor="hand2",
+    )
+    transcribe_file_model_btn.pack(side="left", padx=(2, 0))
     receive_iphone_btn = tk.Button(
         transcribe_hover,
         text="Receive from iPhone",
@@ -4767,6 +6151,7 @@ def open_journal_window_editor(
     placeholder_body_labels: List[Any] = []
 
     api_key_prompt_hooks: Dict[str, Callable[[], None]] = {}
+    transcription_models_manager_hooks: Dict[str, Callable[[], None]] = {}
 
     def build_ai_recap_and_chatbot_pages() -> None:
         _register_page_toggle(ai_recap_page)
@@ -6164,6 +7549,66 @@ def open_journal_window_editor(
     settings_app_name = {"value": settings_prefs.get("app_name", "Daily Logger") or "Daily Logger"}
     console_hint_state: Dict[str, Any] = {"text": "", "apply": None, "reset_after_id": None}
 
+    def _console_update_timestamp() -> str:
+        return datetime.now().strftime("%I:%M:%S%p").lstrip("0")
+
+    def _set_console_temp_message(msg: str, *, timeout_ms: int = 10000) -> None:
+        text = (msg or "").strip()
+        if not text:
+            return
+        console_hint_state["text"] = text
+        _id = console_hint_state.get("reset_after_id")
+        if _id is not None:
+            try:
+                root.after_cancel(_id)
+            except Exception:
+                pass
+        console_hint_state["reset_after_id"] = root.after(timeout_ms, _clear_console_hint)
+        apply_hint = console_hint_state.get("apply")
+        if callable(apply_hint):
+            apply_hint()
+
+    def _append_console_session_update(msg: str, *, key: str = "") -> None:
+        text = (msg or "").strip()
+        if not text:
+            return
+        dedupe_key = key or text
+        if console_session_last.get(dedupe_key) == text:
+            return
+        console_session_last[dedupe_key] = text
+        line = f"[{_console_update_timestamp()}] {text}"
+        console_session_updates.append(line)
+        if len(console_session_updates) > 1000:
+            del console_session_updates[: len(console_session_updates) - 1000]
+        widget = console_output_holder.get("widget")
+        if widget is None:
+            return
+        try:
+            widget.config(state="normal")
+            widget.insert("end", line + "\n")
+            widget.see("end")
+            widget.config(state="disabled")
+        except tk.TclError:
+            pass
+
+    def _console_update_is_noisy_progress(text: str) -> bool:
+        lowered = (text or "").casefold()
+        if lowered.startswith("receiving ") and " / " in lowered:
+            return True
+        if lowered.startswith("transcribing ") and re.search(r"\(\d+%\)$", text or ""):
+            return True
+        return False
+
+    def _publish_console_update(msg: str, *, key: str = "", temp: bool = True, log: Optional[bool] = None) -> None:
+        text = (msg or "").strip()
+        if not text:
+            return
+        if temp:
+            _set_console_temp_message(text)
+        should_log = (not _console_update_is_noisy_progress(text)) if log is None else bool(log)
+        if should_log:
+            _append_console_session_update(text, key=key)
+
     def _clear_console_hint() -> None:
         console_hint_state["text"] = ""
         _id = console_hint_state.get("reset_after_id")
@@ -6179,17 +7624,7 @@ def open_journal_window_editor(
 
     def _set_settings_status(msg: str) -> None:
         settings_status_var.set("")
-        console_hint_state["text"] = msg.strip()
-        _id = console_hint_state.get("reset_after_id")
-        if _id is not None:
-            try:
-                root.after_cancel(_id)
-            except Exception:
-                pass
-        console_hint_state["reset_after_id"] = root.after(10000, _clear_console_hint)
-        apply_hint = console_hint_state.get("apply")
-        if callable(apply_hint):
-            apply_hint()
+        _publish_console_update(msg, key=f"settings:{msg}")
 
     lang_row, _ = _make_settings_row("settings.language")
     ui_lang_var = tk.StringVar(
@@ -6274,6 +7709,52 @@ def open_journal_window_editor(
         width=7,
     )
     startup_toggle_btn.pack(side="left")
+
+    iphone_receive_row, _ = _make_settings_row("settings.iphone_receive")
+    iphone_receive_state = {"enabled": iphone_passive_receive_enabled()}
+    iphone_receive_toggle_btn = tk.Button(
+        iphone_receive_row,
+        text=tr("settings.on") if iphone_receive_state["enabled"] else tr("settings.off"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+        width=7,
+    )
+    iphone_receive_toggle_btn.pack(side="left")
+
+    transcription_models_row, _ = _make_settings_row("settings.transcription_models")
+    transcription_models_btn = tk.Button(
+        transcription_models_row,
+        text=tr("settings.manage"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+        width=9,
+    )
+    transcription_models_btn.pack(side="left")
+
+    def _refresh_iphone_settings_toggle_btn() -> None:
+        iphone_receive_state["enabled"] = iphone_passive_receive_enabled()
+        try:
+            iphone_receive_toggle_btn.config(
+                text=tr("settings.on") if iphone_receive_state["enabled"] else tr("settings.off")
+            )
+        except tk.TclError:
+            pass
+
+    globals()["_daily_logger_refresh_iphone_settings_toggle"] = _refresh_iphone_settings_toggle_btn
 
     theme_row, _ = _make_settings_row("settings.theme")
     settings_theme_btn = tk.Button(
@@ -6483,6 +7964,29 @@ def open_journal_window_editor(
             tr("status.startup_on") if should_enable else tr("status.startup_off")
         )
 
+    def _on_toggle_iphone_receive() -> None:
+        should_enable = not iphone_receive_state["enabled"]
+        if not save_iphone_passive_receive_enabled(should_enable):
+            _set_settings_status(tr("status.iphone_receive_save_fail"))
+            return
+        iphone_receive_state["enabled"] = should_enable
+        iphone_receive_toggle_btn.config(
+            text=tr("settings.on") if should_enable else tr("settings.off")
+        )
+        if should_enable:
+            start_iphone_receiver(show_setup=False, passive=True)
+            _set_settings_status(tr("status.iphone_receive_on"))
+        else:
+            stop_iphone_receiver()
+            _set_settings_status(tr("status.iphone_receive_off"))
+
+    def _on_open_transcription_models() -> None:
+        opener = transcription_models_manager_hooks.get("open")
+        if callable(opener):
+            opener()
+            return
+        _set_settings_status(tr("status.transcription_models_not_ready"))
+
     def _persist_backup_mode(mode: str) -> None:
         prefs = load_preferences()
         if mode == "On":
@@ -6571,6 +8075,8 @@ def open_journal_window_editor(
 
     rename_btn.config(command=_on_rename_apply)
     startup_toggle_btn.config(command=_on_toggle_startup)
+    iphone_receive_toggle_btn.config(command=_on_toggle_iphone_receive)
+    transcription_models_btn.config(command=_on_open_transcription_models)
     backup_mode_btn.config(command=_on_cycle_backup_mode)
     backup_manual_btn.config(command=_on_manual_backup)
     token_save_btn.config(command=_on_token_save)
@@ -6600,6 +8106,8 @@ def open_journal_window_editor(
     for _btn in (
         rename_btn,
         startup_toggle_btn,
+        iphone_receive_toggle_btn,
+        transcription_models_btn,
         settings_theme_btn,
         backup_mode_btn,
         backup_manual_btn,
@@ -6651,6 +8159,8 @@ def open_journal_window_editor(
         highlightcolor=t_init.accent,
     )
     console_output.pack(fill="both", expand=True, side="left")
+    console_output_holder["widget"] = console_output
+    _append_console_session_update("Session started.", key="session:start")
     console_scroll = tk.Scrollbar(
         console_wrap,
         command=console_output.yview,
@@ -7191,6 +8701,7 @@ def open_journal_window_editor(
     last_journal_wav: Dict[str, Optional[Path]] = {"path": None}
     transcribing_busy = {"v": False}
     transcribing_progress: Dict[str, int] = {"v": 0}
+    transcribing_job_state: Dict[str, int] = {"id": 0}
     wave_lock = threading.Lock()
     wave_holder: Dict[str, List[float]] = {"levels": []}
     wave_gate: Dict[str, Any] = {"rms": 0.0}
@@ -7274,6 +8785,7 @@ def open_journal_window_editor(
     iphone_pending_keys: set[str] = set()
     iphone_receiver_state: Dict[str, Any] = {
         "active": False,
+        "passive": False,
         "server": None,
         "thread": None,
         "url": "",
@@ -7289,17 +8801,29 @@ def open_journal_window_editor(
             return str(path).casefold()
 
     def _set_iphone_status(text: str) -> None:
-        try:
-            stt_status.config(text=text)
-        except tk.TclError:
-            pass
+        _publish_console_update(text, key="iphone_status")
+
+    iphone_upload_status_by_id: Dict[str, Tuple[float, str]] = {}
+    iphone_upload_id_by_path: Dict[str, str] = {}
+
+    def publish_iphone_upload_status(upload_id: str, text: str) -> None:
+        if upload_id:
+            iphone_upload_status_by_id[upload_id] = (time.time(), text)
+            cutoff = time.time() - 3600
+            for old_id, (stamp, _msg) in list(iphone_upload_status_by_id.items()):
+                if stamp < cutoff:
+                    iphone_upload_status_by_id.pop(old_id, None)
+        root.after(0, lambda msg=text: _set_iphone_status(msg))
 
     def _update_iphone_receive_button() -> None:
         t = th()
         bg, fg, abg, afg = t.side_action_config()
         active = bool(iphone_receiver_state.get("active"))
+        passive = bool(iphone_receiver_state.get("passive"))
         receive_iphone_btn.config(
-            text=tr("journal.iphone_stop") if active else tr("journal.iphone_receive"),
+            text=tr("journal.iphone_receive") if passive else (
+                tr("journal.iphone_stop") if active else tr("journal.iphone_receive")
+            ),
             state="normal",
             width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
             bg=bg,
@@ -7322,23 +8846,92 @@ def open_journal_window_editor(
 
     def _move_iphone_batch_to_processed(success: bool, paths: List[Path]) -> None:
         if success:
+            for path in paths:
+                upload_id = iphone_upload_id_by_path.get(_iphone_path_key(path), "")
+                if upload_id:
+                    publish_iphone_upload_status(
+                        upload_id,
+                        f"Processed {path.name}. Transcription complete.",
+                    )
+                    iphone_upload_id_by_path.pop(_iphone_path_key(path), None)
+                _append_console_session_update(f"iPhone file transcribed: {path.name}", key=f"iphone:done:{_iphone_path_key(path)}")
             mark_iphone_inbox_files_processed(paths)
+
+    def _rescan_and_drain_iphone_pending() -> None:
+        receive_iphone_incoming_files(list_incoming_iphone_files())
+        enqueue_iphone_imports(list_pending_iphone_inbox_files())
+        drain_iphone_pending()
+
+    def _schedule_iphone_pending_drain_after_install() -> None:
+        for delay in (100, 1000, 3000):
+            root.after(delay, _rescan_and_drain_iphone_pending)
 
     def drain_iphone_pending() -> None:
         if transcribing_busy["v"] or recording_ui_busy["v"]:
             _refresh_iphone_pending_status()
+            _append_console_session_update(
+                "iPhone transcription is pending until the current recording/transcription finishes.",
+                key="iphone:pending:busy",
+            )
             return
         if not iphone_pending_paths:
             if bool(iphone_receiver_state.get("active")):
                 _set_iphone_status(tr("journal.iphone_waiting"))
             return
-        if not get_openai_api_key():
-            _set_iphone_status(_iphone_pending_status_text())
-            return
         paths = sorted(iphone_pending_paths, key=_transcription_file_sort_key)
+        if any_transcription_path_needs_media_tools(paths) and _find_ffmpeg_executable() is None:
+            _set_iphone_status(_iphone_pending_status_text())
+            _append_console_session_update(
+                f"Pending iPhone file needs Media Tools: {paths[0].name}",
+                key="iphone:pending:media_tools",
+            )
+            if messagebox.askyesno(
+                tr("download_manager.title"),
+                tr("download_manager.media_required_prompt"),
+            ):
+                _install_media_tools_addon()
+            return
+        pending_choice = normalize_transcription_model_choice(transcription_model_choice["value"])
+        if transcription_model_is_cloud(pending_choice) and not get_openai_api_key():
+            _set_iphone_status(_iphone_pending_status_text())
+            _append_console_session_update(
+                "iPhone transcription is pending because no cloud API key is saved.",
+                key="iphone:pending:model",
+            )
+            return
+        if transcription_model_is_local(pending_choice):
+            pending_model_name = transcription_local_model_name(pending_choice)
+            local_ready = False
+            local_reason = ""
+            if not local_transcription_model_is_downloaded(pending_model_name):
+                local_reason = "the selected local model is not downloaded"
+            else:
+                runtime_ok, runtime_err = ensure_local_transcription_runtime_loaded()
+                local_ready = runtime_ok
+                local_reason = runtime_err or "the local transcription add-on is not ready"
+            if not local_ready:
+                if get_openai_api_key():
+                    _append_console_session_update(
+                        f"iPhone upload switched to cloud transcription because {local_reason}.",
+                        key="iphone:cloud_fallback",
+                    )
+                    _set_transcription_model_choice(TRANSCRIPTION_MODEL_CLOUD)
+                    pending_choice = normalize_transcription_model_choice(transcription_model_choice["value"])
+                else:
+                    _set_iphone_status(_iphone_pending_status_text())
+                    _append_console_session_update(
+                        f"iPhone transcription is pending because {local_reason}.",
+                        key="iphone:pending:model",
+                    )
+                    _open_transcription_downloads_manager("transcription")
+                    return
         iphone_pending_paths.clear()
         iphone_pending_keys.clear()
         _set_stt_saved_path_display(tr("journal.iphone_inbox"))
+        _append_console_session_update(
+            f"Starting iPhone transcription queue: {len(paths)} file(s).",
+            key=f"iphone:queue:start:{int(time.time())}",
+        )
         begin_transcribe_paths(
             paths,
             display_label=tr("journal.iphone_inbox"),
@@ -7358,7 +8951,166 @@ def open_journal_window_editor(
             added += 1
         if added:
             _set_iphone_status(tr("journal.iphone_received").format(count=added))
+            _append_console_session_update(
+                f"Added {added} iPhone file(s) to pending transcription.",
+                key=f"iphone:pending:add:{int(time.time())}",
+            )
         root.after(100, drain_iphone_pending)
+
+    iphone_incoming_paths: List[Path] = []
+    iphone_incoming_keys: set[str] = set()
+    iphone_incoming_prompt_after = {"id": None}
+
+    def _refresh_settings_iphone_toggle() -> None:
+        fn = globals().get("_daily_logger_refresh_iphone_settings_toggle")
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _accept_iphone_incoming(paths: List[Path]) -> None:
+        accepted: List[Path] = []
+        for src in paths:
+            upload_id = iphone_upload_id_by_path.pop(_iphone_path_key(src), "")
+            moved = move_iphone_file_to_inbox(src)
+            if moved is not None:
+                if upload_id:
+                    iphone_upload_id_by_path[_iphone_path_key(moved)] = upload_id
+                    publish_iphone_upload_status(
+                        upload_id,
+                        f"Accepted {moved.name} on PC. Waiting for transcription to start.",
+                    )
+                accepted.append(moved)
+        if accepted:
+            enqueue_iphone_imports(accepted)
+
+    def _decline_iphone_incoming(paths: List[Path]) -> None:
+        declined = 0
+        for src in paths:
+            if decline_iphone_file(src):
+                declined += 1
+        if declined:
+            _set_iphone_status(tr("journal.iphone_declined").format(count=declined))
+
+    def _show_iphone_incoming_prompt() -> None:
+        iphone_incoming_prompt_after["id"] = None
+        paths = sorted(
+            [p for p in iphone_incoming_paths if p.exists() and is_transcription_media_file(p)],
+            key=_transcription_file_sort_key,
+        )
+        iphone_incoming_paths.clear()
+        iphone_incoming_keys.clear()
+        if not paths:
+            return
+        win = tk.Toplevel(root)
+        win.title(tr("journal.iphone_incoming_title"))
+        win.transient(root)
+        win.geometry("430x260")
+        win.resizable(False, False)
+        t = th()
+        win.configure(bg=t.surface)
+        wrap = tk.Frame(win, bg=t.surface, padx=18, pady=16)
+        wrap.pack(fill="both", expand=True)
+        tk.Label(
+            wrap,
+            text=tr("journal.iphone_incoming_title"),
+            bg=t.surface,
+            fg=t.text,
+            font=("Segoe UI", 13, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+        names = "\n".join(p.name for p in paths[:6])
+        if len(paths) > 6:
+            names += f"\n...and {len(paths) - 6} more"
+        tk.Label(
+            wrap,
+            text=tr("journal.iphone_incoming_body").format(count=len(paths), names=names),
+            bg=t.surface,
+            fg=t.muted,
+            justify="left",
+            anchor="w",
+            wraplength=390,
+            font=("Segoe UI", 9),
+        ).pack(fill="x", pady=(0, 16))
+        button_row = tk.Frame(wrap, bg=t.surface)
+        button_row.pack(fill="x", side="bottom")
+
+        def _close_after(action: Callable[[], None]) -> None:
+            action()
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        accept_btn = tk.Button(
+            button_row,
+            text=tr("journal.iphone_accept"),
+            command=lambda: _close_after(lambda: _accept_iphone_incoming(paths)),
+            bg=t.accent,
+            fg="white",
+            activebackground=t.hover_primary,
+            activeforeground="white",
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=7,
+            cursor="hand2",
+        )
+        accept_btn.pack(side="left", padx=(0, 8))
+        decline_btn = tk.Button(
+            button_row,
+            text=tr("journal.iphone_decline"),
+            command=lambda: _close_after(lambda: _decline_iphone_incoming(paths)),
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=7,
+            cursor="hand2",
+        )
+        decline_btn.pack(side="left", padx=(0, 8))
+
+        def _turn_off() -> None:
+            save_iphone_passive_receive_enabled(False)
+            _decline_iphone_incoming(paths)
+            stop_iphone_receiver()
+            _refresh_settings_iphone_toggle()
+
+        off_btn = tk.Button(
+            button_row,
+            text=tr("journal.iphone_turn_off"),
+            command=lambda: _close_after(_turn_off),
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=7,
+            cursor="hand2",
+        )
+        off_btn.pack(side="left")
+
+    def receive_iphone_incoming_files(paths: List[Path]) -> None:
+        added = 0
+        for path in paths:
+            if not path.exists() or not is_transcription_media_file(path):
+                continue
+            key = _iphone_path_key(path)
+            if key in iphone_incoming_keys:
+                continue
+            iphone_incoming_keys.add(key)
+            iphone_incoming_paths.append(path)
+            added += 1
+        if added:
+            _set_iphone_status(tr("journal.iphone_incoming_status").format(count=added))
+            if iphone_incoming_prompt_after["id"] is None:
+                iphone_incoming_prompt_after["id"] = root.after(700, _show_iphone_incoming_prompt)
 
     def _build_iphone_setup_message(url: str, token: str) -> str:
         return tr("journal.iphone_setup_guide").format(
@@ -7371,8 +9123,8 @@ def open_journal_window_editor(
         win = tk.Toplevel(root)
         win.title(tr("journal.iphone_inbox"))
         win.transient(root)
-        win.geometry("480x620")
-        win.minsize(420, 540)
+        win.geometry("520x690")
+        win.minsize(460, 600)
         t = th()
         win.configure(bg=t.surface)
         wrap = tk.Frame(win, bg=t.surface, padx=20, pady=18)
@@ -7455,6 +9207,20 @@ def open_journal_window_editor(
         )
         note.grid(row=4, column=0, sticky="ew", pady=(0, 14))
 
+        guide = tk.Label(
+            wrap,
+            text=tr("journal.iphone_shortcut_guide_compact"),
+            bg=t.field,
+            fg=t.text,
+            justify="left",
+            anchor="w",
+            wraplength=450,
+            font=("Segoe UI", 9),
+            padx=12,
+            pady=10,
+        )
+        guide.grid(row=5, column=0, sticky="ew", pady=(0, 14))
+
         def _set_entry_value(value: str) -> None:
             shortcut_entry.config(state="normal")
             shortcut_entry.delete(0, "end")
@@ -7490,14 +9256,18 @@ def open_journal_window_editor(
             iphone_receiver_state["urls"] = refreshed
             iphone_receiver_state["url"] = refreshed.get("wifi", "")
             if refreshed.get("wifi"):
-                _set_stt_saved_path_display(refreshed["wifi"])
+                _set_stt_saved_path_display(tr("journal.iphone_inbox"))
+                _publish_console_update(
+                    f"iPhone receiver URL ready: {refreshed['wifi']}",
+                    key="iphone:url",
+                )
             _set_entry_value(refreshed.get("shortcut", refreshed.get("wifi", "")))
             _render_qr(refreshed.get("mobile", refreshed.get("wifi", "")))
 
         _refresh_urls()
 
         button_row = tk.Frame(wrap, bg=t.surface)
-        button_row.grid(row=5, column=0, sticky="e")
+        button_row.grid(row=6, column=0, sticky="e")
         copy_btn = tk.Button(
             button_row,
             text=tr("journal.iphone_copy_shortcut"),
@@ -7554,8 +9324,15 @@ def open_journal_window_editor(
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(data)
+                try:
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                self.close_connection = True
 
             def _authorized(self) -> bool:
                 parsed = urlparse(self.path)
@@ -7571,6 +9348,15 @@ def open_journal_window_editor(
                 parsed = urlparse(self.path)
                 if parsed.path == "/api/health":
                     self._send_text(200, "ok")
+                    return
+                if parsed.path == "/api/upload-status":
+                    if not self._authorized():
+                        self._send_text(403, "Invalid Daily Logger upload token.")
+                        return
+                    qs = parse_qs(parsed.query)
+                    upload_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", (qs.get("uploadId") or [""])[0])[:80]
+                    _stamp, message = iphone_upload_status_by_id.get(upload_id, (0.0, "Daily Logger is waiting for this upload."))
+                    self._send_text(200, message)
                     return
                 if parsed.path.rstrip("/") == "/iphone":
                     if not self._authorized():
@@ -7599,32 +9385,61 @@ def open_journal_window_editor(
                         ".ok{color:#047857}.err{color:#b91c1c}"
                         "</style></head><body><main class='wrap'>"
                         "<h1>Daily Logger iPhone Inbox</h1>"
-                        "<p class='hint'>Choose iPhone videos or audio files. Daily Logger will receive them on the PC and transcribe them in recording-time order.</p>"
+                        "<p class='hint'>Choose iPhone videos, Voice Memos, or audio files. For very long videos, the Share Sheet Shortcut should send audio only first; this page can upload raw video in chunks, but it is slower.</p>"
                         "<section class='panel'>"
-                        "<input id='files' type='file' multiple accept='video/*,audio/*,.mov,.mp4,.m4a,.wav,.mp3,.webm,.ogg,.flac,.mpeg,.mpga,.qt'>"
+                        "<input id='files' type='file' multiple accept='video/*,audio/*,.mov,.mp4,.m4a,.aac,.caf,.wav,.mp3,.webm,.ogg,.flac,.mpeg,.mpga,.qt'>"
                         "<button id='upload'>Upload to Daily Logger</button>"
                         "<div class='bar'><div id='fill' class='fill'></div></div>"
                         "<div id='status' class='status'>Waiting for files.</div>"
                         "</section></main>"
                         "<script>"
+                        f"const CHUNK_SIZE={IPHONE_IMPORT_BROWSER_CHUNK_BYTES};"
+                        "const UPLOAD_TIMEOUT_MS=300000;const MAX_UPLOAD_RETRIES=3;"
                         "const token=new URLSearchParams(location.search).get('token')||'';"
                         "const input=document.getElementById('files');const btn=document.getElementById('upload');"
                         "const statusEl=document.getElementById('status');const fill=document.getElementById('fill');"
                         "function setStatus(text,cls=''){statusEl.className='status '+cls;statusEl.textContent=text}"
-                        "function endpoint(file){const q=new URLSearchParams({token,filename:file.name,lastModified:String(file.lastModified||0)});return '/upload?'+q.toString()}"
-                        "function uploadOne(file,index,total){return new Promise((resolve,reject)=>{"
-                        "const xhr=new XMLHttpRequest();xhr.open('POST',endpoint(file));"
-                        "xhr.setRequestHeader('Content-Type',file.type||'application/octet-stream');"
-                        "xhr.upload.onprogress=e=>{if(e.lengthComputable){const part=e.loaded/e.total;const overall=((index+part)/total)*100;fill.style.width=overall.toFixed(1)+'%';"
-                        "setStatus(`Uploading ${index+1}/${total}: ${file.name} (${Math.round(part*100)}%)`)}};"
-                        "xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300){fill.style.width=(((index+1)/total)*100).toFixed(1)+'%';resolve(xhr.responseText)}"
-                        "else{reject(new Error(xhr.responseText||`Upload failed (${xhr.status})`))}};"
-                        "xhr.onerror=()=>reject(new Error('Could not reach Daily Logger. Keep the app open and stay on the same Wi-Fi.'));"
-                        "xhr.send(file);});}"
+                        "function endpoint(file,uploadId){const q=new URLSearchParams({token,uploadId,filename:file.name,lastModified:String(file.lastModified||0)});return '/upload?'+q.toString()}"
+                        "function chunkEndpoint(file,uploadId,chunkIndex,chunkTotal){const q=new URLSearchParams({token,uploadId,filename:file.name,lastModified:String(file.lastModified||0),contentType:file.type||'application/octet-stream',index:String(chunkIndex),total:String(chunkTotal)});return '/upload-chunk?'+q.toString()}"
+                        "function wait(ms){return new Promise(resolve=>setTimeout(resolve,ms))}"
+                        "function uploadIdFromUrl(url){try{return new URL(url,location.href).searchParams.get('uploadId')||''}catch(_err){return ''}}"
+                        "async function pollPcStatus(uploadId){if(!uploadId){return ''}const q=new URLSearchParams({token,uploadId});"
+                        "try{const r=await fetch('/api/upload-status?'+q.toString(),{cache:'no-store'});return r.ok?await r.text():''}catch(_err){return ''}}"
+                        "function pcStatusMeansChunkDone(text){return /^Saved\\b/.test(text||'')||/Waiting for the next chunk/i.test(text||'')||/Waiting for PC accept/i.test(text||'')}"
+                        "function pcStatusMeansDone(text){return /Transcription complete/i.test(text||'')||/Processed/i.test(text||'')}"
+                        "function postBlobOnce(url,blob,file,basePct,spanPct,label,attempt){return new Promise((resolve,reject)=>{"
+                        "let uploaded=false;let settled=false;let lastUpdate=Date.now();let polling=false;const uploadId=uploadIdFromUrl(url);const xhr=new XMLHttpRequest();"
+                        "function finish(){clearInterval(timer)}"
+                        "function succeed(text,abortRequest=false){if(settled){return}settled=true;finish();if(abortRequest){try{xhr.abort()}catch(_err){}}fill.style.width=(basePct+spanPct).toFixed(1)+'%';resolve(text||'Received by Daily Logger.')}"
+                        "function fail(err){if(settled){return}settled=true;finish();reject(err)}"
+                        "const timer=setInterval(()=>{const seconds=Math.max(1,Math.round((Date.now()-lastUpdate)/1000));"
+                        "const fallback=uploaded?`${label}: ${file.name} uploaded. Waiting for PC to save/respond (${seconds}s). Attempt ${attempt}/${MAX_UPLOAD_RETRIES}.`:`${label}: ${file.name} still uploading (${seconds}s since last progress). Attempt ${attempt}/${MAX_UPLOAD_RETRIES}.`;"
+                        "setStatus(fallback);if(uploadId&&!polling){polling=true;pollPcStatus(uploadId).then(pc=>{if(pc){setStatus(`${fallback}\\nPC: ${pc}`);if(uploaded&&pcStatusMeansChunkDone(pc)){succeed(pc,true)}}}).finally(()=>{polling=false})}},1000);"
+                        "xhr.open('POST',url);xhr.timeout=UPLOAD_TIMEOUT_MS;xhr.setRequestHeader('Content-Type',file.type||'application/octet-stream');"
+                        "xhr.upload.onprogress=e=>{lastUpdate=Date.now();if(e.lengthComputable){const part=e.loaded/e.total;const overall=basePct+(part*spanPct);fill.style.width=overall.toFixed(1)+'%';"
+                        "uploaded=e.loaded>=e.total;if(uploaded){setStatus(`${label}: ${file.name} (100%). Waiting for PC to save/respond...`)}"
+                        "else{setStatus(`${label}: ${file.name} (${Math.round(part*100)}%)`)}}};"
+                        "xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300){succeed(xhr.responseText||'Received by Daily Logger.')}else{fail(new Error(xhr.responseText||`Upload failed (${xhr.status})`))}};"
+                        "xhr.onerror=()=>{fail(new Error('Could not reach Daily Logger. Keep the app open and stay on the same Wi-Fi.'))};"
+                        "xhr.ontimeout=async()=>{const pc=await pollPcStatus(uploadId);if(uploaded&&pcStatusMeansChunkDone(pc)){succeed(pc,true);return}fail(new Error(`${label} timed out while waiting for Daily Logger to respond.`))};"
+                        "xhr.send(blob);});}"
+                        "async function postBlob(url,blob,file,basePct,spanPct,label){let lastError=null;"
+                        "for(let attempt=1;attempt<=MAX_UPLOAD_RETRIES;attempt++){try{if(attempt>1){setStatus(`${label}: retry ${attempt}/${MAX_UPLOAD_RETRIES} for ${file.name}...`)}"
+                        "return await postBlobOnce(url,blob,file,basePct,spanPct,label,attempt)}catch(err){lastError=err;if(attempt>=MAX_UPLOAD_RETRIES){break}await wait(1200*attempt)}}"
+                        "throw lastError||new Error('Upload failed.')}"
+                        "function makeUploadId(){return Date.now().toString(36)+'-'+Math.random().toString(36).slice(2)}"
+                        "async function monitorPc(uploadId,fileName){if(!uploadId){return}for(let i=0;i<900;i++){const pc=await pollPcStatus(uploadId);if(pc){setStatus(`Uploaded ${fileName}.\\nPC: ${pc}`,'ok');if(pcStatusMeansDone(pc)){return}}await wait(2000)}}"
+                        "async function uploadRaw(file,index,total){const id=makeUploadId();const reply=await postBlob(endpoint(file,id),file,file,(index/total)*100,(1/total)*100,`Uploading ${index+1}/${total}`);return {id,reply}}"
+                        "async function uploadChunked(file,index,total){const chunks=Math.ceil(file.size/CHUNK_SIZE);const id=makeUploadId();"
+                        "setStatus(`${file.name}: uploading ${chunks} larger chunks. Daily Logger starts transcription after the full media file is saved and accepted on the PC.`);"
+                        "for(let c=0;c<chunks;c++){const start=c*CHUNK_SIZE;const blob=file.slice(start,Math.min(file.size,start+CHUNK_SIZE));"
+                        "const base=((index+(c/chunks))/total)*100;const span=(1/chunks/total)*100;const label=(c===chunks-1)?`Uploading final chunk ${c+1}/${chunks} for ${index+1}/${total}; PC assembles after this`:`Uploading chunk ${c+1}/${chunks} for ${index+1}/${total}`;"
+                        "const reply=await postBlob(chunkEndpoint(file,id,c,chunks),blob,file,base,span,label);setStatus(`${file.name}: Daily Logger received chunk ${c+1}/${chunks}.\\n${reply}`)}return {id,reply:'Saved to Daily Logger.'}}"
+                        "function uploadOne(file,index,total){if(file.size>CHUNK_SIZE*1.5){return uploadChunked(file,index,total)}return uploadRaw(file,index,total)}"
                         "btn.addEventListener('click',async()=>{const files=Array.from(input.files||[]).sort((a,b)=>(a.lastModified||0)-(b.lastModified||0)||a.name.localeCompare(b.name));"
                         "if(!files.length){setStatus('Choose one or more files first.','err');return}"
                         "btn.disabled=true;fill.style.width='0';"
-                        "try{for(let i=0;i<files.length;i++){await uploadOne(files[i],i,files.length)}setStatus(`Uploaded ${files.length} file(s). You can return to Daily Logger.`, 'ok')}"
+                        "try{let last=null;for(let i=0;i<files.length;i++){last=await uploadOne(files[i],i,files.length)}setStatus(`Uploaded ${files.length} file(s). Accept on the PC to start transcription. This page will keep showing PC progress.`, 'ok');if(last&&last.id){monitorPc(last.id,files[files.length-1].name)}}"
                         "catch(err){setStatus(err.message||String(err),'err')}"
                         "finally{btn.disabled=false}});"
                         "</script></body></html>"
@@ -7641,9 +9456,160 @@ def open_journal_window_editor(
                 )
                 self._send_text(200, body, "text/html; charset=utf-8")
 
+            def _query_filename(self, parsed: Any, qs: Dict[str, List[str]]) -> str:
+                filename = unquote((qs.get("filename") or [""])[0]).strip()
+                if not filename:
+                    filename = self.headers.get("X-Filename", "").strip()
+                if not filename:
+                    filename = _filename_from_content_disposition(
+                        self.headers.get("Content-Disposition", "")
+                    ).strip()
+                return filename
+
+            def _read_upload_body(
+                self,
+                target: Path,
+                length: int,
+                progress: Optional[Callable[[int, int], None]] = None,
+            ) -> Optional[str]:
+                remaining = length
+                target.parent.mkdir(parents=True, exist_ok=True)
+                written = 0
+                next_progress_at = time.monotonic()
+                try:
+                    self.connection.settimeout(300)
+                except Exception:
+                    pass
+                try:
+                    with target.open("wb") as out:
+                        while remaining > 0:
+                            chunk = self.rfile.read(min(IPHONE_IMPORT_CHUNK_BYTES, remaining))
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            written += len(chunk)
+                            remaining -= len(chunk)
+                            now = time.monotonic()
+                            if progress is not None and (now >= next_progress_at or remaining <= 0):
+                                progress(written, length)
+                                next_progress_at = now + 1.0
+                except (OSError, TimeoutError) as exc:
+                    try:
+                        target.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return f"Upload stalled while Daily Logger was saving the file: {exc}"
+                if remaining != 0:
+                    try:
+                        target.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return "Upload ended before the full file was received."
+                return None
+
+            def _finish_received_file(self, dest: Path, last_modified_raw: str, upload_id: str = "") -> None:
+                apply_iphone_last_modified(dest, last_modified_raw)
+                if upload_id:
+                    iphone_upload_id_by_path[_iphone_path_key(dest)] = upload_id
+                root.after(0, lambda p=dest: receive_iphone_incoming_files([p]))
+
+            def _handle_chunk_upload(self, parsed: Any, qs: Dict[str, List[str]], length: int) -> None:
+                if length <= 0:
+                    self._send_text(400, "No file body was uploaded.")
+                    return
+                if length > IPHONE_IMPORT_CHUNK_MAX_BYTES:
+                    self._send_text(413, "That upload chunk is too large.")
+                    return
+                upload_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", (qs.get("uploadId") or [""])[0])[:80]
+                if not upload_id:
+                    self._send_text(400, "Missing upload id.")
+                    return
+                try:
+                    index = int((qs.get("index") or [""])[0])
+                    total = int((qs.get("total") or [""])[0])
+                except (TypeError, ValueError):
+                    self._send_text(400, "Invalid chunk index.")
+                    return
+                if total < 1 or total > 10000 or index < 0 or index >= total:
+                    self._send_text(400, "Invalid chunk index.")
+                    return
+                content_type = unquote((qs.get("contentType") or [""])[0]).strip() or self.headers.get_content_type()
+                filename = self._query_filename(parsed, qs)
+                stem, suffix = _sanitize_iphone_upload_name(filename, content_type)
+                if not suffix:
+                    allowed = ", ".join(sorted(TRANSCRIPTION_MEDIA_SUFFIXES))
+                    self._send_text(415, f"Unsupported upload type. Use: {allowed}")
+                    return
+                chunk_dir = ensure_iphone_incoming_dir() / ".chunks" / upload_id
+                chunk_path = chunk_dir / f"{index:06d}.chunk"
+                tmp_chunk = chunk_path.with_suffix(".part")
+                try:
+                    label_name = filename or "iPhone upload"
+                    publish_iphone_upload_status(
+                        upload_id,
+                        f"Receiving {label_name}: chunk {index + 1}/{total} ({_media_size_mb(length)}).",
+                    )
+
+                    def _chunk_progress(done: int, expected: int) -> None:
+                        publish_iphone_upload_status(
+                            upload_id,
+                            (
+                                f"Receiving {label_name}: chunk {index + 1}/{total} "
+                                f"({_media_size_mb(done)} / {_media_size_mb(expected)})."
+                            ),
+                        )
+
+                    err_msg = self._read_upload_body(tmp_chunk, length, _chunk_progress)
+                    if err_msg:
+                        publish_iphone_upload_status(upload_id, err_msg)
+                        self._send_text(400, err_msg)
+                        return
+                    tmp_chunk.replace(chunk_path)
+                    ready = all((chunk_dir / f"{i:06d}.chunk").is_file() for i in range(total))
+                    if not ready:
+                        publish_iphone_upload_status(
+                            upload_id,
+                            f"Saved {label_name}: chunk {index + 1}/{total}. Waiting for the next chunk.",
+                        )
+                        self._send_text(202, f"Received chunk {index + 1}/{total}.")
+                        return
+                    dest, err = _unique_iphone_inbox_path(filename, content_type, folder=ensure_iphone_incoming_dir())
+                    if dest is None:
+                        publish_iphone_upload_status(upload_id, err)
+                        self._send_text(415, err)
+                        return
+                    tmp_dest = dest.with_suffix(dest.suffix + ".part")
+                    publish_iphone_upload_status(
+                        upload_id,
+                        f"All chunks received for {label_name}. Assembling file on PC...",
+                    )
+                    with tmp_dest.open("wb") as out:
+                        for i in range(total):
+                            part = chunk_dir / f"{i:06d}.chunk"
+                            with part.open("rb") as inp:
+                                shutil.copyfileobj(inp, out, length=1024 * 1024)
+                            if i == 0 or (i + 1) == total or (i + 1) % 10 == 0:
+                                publish_iphone_upload_status(
+                                    upload_id,
+                                    f"Assembling {label_name}: {i + 1}/{total} chunks.",
+                                )
+                    tmp_dest.replace(dest)
+                    publish_iphone_upload_status(upload_id, f"Saved {label_name} to Daily Logger. Waiting for PC accept.")
+                    self._finish_received_file(dest, (qs.get("lastModified") or [""])[0], upload_id)
+                    shutil.rmtree(chunk_dir, ignore_errors=True)
+                    self._send_text(200, f"Saved to Daily Logger iPhone Inbox: {dest.name}")
+                except OSError as exc:
+                    try:
+                        tmp_chunk.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    publish_iphone_upload_status(upload_id, f"Could not save upload chunk: {exc}")
+                    self._send_text(500, f"Could not save upload chunk: {exc}")
+
             def do_POST(self) -> None:
                 parsed = urlparse(self.path)
-                if parsed.path.rstrip("/") not in {"", "/upload", "/iphone-upload"}:
+                path_key = parsed.path.rstrip("/")
+                if path_key not in {"", "/upload", "/iphone-upload", "/upload-chunk"}:
                     self._send_text(404, "Upload endpoint not found.")
                     return
                 if not self._authorized():
@@ -7656,6 +9622,10 @@ def open_journal_window_editor(
                 if length <= 0:
                     self._send_text(400, "No file body was uploaded.")
                     return
+                qs = parse_qs(parsed.query)
+                if path_key == "/upload-chunk":
+                    self._handle_chunk_upload(parsed, qs, length)
+                    return
                 if length > IPHONE_IMPORT_MAX_UPLOAD_BYTES:
                     self._send_text(413, "That file is too large for the iPhone Inbox receiver.")
                     return
@@ -7667,61 +9637,66 @@ def open_journal_window_editor(
                         "Use iPhone Shortcuts request body: File, not Form Data.",
                     )
                     return
-                qs = parse_qs(parsed.query)
-                filename = unquote((qs.get("filename") or [""])[0]).strip()
-                if not filename:
-                    filename = self.headers.get("X-Filename", "").strip()
-                if not filename:
-                    filename = _filename_from_content_disposition(
-                        self.headers.get("Content-Disposition", "")
-                    ).strip()
-                dest, err_msg = _unique_iphone_inbox_path(filename, content_type)
-                if dest is None:
-                    self._send_text(415, err_msg)
-                    return
-                tmp = dest.with_suffix(dest.suffix + ".part")
-                remaining = length
+                filename = self._query_filename(parsed, qs)
+                incoming_dir = ensure_iphone_incoming_dir()
+                tmp = incoming_dir / f".upload_{secrets.token_hex(8)}.part"
                 try:
-                    with tmp.open("wb") as out:
-                        while remaining > 0:
-                            chunk = self.rfile.read(min(IPHONE_IMPORT_CHUNK_BYTES, remaining))
-                            if not chunk:
-                                break
-                            out.write(chunk)
-                            remaining -= len(chunk)
-                    if remaining != 0:
+                    raw_upload_id = re.sub(
+                        r"[^A-Za-z0-9_.-]+",
+                        "_",
+                        (qs.get("uploadId") or [secrets.token_hex(8)])[0],
+                    )[:80]
+                    label_name = filename or "iPhone upload"
+                    publish_iphone_upload_status(
+                        raw_upload_id,
+                        f"Receiving {label_name} ({_media_size_mb(length)}).",
+                    )
+
+                    def _raw_progress(done: int, expected: int) -> None:
+                        publish_iphone_upload_status(
+                            raw_upload_id,
+                            f"Receiving {label_name}: {_media_size_mb(done)} / {_media_size_mb(expected)}.",
+                        )
+
+                    err_msg = self._read_upload_body(tmp, length, _raw_progress)
+                    if err_msg:
+                        publish_iphone_upload_status(raw_upload_id, err_msg)
+                        self._send_text(400, err_msg)
+                        return
+                    suffix = _infer_iphone_upload_suffix_from_file(tmp, filename, content_type)
+                    dest, err_msg = _unique_iphone_inbox_path_for_suffix(
+                        filename,
+                        suffix,
+                        folder=incoming_dir,
+                    )
+                    if dest is None:
                         try:
                             tmp.unlink(missing_ok=True)
                         except OSError:
                             pass
-                        self._send_text(400, "Upload ended before the full file was received.")
+                        publish_iphone_upload_status(raw_upload_id, err_msg)
+                        self._send_text(415, err_msg)
                         return
                     tmp.replace(dest)
-                    try:
-                        last_modified_raw = (qs.get("lastModified") or [""])[0]
-                        last_modified = float(last_modified_raw)
-                        if last_modified > 10_000_000_000:
-                            last_modified /= 1000.0
-                        if 946684800 <= last_modified <= 4102444800:
-                            os.utime(dest, (last_modified, last_modified))
-                    except (OSError, TypeError, ValueError):
-                        pass
+                    publish_iphone_upload_status(raw_upload_id, f"Saved {label_name} to Daily Logger. Waiting for PC accept.")
+                    self._finish_received_file(dest, (qs.get("lastModified") or [""])[0], raw_upload_id)
                 except OSError as exc:
                     try:
                         tmp.unlink(missing_ok=True)
                     except OSError:
                         pass
+                    publish_iphone_upload_status(raw_upload_id if "raw_upload_id" in locals() else "", f"Could not save upload: {exc}")
                     self._send_text(500, f"Could not save upload: {exc}")
                     return
 
-                root.after(0, lambda p=dest: enqueue_iphone_imports([p]))
-                self._send_text(200, f"Saved to Daily Logger iPhone Inbox: {dest.name}")
+                self._send_text(200, f"Received by Daily Logger: {dest.name}. Accept it on the PC to transcribe.")
 
         return IPhoneUploadHandler
 
     def stop_iphone_receiver() -> None:
         server = iphone_receiver_state.get("server")
         iphone_receiver_state["active"] = False
+        iphone_receiver_state["passive"] = False
         iphone_receiver_state["server"] = None
         iphone_receiver_state["thread"] = None
         iphone_receiver_state["url"] = ""
@@ -7737,8 +9712,13 @@ def open_journal_window_editor(
             threading.Thread(target=_shutdown, daemon=True).start()
         _update_iphone_receive_button()
 
-    def start_iphone_receiver() -> None:
+    def start_iphone_receiver(*, show_setup: bool = True, passive: bool = False) -> None:
         if bool(iphone_receiver_state.get("active")):
+            if show_setup:
+                urls = iphone_receiver_state.get("urls") or {}
+                url = str((urls or {}).get("wifi") or iphone_receiver_state.get("url") or "")
+                token_now = str(iphone_receiver_state.get("token") or get_or_create_iphone_import_token())
+                show_iphone_setup_window(url, token_now)
             return
         token = str(iphone_receiver_state.get("token") or get_or_create_iphone_import_token())
         handler = _make_iphone_upload_handler(token)
@@ -7754,15 +9734,17 @@ def open_journal_window_editor(
             except OSError as exc:
                 last_exc = exc
         if server is None:
-            messagebox.showerror(
-                tr("journal.iphone_inbox"),
-                tr("journal.iphone_start_failed").format(exc=last_exc or "port unavailable"),
-            )
+            if show_setup:
+                messagebox.showerror(
+                    tr("journal.iphone_inbox"),
+                    tr("journal.iphone_start_failed").format(exc=last_exc or "port unavailable"),
+                )
             return
         urls = build_iphone_receiver_urls(bound_port, token)
         url = urls.get("wifi", "")
         iphone_receiver_state.update({
             "active": True,
+            "passive": passive,
             "server": server,
             "port": bound_port,
             "url": url,
@@ -7772,29 +9754,1340 @@ def open_journal_window_editor(
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         iphone_receiver_state["thread"] = thread
         thread.start()
-        _set_stt_saved_path_display(url)
+        if show_setup:
+            _set_stt_saved_path_display(tr("journal.iphone_inbox"))
+            if url:
+                _publish_console_update(f"iPhone receiver URL ready: {url}", key="iphone:url")
         _set_iphone_status(tr("journal.iphone_waiting"))
         _update_iphone_receive_button()
-        show_iphone_setup_window(url, token)
+        if show_setup:
+            show_iphone_setup_window(url, token)
 
     def toggle_iphone_receiver() -> None:
         if bool(iphone_receiver_state.get("active")):
+            if bool(iphone_receiver_state.get("passive")):
+                start_iphone_receiver(show_setup=True, passive=True)
+                return
             stop_iphone_receiver()
             return
-        start_iphone_receiver()
+        start_iphone_receiver(show_setup=True, passive=False)
 
     journal_cleanup_callbacks.append(stop_iphone_receiver)
+
+    transcription_model_choice = {"value": get_selected_transcription_model_choice()}
+    transcription_model_download_busy = {"v": False}
+    transcription_model_download_job = {"id": ""}
+
+    def _set_download_manager_status(text: str, *, console_key: str = "") -> None:
+        status_var = transcription_model_manager_window.get("status")
+        if status_var is not None:
+            try:
+                status_var.set(text)
+            except tk.TclError:
+                pass
+        if console_key:
+            _publish_console_update(text, key=console_key)
+
+    def _set_download_manager_status_from_worker(text: str, *, console_key: str = "") -> None:
+        try:
+            root.after(0, lambda: _set_download_manager_status(text, console_key=console_key))
+        except Exception:
+            pass
+
+    def _addon_progress_text(prefix: str, downloaded: int, total: int) -> str:
+        if total > 0:
+            percent = max(0, min(100, int(downloaded * 100 / total)))
+            return f"{prefix} {percent}% ({format_size_short(downloaded)} / {format_size_short(total)})"
+        return f"{prefix} {format_size_short(downloaded)} downloaded"
+
+    def _start_model_download_progress_monitor(model_name: str, job_id: str) -> None:
+        stats = TRANSCRIPTION_LOCAL_MODEL_STATS.get(model_name, {})
+        estimate = int(stats.get("bytes") or 0)
+        target = local_transcription_model_path(model_name)
+        started = time.monotonic()
+
+        def _tick() -> None:
+            if transcription_model_download_job.get("id") != job_id:
+                return
+            if not bool(transcription_model_download_busy["v"]):
+                return
+            current_size = directory_size_bytes(target)
+            elapsed = max(1, int(time.monotonic() - started))
+            if estimate > 0:
+                percent = max(1, min(99, int(current_size * 100 / estimate)))
+                text = (
+                    f"Downloading Local - {model_name}: {percent}% "
+                    f"({format_size_short(current_size)} / {format_size_short(estimate)}, {elapsed}s)"
+                )
+            else:
+                text = (
+                    f"Downloading Local - {model_name}: "
+                    f"{format_size_short(current_size)} downloaded, {elapsed}s"
+                )
+            _set_download_manager_status(text, console_key=f"model:{model_name}:progress")
+            root.after(1000, _tick)
+
+        root.after(250, _tick)
+
+    def _transcription_model_display(choice: str) -> str:
+        normalized = normalize_transcription_model_choice(choice)
+        if transcription_model_is_cloud(normalized):
+            return f"Cloud - {transcription_cloud_model_name(normalized)}"
+        model_name = transcription_local_model_name(normalized)
+        return f"Local - {model_name}"
+
+    def _set_transcription_model_choice(choice: str) -> None:
+        normalized = normalize_transcription_model_choice(choice)
+        transcription_model_choice["value"] = normalized
+        save_selected_transcription_model_choice(normalized)
+        _publish_console_update(
+            tr("journal.transcription_model_selected").format(
+                model=_transcription_model_display(normalized)
+            ),
+            key="transcription:model:selected",
+        )
+        try:
+            _refresh_transcription_model_manager_window()
+        except NameError:
+            pass
+
+    def _install_local_addon(on_success: Optional[Callable[[], None]] = None) -> None:
+        if transcription_model_download_busy["v"] or transcribing_busy["v"] or recording_ui_busy["v"]:
+            messagebox.showinfo(
+                tr("journal.transcription_model_title"),
+                tr("journal.transcription_model_busy"),
+            )
+            return
+        transcription_model_download_busy["v"] = True
+        update_transcribe_ui()
+        _set_download_manager_status(
+            tr("journal.local_addon_installing"),
+            console_key="addon:local:installing",
+        )
+
+        def _work() -> None:
+            def _progress(downloaded: int, total: int) -> None:
+                _set_download_manager_status_from_worker(
+                    _addon_progress_text("Downloading local transcription add-on:", downloaded, total),
+                    console_key="addon:local:download_progress",
+                )
+
+            zip_path, err_msg = resolve_or_download_addon_zip(
+                LOCAL_TRANSCRIPTION_ADDON_ZIP_NAME,
+                progress=_progress,
+            )
+            ok = False
+            if zip_path is not None:
+                _set_download_manager_status_from_worker(
+                    "Installing local transcription add-on: extracting...",
+                    console_key="addon:local:extracting",
+                )
+                ok, err_msg = install_local_transcription_addon(zip_path)
+
+            def _done() -> None:
+                transcription_model_download_busy["v"] = False
+                update_transcribe_ui()
+                if not ok:
+                    _append_console_session_update(
+                        f"Local transcription add-on install failed: {err_msg}",
+                        key="addon:local:failed",
+                    )
+                    messagebox.showerror(tr("journal.transcription_model_title"), err_msg[:4000])
+                    return
+                _set_download_manager_status(
+                    f"{tr('journal.local_addon_installed')} (100%)",
+                    console_key="addon:local:installed",
+                )
+                _refresh_transcription_model_manager_window()
+                if callable(on_success):
+                    root.after(50, on_success)
+
+            root.after(0, _done)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _uninstall_local_addon() -> None:
+        if transcription_model_download_busy["v"] or transcribing_busy["v"] or recording_ui_busy["v"]:
+            messagebox.showinfo(
+                tr("journal.transcription_model_title"),
+                tr("journal.transcription_model_busy"),
+            )
+            return
+        if not local_transcription_addon_is_installed():
+            return
+        if not messagebox.askyesno(
+            tr("journal.transcription_model_title"),
+            tr("journal.local_addon_uninstall_confirm"),
+        ):
+            return
+        ok, err_msg = uninstall_local_transcription_addon()
+        if not ok:
+            messagebox.showerror(tr("journal.transcription_model_title"), err_msg[:4000])
+            return
+        if transcription_model_is_local(transcription_model_choice["value"]):
+            _set_transcription_model_choice(TRANSCRIPTION_MODEL_CLOUD)
+        _publish_console_update(tr("journal.local_addon_uninstalled"), key="addon:local:uninstalled")
+        update_transcribe_ui()
+        _refresh_transcription_model_manager_window()
+
+    def _start_local_model_download(model_name: str) -> None:
+        if transcription_model_download_busy["v"] or transcribing_busy["v"] or recording_ui_busy["v"]:
+            messagebox.showinfo(
+                tr("journal.transcription_model_title"),
+                tr("journal.transcription_model_busy"),
+            )
+            return
+        runtime_ok, runtime_err = ensure_local_transcription_runtime_loaded()
+        if not runtime_ok:
+            messagebox.showinfo(
+                tr("journal.transcription_model_title"),
+                f"Local transcription engine needs repair before models can download.\n\n{runtime_err}",
+            )
+            _append_console_session_update(
+                f"Local transcription engine repair needed: {runtime_err}",
+                key="addon:local:repair_needed",
+            )
+            return
+        if model_name not in TRANSCRIPTION_LOCAL_MODEL_NAMES:
+            return
+        if local_transcription_model_is_downloaded(model_name):
+            _set_transcription_model_choice(f"local:{model_name}")
+            return
+        if not messagebox.askyesno(
+            tr("journal.transcription_model_title"),
+            tr("journal.transcription_model_download_confirm").format(model=model_name),
+        ):
+            return
+        transcription_model_download_busy["v"] = True
+        job_id = secrets.token_hex(6)
+        transcription_model_download_job["id"] = job_id
+        update_transcribe_ui()
+        _set_download_manager_status(
+            tr("journal.transcription_model_downloading").format(model=model_name),
+            console_key=f"model:{model_name}:downloading",
+        )
+
+        def _work() -> None:
+            def _progress(pct: int) -> None:
+                _set_download_manager_status_from_worker(
+                    f"Downloading Local - {model_name}: {min(100, max(0, int(pct)))}%",
+                    console_key=f"model:{model_name}:progress",
+                )
+
+            def _status(text: str) -> None:
+                if text:
+                    _set_download_manager_status_from_worker(
+                        text,
+                        console_key=f"model:{model_name}:status",
+                    )
+
+            ok, err_msg = download_local_transcription_model(
+                model_name,
+                progress=_progress,
+                status=_status,
+            )
+
+            def _done() -> None:
+                transcription_model_download_job["id"] = ""
+                transcription_model_download_busy["v"] = False
+                update_transcribe_ui()
+                if not ok:
+                    _append_console_session_update(
+                        f"Local model download failed ({model_name}): {err_msg}",
+                        key=f"model:{model_name}:failed",
+                    )
+                    messagebox.showerror(tr("journal.transcription_model_title"), err_msg[:4000])
+                    _refresh_transcription_model_manager_window()
+                    return
+                _set_download_manager_status(
+                    f"Local model downloaded: {model_name} (100%)",
+                    console_key=f"model:{model_name}:downloaded",
+                )
+                _append_console_session_update(
+                    f"Local model downloaded: {model_name}",
+                    key=f"model:{model_name}:downloaded",
+                )
+                _set_transcription_model_choice(f"local:{model_name}")
+                _refresh_transcription_model_manager_window()
+
+            root.after(0, _done)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _uninstall_local_model(model_name: str) -> None:
+        if transcription_model_download_busy["v"] or transcribing_busy["v"] or recording_ui_busy["v"]:
+            messagebox.showinfo(
+                tr("journal.transcription_model_title"),
+                tr("journal.transcription_model_busy"),
+            )
+            return
+        if not local_transcription_model_is_downloaded(model_name):
+            return
+        if not messagebox.askyesno(
+            tr("journal.transcription_model_title"),
+            tr("journal.transcription_model_uninstall_confirm").format(model=model_name),
+        ):
+            return
+        ok, err_msg = uninstall_local_transcription_model(model_name)
+        if not ok:
+            messagebox.showerror(tr("journal.transcription_model_title"), err_msg[:4000])
+            return
+        _clear_local_transcription_model_cache(model_name)
+        if transcription_model_choice["value"] == f"local:{model_name}":
+            _set_transcription_model_choice(TRANSCRIPTION_MODEL_CLOUD)
+        update_transcribe_ui()
+        _refresh_transcription_model_manager_window()
+
+    def _install_media_tools_addon() -> None:
+        if transcription_model_download_busy["v"] or transcribing_busy["v"] or recording_ui_busy["v"]:
+            messagebox.showinfo(
+                tr("download_manager.title"),
+                tr("journal.transcription_model_busy"),
+            )
+            return
+        transcription_model_download_busy["v"] = True
+        update_transcribe_ui()
+        _set_download_manager_status(
+            tr("download_manager.media_installing"),
+            console_key="addon:media:installing",
+        )
+
+        def _work() -> None:
+            def _progress(downloaded: int, total: int) -> None:
+                _set_download_manager_status_from_worker(
+                    _addon_progress_text("Downloading Media Tools:", downloaded, total),
+                    console_key="addon:media:download_progress",
+                )
+
+            zip_path, err_msg = resolve_or_download_addon_zip(
+                MEDIA_TOOLS_ADDON_ZIP_NAME,
+                progress=_progress,
+            )
+            ok = False
+            if zip_path is not None:
+                _set_download_manager_status_from_worker(
+                    "Installing Media Tools: extracting...",
+                    console_key="addon:media:extracting",
+                )
+                ok, err_msg = install_media_tools_addon(zip_path)
+
+            def _done() -> None:
+                transcription_model_download_busy["v"] = False
+                update_transcribe_ui()
+                if not ok:
+                    _append_console_session_update(
+                        f"Media Tools add-on install failed: {err_msg}",
+                        key="addon:media:failed",
+                    )
+                    messagebox.showerror(tr("download_manager.title"), err_msg[:4000])
+                    _refresh_transcription_model_manager_window()
+                    return
+                _set_download_manager_status(
+                    f"{tr('download_manager.media_installed')} (100%)",
+                    console_key="addon:media:installed",
+                )
+                _refresh_transcription_model_manager_window()
+                _schedule_iphone_pending_drain_after_install()
+
+            root.after(0, _done)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _uninstall_media_tools_addon() -> None:
+        if transcription_model_download_busy["v"] or transcribing_busy["v"] or recording_ui_busy["v"]:
+            messagebox.showinfo(
+                tr("download_manager.title"),
+                tr("journal.transcription_model_busy"),
+            )
+            return
+        if not media_tools_addon_is_installed():
+            return
+        if not messagebox.askyesno(
+            tr("download_manager.title"),
+            tr("download_manager.media_uninstall_confirm"),
+        ):
+            return
+        ok, err_msg = uninstall_media_tools_addon()
+        if not ok:
+            messagebox.showerror(tr("download_manager.title"), err_msg[:4000])
+            return
+        _publish_console_update(tr("download_manager.media_uninstalled"), key="addon:media:uninstalled")
+        update_transcribe_ui()
+        _refresh_transcription_model_manager_window()
+
+    transcription_model_manager_window: Dict[str, Any] = {
+        "win": None,
+        "body": None,
+        "status": None,
+        "canvas": None,
+        "scroll": None,
+        "tabs": {},
+        "tab": "transcription",
+        "size_label": None,
+        "size_canvas": None,
+        "size_preview": 0,
+    }
+
+    def _set_download_manager_tab(tab_name: str) -> None:
+        if tab_name not in ("transcription", "media", "reader"):
+            tab_name = "transcription"
+        transcription_model_manager_window["tab"] = tab_name
+        _refresh_transcription_model_manager_window()
+
+    def _path_size_or_estimate(path: Path, estimate: int) -> int:
+        actual = directory_size_bytes(path)
+        return actual if actual > 0 else int(estimate)
+
+    def _installed_addons_size_bytes() -> int:
+        total = 0
+        if local_transcription_addon_is_installed():
+            total += directory_size_bytes(LOCAL_TRANSCRIPTION_ADDON_DIR)
+        if media_tools_addon_is_installed():
+            total += directory_size_bytes(MEDIA_TOOLS_ADDON_DIR)
+        return total
+
+    def _visible_model_size_bytes() -> int:
+        total = 0
+        for model_name in TRANSCRIPTION_LOCAL_MODEL_NAMES:
+            path = local_transcription_model_path(model_name)
+            if path.is_dir():
+                total += directory_size_bytes(path)
+        return total
+
+    def _other_model_paths() -> List[Path]:
+        visible = {name.casefold() for name in TRANSCRIPTION_LOCAL_MODEL_NAMES}
+        try:
+            if not LOCAL_TRANSCRIPTION_MODEL_DIR.is_dir():
+                return []
+            items = [
+                path
+                for path in LOCAL_TRANSCRIPTION_MODEL_DIR.iterdir()
+                if path.name.casefold() not in visible
+                and not path.name.lower().endswith(".part")
+            ]
+        except OSError:
+            return []
+        return sorted(items, key=lambda p: p.name.lower())
+
+    def _other_model_size_bytes() -> int:
+        return sum(directory_size_bytes(path) for path in _other_model_paths())
+
+    def _uninstall_other_local_models() -> None:
+        paths = _other_model_paths()
+        if not paths:
+            return
+        if transcription_model_download_busy["v"] or transcribing_busy["v"] or recording_ui_busy["v"]:
+            messagebox.showinfo(
+                tr("download_manager.title"),
+                tr("journal.transcription_model_busy"),
+            )
+            return
+        names = ", ".join(path.name for path in paths[:8])
+        if len(paths) > 8:
+            names += f", +{len(paths) - 8}"
+        if not messagebox.askyesno(
+            tr("download_manager.title"),
+            tr("download_manager.other_models_confirm").format(names=names),
+        ):
+            return
+        try:
+            root_dir = LOCAL_TRANSCRIPTION_MODEL_DIR.resolve()
+        except OSError as exc:
+            messagebox.showerror(tr("download_manager.title"), str(exc)[:4000])
+            return
+        errors: List[str] = []
+        for path in paths:
+            try:
+                target = path.resolve()
+                target.relative_to(root_dir)
+                if target.is_dir():
+                    shutil.rmtree(target)
+                elif target.exists():
+                    target.unlink()
+            except (OSError, ValueError) as exc:
+                errors.append(f"{path.name}: {exc}")
+        if errors:
+            messagebox.showerror(tr("download_manager.title"), "\n".join(errors[:8])[:4000])
+        update_transcribe_ui()
+        _refresh_transcription_model_manager_window()
+
+    def _base_package_size_bytes() -> int:
+        try:
+            if getattr(sys, "frozen", False):
+                return directory_size_bytes(BASE_DIR)
+            dist_root = BASE_DIR / "dist" / "DailyLogger"
+            if dist_root.is_dir():
+                return directory_size_bytes(dist_root)
+        except OSError:
+            pass
+        return 0
+
+    def _download_manager_size_parts() -> Dict[str, int]:
+        return {
+            "base": _base_package_size_bytes(),
+            "addons": _installed_addons_size_bytes(),
+            "visible_models": _visible_model_size_bytes(),
+            "other_models": _other_model_size_bytes(),
+        }
+
+    def _update_download_manager_size_bar(preview_free_bytes: int = 0) -> None:
+        label = transcription_model_manager_window.get("size_label")
+        canvas = transcription_model_manager_window.get("size_canvas")
+        if label is None or canvas is None:
+            return
+        t = th()
+        parts = _download_manager_size_parts()
+        total = max(sum(parts.values()), 1)
+        text = tr("download_manager.size_summary").format(
+            base=format_size_short(parts["base"]),
+            addons=format_size_short(parts["addons"]),
+            visible_models=format_size_short(parts["visible_models"]),
+            other_models=format_size_short(parts["other_models"]),
+            total=format_size_short(sum(parts.values())),
+        )
+        if preview_free_bytes > 0:
+            text += "  " + tr("download_manager.free_preview").format(
+                size=format_size_short(preview_free_bytes)
+            )
+        try:
+            label.config(text=text, fg=("#F04438" if preview_free_bytes > 0 else t.muted))
+            canvas.delete("all")
+            width = max(1, int(canvas.winfo_width() or 1))
+            height = max(1, int(canvas.winfo_height() or 10))
+            x = 0
+            colors = {
+                "base": t.muted,
+                "addons": t.accent,
+                "visible_models": t.hover_primary,
+                "other_models": "#9CA3AF",
+            }
+            for index, key in enumerate(("base", "addons", "visible_models", "other_models")):
+                value = max(0, int(parts[key]))
+                seg_w = int(width * value / total) if total else 0
+                if index == 3:
+                    seg_w = width - x
+                if value > 0 and seg_w > 0:
+                    canvas.create_rectangle(x, 0, x + seg_w, height, fill=colors[key], width=0)
+                x += seg_w
+            if preview_free_bytes > 0:
+                preview_w = max(6, min(width, int(width * min(preview_free_bytes, total) / total)))
+                canvas.create_rectangle(width - preview_w, 0, width, height, fill="#F04438", width=0)
+            canvas.create_rectangle(0, 0, width, height, outline=t.border, width=1)
+        except tk.TclError:
+            pass
+
+    def _transcription_model_state_text(choice: str) -> str:
+        normalized = normalize_transcription_model_choice(choice)
+        selected = normalize_transcription_model_choice(transcription_model_choice["value"])
+        if transcription_model_is_cloud(normalized):
+            if selected == normalized:
+                if transcription_cloud_is_ready():
+                    return tr("journal.transcription_state_default")
+                return (
+                    f"{tr('journal.transcription_state_default')} - "
+                    f"{tr('journal.transcription_state_api_key_required')}"
+                )
+            return (
+                tr("journal.transcription_state_ready")
+                if transcription_cloud_is_ready()
+                else tr("journal.transcription_state_api_key_required")
+            )
+        model_name = transcription_local_model_name(normalized)
+        downloaded = local_transcription_model_is_downloaded(model_name)
+        runtime_ready, _runtime_err = ensure_local_transcription_runtime_loaded()
+        if selected == normalized and downloaded and runtime_ready:
+            return tr("journal.transcription_state_default")
+        if downloaded and runtime_ready:
+            return tr("journal.transcription_state_downloaded")
+        if downloaded and not runtime_ready:
+            return tr("journal.transcription_state_addon_required")
+        if not runtime_ready:
+            return tr("journal.transcription_state_addon_required")
+        return tr("journal.transcription_state_not_downloaded")
+
+    def _style_manager_button(btn: Any, *, enabled: bool = True) -> None:
+        t = th()
+        if enabled:
+            btn.config(
+                state="normal",
+                bg=t.btn_secondary,
+                fg=t.text,
+                activebackground=t.secondary_hover,
+                activeforeground=t.text,
+                cursor="hand2",
+            )
+        else:
+            db = t.transcribe_idle_disabled_config()
+            btn.config(
+                state="disabled",
+                bg=db[0],
+                fg=db[1],
+                activebackground=db[2],
+                activeforeground=db[3],
+                disabledforeground=db[4],
+                cursor="arrow",
+            )
+
+    def _make_manager_button(
+        parent: Any,
+        text: str,
+        command: Callable[[], None],
+        enabled: bool = True,
+        *,
+        free_bytes: int = 0,
+    ) -> Any:
+        btn = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=5,
+            wraplength=150,
+        )
+        _style_manager_button(btn, enabled=enabled)
+        btn.pack(side="left", padx=(0, 8), pady=(8, 0))
+        bind_button_hover_if_enabled(
+            btn,
+            lambda: th().side_action_bind_rest(),
+            lambda: th().accent,
+            lambda: "white",
+        )
+        if free_bytes > 0:
+            def _show_free_preview(_evt: Optional[Any] = None, b: int = free_bytes) -> None:
+                transcription_model_manager_window["size_preview"] = b
+                _update_download_manager_size_bar(b)
+
+            def _clear_free_preview(_evt: Optional[Any] = None) -> None:
+                transcription_model_manager_window["size_preview"] = 0
+                _update_download_manager_size_bar(0)
+
+            btn.bind(
+                "<Enter>",
+                _show_free_preview,
+                add="+",
+            )
+            btn.bind(
+                "<Leave>",
+                _clear_free_preview,
+                add="+",
+            )
+        return btn
+
+    def _make_model_card(
+        parent: Any,
+        title: str,
+        subtitle: str,
+        note: str,
+        state_text: str,
+        actions: List[Tuple[str, Callable[[], None], bool, int]],
+    ) -> None:
+        t = th()
+        card = tk.Frame(parent, bg=t.field, highlightthickness=1, highlightbackground=t.border)
+        card.pack(fill="x", pady=(0, 8))
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_columnconfigure(1, weight=0)
+        info = tk.Frame(card, bg=t.field)
+        info.grid(row=0, column=0, sticky="ew", padx=12, pady=9)
+        title_lbl = tk.Label(
+            info,
+            text=title,
+            bg=t.field,
+            fg=t.text,
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+            justify="left",
+        )
+        title_lbl.pack(fill="x")
+        subtitle_lbl = tk.Label(
+            info,
+            text=f"{subtitle}  |  {state_text}",
+            bg=t.field,
+            fg=t.accent if state_text == tr("journal.transcription_state_default") else t.muted,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=430,
+        )
+        subtitle_lbl.pack(fill="x", pady=(2, 0))
+        note_lbl = tk.Label(
+            info,
+            text=note,
+            bg=t.field,
+            fg=t.muted,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=430,
+        )
+        note_lbl.pack(fill="x", pady=(2, 0))
+        buttons = tk.Frame(card, bg=t.field)
+        buttons.grid(row=0, column=1, sticky="e", padx=12, pady=9)
+        for label, command, enabled, free_bytes in actions:
+            _make_manager_button(buttons, label, command, enabled, free_bytes=free_bytes)
+
+    def _refresh_transcription_model_manager_window() -> None:
+        win = transcription_model_manager_window.get("win")
+        body = transcription_model_manager_window.get("body")
+        status_var = transcription_model_manager_window.get("status")
+        if win is None or body is None:
+            return
+        try:
+            if not bool(win.winfo_exists()):
+                return
+        except tk.TclError:
+            return
+        t = th()
+        try:
+            win.configure(bg=t.surface)
+            canvas = transcription_model_manager_window.get("canvas")
+            scroll = transcription_model_manager_window.get("scroll")
+            if canvas is not None:
+                canvas.configure(bg=t.surface, highlightbackground=t.border)
+            if scroll is not None:
+                scroll.configure(bg=t.panel, troughcolor=t.field, activebackground=t.accent)
+            body.configure(bg=t.surface)
+            for child in body.winfo_children():
+                child.destroy()
+        except tk.TclError:
+            return
+        if status_var is not None:
+            selected_label = _transcription_model_display(transcription_model_choice["value"])
+            status_var.set(tr("journal.transcription_manager_current").format(model=selected_label))
+
+        busy = bool(transcription_model_download_busy["v"] or transcribing_busy["v"] or recording_ui_busy["v"])
+        active_tab = str(transcription_model_manager_window.get("tab") or "transcription")
+        runtime_ready, runtime_err = ensure_local_transcription_runtime_loaded()
+        if not runtime_ready and status_var is not None and active_tab == "transcription":
+            selected_label = _transcription_model_display(transcription_model_choice["value"])
+            status_var.set(
+                f"{tr('journal.transcription_manager_current').format(model=selected_label)}"
+                f" | {runtime_err}"
+            )
+        selected = normalize_transcription_model_choice(transcription_model_choice["value"])
+        tab_buttons = transcription_model_manager_window.get("tabs") or {}
+        for key, btn in dict(tab_buttons).items():
+            try:
+                if key == active_tab:
+                    btn.config(
+                        bg=t.accent,
+                        fg="white",
+                        activebackground=t.hover_primary,
+                        activeforeground="white",
+                    )
+                else:
+                    btn.config(
+                        bg=t.btn_secondary,
+                        fg=t.text,
+                        activebackground=t.secondary_hover,
+                        activeforeground=t.text,
+                    )
+            except tk.TclError:
+                pass
+
+        def _heading(parent: Any, key: str) -> None:
+            tk.Label(
+                parent,
+                text=tr(key),
+                bg=t.surface,
+                fg=t.text,
+                font=("Segoe UI", 12, "bold"),
+                anchor="w",
+            ).pack(fill="x", pady=(0, 8))
+
+        def _render_transcription_tab() -> None:
+            left = tk.Frame(body, bg=t.surface)
+            right = tk.Frame(body, bg=t.surface)
+            left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+            right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+            body.grid_columnconfigure(0, weight=1, uniform="download_manager")
+            body.grid_columnconfigure(1, weight=1, uniform="download_manager")
+            body.grid_rowconfigure(0, weight=1)
+            _heading(left, "journal.transcription_manager_free_models")
+            _heading(right, "journal.transcription_manager_cloud_models")
+
+            for model_name in TRANSCRIPTION_LOCAL_MODEL_NAMES:
+                choice = f"local:{model_name}"
+                stats = TRANSCRIPTION_LOCAL_MODEL_STATS.get(model_name, {})
+                downloaded = local_transcription_model_is_downloaded(model_name)
+                recommended = (
+                    f" {tr('journal.transcription_manager_recommended')}"
+                    if model_name == TRANSCRIPTION_SUGGESTED_LOCAL_MODEL
+                    else ""
+                )
+                actions: List[Tuple[str, Callable[[], None], bool, int]] = []
+                if not runtime_ready:
+                    actions.append((tr("journal.local_addon_repair_short"), _install_local_addon, not busy, 0))
+                elif not downloaded:
+                    actions.append((
+                        tr("journal.transcription_model_download"),
+                        lambda m=model_name: _start_local_model_download(m),
+                        not busy,
+                        0,
+                    ))
+                else:
+                    model_size = directory_size_bytes(local_transcription_model_path(model_name))
+                    actions.append((
+                        tr("journal.transcription_model_use_default"),
+                        lambda c=choice: _set_transcription_model_choice(c),
+                        (not busy and selected != choice),
+                        0,
+                    ))
+                    actions.append((
+                        tr("journal.transcription_model_uninstall_short"),
+                        lambda m=model_name: _uninstall_local_model(m),
+                        not busy,
+                        model_size,
+                    ))
+                _make_model_card(
+                    left,
+                    f"Local - {model_name}{recommended}",
+                    tr("journal.transcription_manager_local_stats").format(
+                        quality=stats.get("quality", ""),
+                        speed=stats.get("speed", ""),
+                        disk=stats.get("disk", ""),
+                    ),
+                    str(stats.get("note", "")),
+                    _transcription_model_state_text(choice),
+                    actions,
+                )
+
+            other_model_size = _other_model_size_bytes()
+            if other_model_size > 0:
+                _make_model_card(
+                    left,
+                    tr("download_manager.other_models_title"),
+                    tr("download_manager.other_models_stats").format(
+                        size=format_size_short(other_model_size)
+                    ),
+                    tr("download_manager.other_models_note"),
+                    tr("journal.transcription_state_downloaded"),
+                    [(
+                        tr("journal.transcription_model_uninstall_short"),
+                        _uninstall_other_local_models,
+                        not busy,
+                        other_model_size,
+                    )],
+                )
+
+            if runtime_ready and local_transcription_addon_is_installed():
+                footer = tk.Frame(left, bg=t.surface)
+                footer.pack(fill="x", pady=(0, 8))
+                _make_manager_button(
+                    footer,
+                    tr("journal.local_addon_uninstall_short"),
+                    _uninstall_local_addon,
+                    enabled=not busy,
+                    free_bytes=directory_size_bytes(LOCAL_TRANSCRIPTION_ADDON_DIR),
+                )
+
+            for cloud_name in TRANSCRIPTION_CLOUD_MODEL_NAMES:
+                cloud_choice = normalize_transcription_model_choice(f"cloud:{cloud_name}")
+                cloud_stats = TRANSCRIPTION_CLOUD_MODEL_STATS.get(
+                    cloud_name,
+                    {
+                        "quality": "Cloud",
+                        "speed": "Fast",
+                        "cost": "Uses API tokens",
+                        "note": "OpenAI cloud transcription model.",
+                    },
+                )
+                actions = [
+                    (
+                        tr("journal.transcription_model_use_default"),
+                        lambda c=cloud_choice: _set_transcription_model_choice(c),
+                        (not busy and selected != cloud_choice),
+                        0,
+                    )
+                ]
+                if not transcription_cloud_is_ready():
+                    actions.append((
+                        tr("journal.transcription_add_api_key"),
+                        lambda: (_close_transcription_model_manager(), _goto_settings_token_field()),
+                        not busy,
+                        0,
+                    ))
+                _make_model_card(
+                    right,
+                    f"Cloud - {cloud_name}",
+                    tr("journal.transcription_manager_cloud_stats").format(
+                        quality=cloud_stats.get("quality", ""),
+                        speed=cloud_stats.get("speed", ""),
+                        cost=cloud_stats.get("cost", ""),
+                    ),
+                    str(cloud_stats.get("note", "")),
+                    _transcription_model_state_text(cloud_choice),
+                    actions,
+                )
+
+        def _render_media_tab() -> None:
+            body.grid_columnconfigure(0, weight=1)
+            body.grid_columnconfigure(1, weight=0)
+            _heading(body, "download_manager.media_tab")
+            installed = media_tools_addon_is_installed()
+            media_size = directory_size_bytes(MEDIA_TOOLS_ADDON_DIR)
+            state = (
+                tr("journal.transcription_state_downloaded")
+                if installed
+                else tr("journal.transcription_state_not_downloaded")
+            )
+            actions: List[Tuple[str, Callable[[], None], bool, int]]
+            if installed:
+                actions = [(
+                    tr("journal.transcription_model_uninstall_short"),
+                    _uninstall_media_tools_addon,
+                    not busy,
+                    media_size,
+                )]
+            else:
+                actions = [(
+                    tr("download_manager.install"),
+                    _install_media_tools_addon,
+                    not busy,
+                    0,
+                )]
+            _make_model_card(
+                body,
+                tr("download_manager.media_title"),
+                tr("download_manager.media_stats").format(
+                    size=format_size_short(media_size or MEDIA_TOOLS_ADDON_ESTIMATED_BYTES)
+                ),
+                tr("download_manager.media_note"),
+                state,
+                actions,
+            )
+
+        def _render_reader_tab() -> None:
+            body.grid_columnconfigure(0, weight=1)
+            body.grid_columnconfigure(1, weight=0)
+            _heading(body, "download_manager.reader_tab")
+            reader_path = BASE_DIR / "_internal" / "virtual-journal-reader"
+            if not reader_path.exists():
+                reader_path = BASE_DIR / "virtual-journal-reader"
+            reader_size = directory_size_bytes(reader_path)
+            _make_model_card(
+                body,
+                tr("download_manager.reader_title"),
+                tr("download_manager.reader_stats").format(size=format_size_short(reader_size)),
+                tr("download_manager.reader_note"),
+                tr("download_manager.core_installed"),
+                [],
+            )
+
+        if active_tab == "media":
+            _render_media_tab()
+        elif active_tab == "reader":
+            _render_reader_tab()
+        else:
+            _render_transcription_tab()
+        _update_download_manager_size_bar(int(transcription_model_manager_window.get("size_preview") or 0))
+
+    def _close_transcription_model_manager() -> None:
+        win = transcription_model_manager_window.get("win")
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+        transcription_model_manager_window.update(
+            {
+                "win": None,
+                "body": None,
+                "status": None,
+                "canvas": None,
+                "scroll": None,
+                "tabs": {},
+                "size_label": None,
+                "size_canvas": None,
+                "size_preview": 0,
+            }
+        )
+
+    def _open_transcription_downloads_manager(tab_name: str = "") -> None:
+        if tab_name:
+            transcription_model_manager_window["tab"] = (
+                tab_name if tab_name in ("transcription", "media", "reader") else "transcription"
+            )
+        win = transcription_model_manager_window.get("win")
+        try:
+            if win is not None and bool(win.winfo_exists()):
+                win.lift()
+                win.focus_force()
+                _refresh_transcription_model_manager_window()
+                return
+        except tk.TclError:
+            transcription_model_manager_window.update(
+                {
+                    "win": None,
+                    "body": None,
+                    "status": None,
+                    "canvas": None,
+                    "scroll": None,
+                    "tabs": {},
+                    "size_label": None,
+                    "size_canvas": None,
+                    "size_preview": 0,
+                }
+            )
+        t = th()
+        win = tk.Toplevel(root)
+        win.title(tr("download_manager.title"))
+        win.geometry("900x650")
+        win.minsize(780, 540)
+        win.configure(bg=t.surface)
+        win.transient(root)
+        win.protocol("WM_DELETE_WINDOW", _close_transcription_model_manager)
+        transcription_model_manager_window["win"] = win
+
+        outer = tk.Frame(win, bg=t.surface)
+        outer.pack(fill="both", expand=True, padx=18, pady=16)
+        title_lbl = tk.Label(
+            outer,
+            text=tr("download_manager.title"),
+            bg=t.surface,
+            fg=t.text,
+            font=("Segoe UI", 16, "bold"),
+            anchor="w",
+        )
+        title_lbl.pack(fill="x")
+        status_var = tk.StringVar(value="")
+        transcription_model_manager_window["status"] = status_var
+        tk.Label(
+            outer,
+            textvariable=status_var,
+            bg=t.surface,
+            fg=t.muted,
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(fill="x", pady=(2, 12))
+        tabs_frame = tk.Frame(outer, bg=t.surface)
+        tabs_frame.pack(fill="x", pady=(0, 10))
+        tab_specs = (
+            ("transcription", "download_manager.transcription_tab"),
+            ("media", "download_manager.media_tab"),
+            ("reader", "download_manager.reader_tab"),
+        )
+        tab_buttons: Dict[str, Any] = {}
+        for tab_name, label_key in tab_specs:
+            tab_btn = tk.Button(
+                tabs_frame,
+                text=tr(label_key),
+                command=lambda n=tab_name: _set_download_manager_tab(n),
+                relief="flat",
+                font=("Segoe UI", 9, "bold"),
+                padx=12,
+                pady=6,
+                cursor="hand2",
+            )
+            tab_btn.pack(side="left", padx=(0, 8))
+            tab_buttons[tab_name] = tab_btn
+            bind_button_hover_if_enabled(
+                tab_btn,
+                lambda b=tab_btn, n=tab_name: (
+                    "normal",
+                    th().accent if transcription_model_manager_window.get("tab") == n else th().btn_secondary,
+                    "white" if transcription_model_manager_window.get("tab") == n else th().text,
+                    th().hover_primary if transcription_model_manager_window.get("tab") == n else th().secondary_hover,
+                    "white" if transcription_model_manager_window.get("tab") == n else th().text,
+                ),
+                lambda: th().hover_primary,
+                lambda: "white",
+            )
+        transcription_model_manager_window["tabs"] = tab_buttons
+        body_holder = tk.Frame(outer, bg=t.surface)
+        body_holder.pack(fill="both", expand=True)
+        body_canvas = tk.Canvas(
+            body_holder,
+            bg=t.surface,
+            highlightthickness=1,
+            highlightbackground=t.border,
+            bd=0,
+        )
+        body_scroll = tk.Scrollbar(
+            body_holder,
+            command=body_canvas.yview,
+            bg=t.panel,
+            troughcolor=t.field,
+            activebackground=t.accent,
+            bd=0,
+            highlightthickness=0,
+            width=11,
+        )
+        body_canvas.configure(yscrollcommand=body_scroll.set)
+        body_canvas.pack(side="left", fill="both", expand=True)
+        body_scroll.pack(side="right", fill="y")
+        body = tk.Frame(body_canvas, bg=t.surface)
+        body_window = body_canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _sync_manager_scroll(_evt: Optional[Any] = None) -> None:
+            try:
+                body_canvas.configure(scrollregion=body_canvas.bbox("all"))
+                body_canvas.itemconfigure(body_window, width=body_canvas.winfo_width())
+            except tk.TclError:
+                pass
+
+        body.bind("<Configure>", _sync_manager_scroll, add="+")
+        body_canvas.bind("<Configure>", _sync_manager_scroll, add="+")
+
+        def _manager_mousewheel(evt: Any) -> str:
+            try:
+                body_canvas.yview_scroll(int(-1 * (evt.delta / 120)), "units")
+            except tk.TclError:
+                pass
+            return "break"
+
+        win.bind("<MouseWheel>", _manager_mousewheel, add="+")
+        transcription_model_manager_window["body"] = body
+        transcription_model_manager_window["canvas"] = body_canvas
+        transcription_model_manager_window["scroll"] = body_scroll
+        size_wrap = tk.Frame(outer, bg=t.surface)
+        size_wrap.pack(fill="x", pady=(10, 0))
+        size_label = tk.Label(
+            size_wrap,
+            text="",
+            bg=t.surface,
+            fg=t.muted,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=820,
+        )
+        size_label.pack(fill="x", pady=(0, 4))
+        size_canvas = tk.Canvas(
+            size_wrap,
+            height=12,
+            bg=t.field,
+            highlightthickness=1,
+            highlightbackground=t.border,
+            bd=0,
+        )
+        size_canvas.pack(fill="x")
+        transcription_model_manager_window["size_label"] = size_label
+        transcription_model_manager_window["size_canvas"] = size_canvas
+        size_canvas.bind(
+            "<Configure>",
+            lambda _e: _update_download_manager_size_bar(
+                int(transcription_model_manager_window.get("size_preview") or 0)
+            ),
+            add="+",
+        )
+        bottom = tk.Frame(outer, bg=t.surface)
+        bottom.pack(fill="x", pady=(10, 0))
+        close_btn = tk.Button(
+            bottom,
+            text=tr("find.close"),
+            command=_close_transcription_model_manager,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=14,
+            pady=6,
+        )
+        _style_manager_button(close_btn)
+        close_btn.pack(side="right")
+        bind_button_hover_if_enabled(
+            close_btn,
+            lambda: th().side_action_bind_rest(),
+            lambda: th().hover_primary,
+            lambda: "white",
+        )
+        _refresh_transcription_model_manager_window()
+        win.lift()
+        win.focus_force()
+
+    transcription_models_manager_hooks["open"] = _open_transcription_downloads_manager
+
+    def _show_transcription_model_menu(anchor: Any) -> None:
+        if transcription_model_download_busy["v"]:
+            return
+        menu = tk.Menu(anchor, tearoff=0)
+        selected = normalize_transcription_model_choice(transcription_model_choice["value"])
+        for cloud_name in TRANSCRIPTION_CLOUD_MODEL_NAMES:
+            cloud_choice = normalize_transcription_model_choice(f"cloud:{cloud_name}")
+            cloud_suffix = tr("journal.transcription_state_default") if selected == cloud_choice else ""
+            menu.add_command(
+                label=f"{_transcription_model_display(cloud_choice)} {cloud_suffix}".strip(),
+                command=lambda c=cloud_choice: _set_transcription_model_choice(c),
+            )
+        downloaded_choices = [
+            model_name
+            for model_name in usable_local_transcription_model_names()
+            if local_transcription_model_is_downloaded(model_name)
+        ]
+        if downloaded_choices:
+            menu.add_separator()
+        for model_name in downloaded_choices:
+            choice = f"local:{model_name}"
+            suffix = tr("journal.transcription_state_default") if selected == choice else ""
+            menu.add_command(
+                label=f"{_transcription_model_display(choice)} {suffix}".strip(),
+                command=lambda c=choice: _set_transcription_model_choice(c),
+            )
+        menu.add_separator()
+        menu.add_command(
+            label=tr("journal.transcription_manage_models"),
+            command=lambda: _open_transcription_downloads_manager("transcription"),
+        )
+        try:
+            menu.tk_popup(anchor.winfo_rootx(), anchor.winfo_rooty() + anchor.winfo_height())
+        finally:
+            try:
+                menu.grab_release()
+            except tk.TclError:
+                pass
+
+    transcription_setup_prompt_window: Dict[str, Any] = {"win": None}
+
+    def _maybe_prompt_media_tools_from_error(text: str) -> bool:
+        if "Media Tools add-on" not in (text or ""):
+            return False
+        if messagebox.askyesno(
+            tr("download_manager.title"),
+            tr("download_manager.media_required_prompt"),
+        ):
+            _install_media_tools_addon()
+        return True
+
+    def _close_transcription_setup_prompt() -> None:
+        win = transcription_setup_prompt_window.get("win")
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+        transcription_setup_prompt_window["win"] = None
+
+    def _show_transcription_setup_prompt() -> None:
+        win = transcription_setup_prompt_window.get("win")
+        try:
+            if win is not None and bool(win.winfo_exists()):
+                win.lift()
+                win.focus_force()
+                return
+        except tk.TclError:
+            transcription_setup_prompt_window["win"] = None
+        t = th()
+        win = tk.Toplevel(root)
+        transcription_setup_prompt_window["win"] = win
+        win.title(tr("journal.transcription_setup_title"))
+        win.geometry("520x250")
+        win.minsize(460, 230)
+        win.configure(bg=t.surface)
+        win.transient(root)
+        win.protocol("WM_DELETE_WINDOW", _close_transcription_setup_prompt)
+        wrap = tk.Frame(win, bg=t.surface)
+        wrap.pack(fill="both", expand=True, padx=18, pady=16)
+        tk.Label(
+            wrap,
+            text=tr("journal.transcription_setup_title"),
+            bg=t.surface,
+            fg=t.text,
+            font=("Segoe UI", 14, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+        tk.Label(
+            wrap,
+            text=tr("journal.transcription_setup_body").format(
+                model=TRANSCRIPTION_SUGGESTED_LOCAL_MODEL
+            ),
+            bg=t.surface,
+            fg=t.muted,
+            font=("Segoe UI", 10),
+            anchor="w",
+            justify="left",
+            wraplength=470,
+        ).pack(fill="x", pady=(0, 16))
+        buttons = tk.Frame(wrap, bg=t.surface)
+        buttons.pack(fill="x", side="bottom")
+
+        def _download_suggested() -> None:
+            _close_transcription_setup_prompt()
+            _start_local_model_download(TRANSCRIPTION_SUGGESTED_LOCAL_MODEL)
+
+        def _enter_key() -> None:
+            _close_transcription_setup_prompt()
+            _goto_settings_token_field()
+
+        _make_manager_button(
+            buttons,
+            tr("journal.transcription_setup_download").format(
+                model=TRANSCRIPTION_SUGGESTED_LOCAL_MODEL
+            ),
+            _download_suggested,
+            True,
+        )
+        _make_manager_button(buttons, tr("journal.transcription_add_api_key"), _enter_key, True)
+        _make_manager_button(buttons, tr("find.close"), _close_transcription_setup_prompt, True)
+        win.lift()
+        win.focus_force()
+
+    def _ensure_selected_transcription_model_ready() -> bool:
+        choice = normalize_transcription_model_choice(transcription_model_choice["value"])
+        if transcription_model_is_cloud(choice):
+            if get_openai_api_key():
+                return True
+            fallback_choice = first_usable_local_transcription_choice()
+            if fallback_choice:
+                if messagebox.askyesno(
+                    tr("journal.transcription_model_title"),
+                    tr("journal.transcription_use_downloaded_confirm").format(
+                        model=_transcription_model_display(fallback_choice)
+                    ),
+                ):
+                    _set_transcription_model_choice(fallback_choice)
+                    return True
+            _show_transcription_setup_prompt()
+            return False
+        model_name = transcription_local_model_name(choice)
+        if local_transcription_model_is_downloaded(model_name):
+            runtime_ok, runtime_err = ensure_local_transcription_runtime_loaded()
+            if runtime_ok:
+                return True
+            _append_console_session_update(
+                f"Local transcription add-on is not ready: {runtime_err}",
+                key="transcription:local_runtime_failed",
+            )
+            if get_openai_api_key() and messagebox.askyesno(
+                tr("journal.transcription_model_title"),
+                tr("journal.transcription_use_cloud_confirm"),
+            ):
+                _set_transcription_model_choice(TRANSCRIPTION_MODEL_CLOUD)
+                return True
+            _open_transcription_downloads_manager("transcription")
+            return False
+        if not transcription_has_any_ready_model():
+            _show_transcription_setup_prompt()
+        else:
+            _open_transcription_downloads_manager()
+        return False
 
     def update_transcribe_ui() -> None:
         t = th()
         _update_iphone_receive_button()
+
+        for row in (transcribe_btn_row, transcribe_file_btn_row):
+            row.configure(bg=t.panel)
+
+        def _set_model_buttons_enabled(enabled: bool) -> None:
+            state = "normal" if enabled else "disabled"
+            bg, fg, abg, afg = t.side_action_config()
+            if not enabled:
+                bg, fg, abg, afg, _dfg = t.transcribe_idle_disabled_config()
+            for btn in (transcribe_model_btn, transcribe_file_model_btn):
+                btn.config(
+                    state=state,
+                    bg=bg,
+                    fg=fg,
+                    activebackground=abg,
+                    activeforeground=afg,
+                )
 
         def _set_transcribe_file_button_enabled(enabled: bool) -> None:
             if enabled:
                 bg, fg, abg, afg = t.side_action_config()
                 transcribe_file_btn.config(
                     state="normal",
-                    width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+                    width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH - 3,
                     bg=bg,
                     fg=fg,
                     activebackground=abg,
@@ -7804,7 +11097,7 @@ def open_journal_window_editor(
                 tb = t.transcribe_idle_disabled_config()
                 transcribe_file_btn.config(
                     state="disabled",
-                    width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+                    width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH - 3,
                     bg=tb[0],
                     fg=tb[1],
                     activebackground=tb[2],
@@ -7816,7 +11109,7 @@ def open_journal_window_editor(
             tb = t.transcribe_busy_config()
             transcribe_btn.config(
                 state="disabled",
-                width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+                width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH - 3,
                 bg=tb[0],
                 fg=tb[1],
                 activebackground=tb[2],
@@ -7824,12 +11117,13 @@ def open_journal_window_editor(
                 disabledforeground=tb[4],
             )
             _set_transcribe_file_button_enabled(False)
+            _set_model_buttons_enabled(False)
             return
         if recording_ui_busy["v"]:
             tb = t.transcribe_idle_disabled_config()
             transcribe_btn.config(
                 state="disabled",
-                width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+                width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH - 3,
                 bg=tb[0],
                 fg=tb[1],
                 activebackground=tb[2],
@@ -7837,7 +11131,9 @@ def open_journal_window_editor(
                 disabledforeground=tb[4],
             )
             _set_transcribe_file_button_enabled(False)
+            _set_model_buttons_enabled(False)
             return
+        _set_model_buttons_enabled(not transcription_model_download_busy["v"])
         _set_transcribe_file_button_enabled(filedialog is not None)
         p = last_journal_wav.get("path")
         has_session = p is not None and isinstance(p, Path) and p.exists()
@@ -7846,7 +11142,7 @@ def open_journal_window_editor(
             bg, fg, abg, afg = t.side_action_config()
             transcribe_btn.config(
                 state="normal",
-                width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+                width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH - 3,
                 bg=bg,
                 fg=fg,
                 activebackground=abg,
@@ -7856,7 +11152,7 @@ def open_journal_window_editor(
             tb = t.transcribe_idle_disabled_config()
             transcribe_btn.config(
                 state="disabled",
-                width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+                width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH - 3,
                 bg=tb[0],
                 fg=tb[1],
                 activebackground=tb[2],
@@ -7887,6 +11183,8 @@ def open_journal_window_editor(
 
     def receive_iphone_tooltip_text() -> str:
         if bool(iphone_receiver_state.get("active")):
+            if bool(iphone_receiver_state.get("passive")):
+                return tr("journal.iphone_passive_tooltip")
             return tr("journal.iphone_active_tooltip")
         return tr("journal.iphone_receive_tooltip")
 
@@ -7895,39 +11193,41 @@ def open_journal_window_editor(
             messagebox.showinfo("Speech to text", f"That file is no longer on disk:\n{use_path}")
             update_transcribe_ui()
             return
-        if not get_openai_api_key():
-            messagebox.showerror(
-                "Speech to text",
-                "No OpenAI API key. Use TOKEN ADD in the main menu or set OPENAI_API_KEY.",
-            )
+        if not _ensure_selected_transcription_model_ready():
             return
         if display_path is not None:
             _set_stt_saved_path_display(f"Selected: {display_path}")
         transcribing_progress["v"] = 0
+        transcribing_job_state["id"] += 1
+        job_id = transcribing_job_state["id"]
 
         def schedule_progress(pct: int) -> None:
+            if job_id != transcribing_job_state["id"]:
+                return
             p = min(100, max(0, int(pct)))
             transcribing_progress["v"] = p
 
             def _ui() -> None:
-                try:
-                    stt_status.config(text=f"Transcribingâ€¦ ({p}%)")
-                except tk.TclError:
-                    pass
+                if job_id != transcribing_job_state["id"]:
+                    return
+                _publish_console_update(f"Transcribing... ({p}%)", key="transcribe:single:progress", log=False)
 
             root.after(0, _ui)
 
         transcribing_busy["v"] = True
         update_transcribe_ui()
         schedule_progress(0)
+        _append_console_session_update(f"Transcription started: {use_path.name}", key=f"transcribe:start:{_iphone_path_key(use_path)}:{int(time.time())}")
         lang_snap = _language_code_for_whisper()
+        model_choice_snap = normalize_transcription_model_choice(transcription_model_choice["value"])
 
         def work() -> None:
             result = ""
             try:
-                result = transcribe_audio_openai(
+                result = transcribe_audio_with_model(
                     use_path,
                     lang_snap,
+                    model_choice_snap,
                     temperature=0.0,
                     progress=schedule_progress,
                 )
@@ -7940,11 +11240,21 @@ def open_journal_window_editor(
                     pass
 
             def done() -> None:
+                if job_id != transcribing_job_state["id"]:
+                    return
+                transcribing_job_state["id"] += 1
                 transcribing_busy["v"] = False
                 transcribing_progress["v"] = 0
                 update_transcribe_ui()
                 stt_status.config(text="")
+                _clear_console_hint()
                 if _is_likely_api_error_message(result):
+                    if _maybe_prompt_media_tools_from_error(result):
+                        return
+                    _append_console_session_update(
+                        f"Transcription failed: {use_path.name}: {result[:240]}",
+                        key=f"transcribe:failed:{_iphone_path_key(use_path)}:{int(time.time())}",
+                    )
                     messagebox.showerror("Speech to text", result[:4000])
                     return
                 final_text = normalize_journal_text_punctuation(result.strip())
@@ -7952,6 +11262,16 @@ def open_journal_window_editor(
                     if stt_box.get("1.0", "end-1c").strip():
                         stt_box.insert("end", " ")
                     stt_box.insert("end", final_text)
+                _append_console_session_update(
+                    f"Transcription finished: {use_path.name}",
+                    key=f"transcribe:done:{_iphone_path_key(use_path)}:{int(time.time())}",
+                )
+                _publish_console_update(
+                    f"Transcription complete: {use_path.name}",
+                    key=f"transcribe:complete:{_iphone_path_key(use_path)}",
+                    temp=True,
+                    log=False,
+                )
                 save_draft()
                 refresh_save_entry_state()
 
@@ -8006,37 +11326,39 @@ def open_journal_window_editor(
                 return
             use_path = alt
             last_journal_wav["path"] = alt
-        if not get_openai_api_key():
-            messagebox.showerror(
-                "Speech to text",
-                "No OpenAI API key. Use TOKEN ADD in the main menu or set OPENAI_API_KEY.",
-            )
+        if not _ensure_selected_transcription_model_ready():
             return
         transcribing_progress["v"] = 0
+        transcribing_job_state["id"] += 1
+        job_id = transcribing_job_state["id"]
 
         def schedule_progress(pct: int) -> None:
+            if job_id != transcribing_job_state["id"]:
+                return
             p = min(100, max(0, int(pct)))
             transcribing_progress["v"] = p
 
             def _ui() -> None:
-                try:
-                    stt_status.config(text=f"Transcribing… ({p}%)")
-                except tk.TclError:
-                    pass
+                if job_id != transcribing_job_state["id"]:
+                    return
+                _publish_console_update(f"Transcribing... ({p}%)", key="transcribe:recording:progress", log=False)
 
             root.after(0, _ui)
 
         transcribing_busy["v"] = True
         update_transcribe_ui()
         schedule_progress(0)
+        _append_console_session_update(f"Transcription started: {use_path.name}", key=f"transcribe:start:{_iphone_path_key(use_path)}:{int(time.time())}")
         lang_snap = _language_code_for_whisper()
+        model_choice_snap = normalize_transcription_model_choice(transcription_model_choice["value"])
 
         def work() -> None:
             result = ""
             try:
-                result = transcribe_audio_openai(
+                result = transcribe_audio_with_model(
                     use_path,
                     lang_snap,
+                    model_choice_snap,
                     temperature=0.0,
                     progress=schedule_progress,
                 )
@@ -8049,11 +11371,21 @@ def open_journal_window_editor(
                     pass
 
             def done() -> None:
+                if job_id != transcribing_job_state["id"]:
+                    return
+                transcribing_job_state["id"] += 1
                 transcribing_busy["v"] = False
                 transcribing_progress["v"] = 0
                 update_transcribe_ui()
                 stt_status.config(text="")
+                _clear_console_hint()
                 if _is_likely_api_error_message(result):
+                    if _maybe_prompt_media_tools_from_error(result):
+                        return
+                    _append_console_session_update(
+                        f"Transcription failed: {use_path.name}: {result[:240]}",
+                        key=f"transcribe:failed:{_iphone_path_key(use_path)}:{int(time.time())}",
+                    )
                     messagebox.showerror("Speech to text", result[:4000])
                     return
                 final_text = normalize_journal_text_punctuation(result.strip())
@@ -8061,6 +11393,16 @@ def open_journal_window_editor(
                     if stt_box.get("1.0", "end-1c").strip():
                         stt_box.insert("end", " ")
                     stt_box.insert("end", final_text)
+                _append_console_session_update(
+                    f"Transcription finished: {use_path.name}",
+                    key=f"transcribe:done:{_iphone_path_key(use_path)}:{int(time.time())}",
+                )
+                _publish_console_update(
+                    f"Transcription complete: {use_path.name}",
+                    key=f"transcribe:complete:{_iphone_path_key(use_path)}",
+                    temp=True,
+                    log=False,
+                )
                 save_draft()
                 refresh_save_entry_state()
 
@@ -8089,11 +11431,14 @@ def open_journal_window_editor(
             messagebox.showinfo("Speech to text", f"That file is no longer on disk:\n{missing[0]}")
             update_transcribe_ui()
             return
-        if not get_openai_api_key():
-            messagebox.showerror(
-                "Speech to text",
-                "No OpenAI API key. Use TOKEN ADD in the main menu or set OPENAI_API_KEY.",
-            )
+        if any_transcription_path_needs_media_tools(ordered_paths) and _find_ffmpeg_executable() is None:
+            if messagebox.askyesno(
+                tr("download_manager.title"),
+                tr("download_manager.media_required_prompt"),
+            ):
+                _install_media_tools_addon()
+            return
+        if not _ensure_selected_transcription_model_ready():
             return
         if display_label:
             _set_stt_saved_path_display(display_label)
@@ -8102,39 +11447,94 @@ def open_journal_window_editor(
         else:
             _set_stt_saved_path_display(f"Selected: {len(ordered_paths)} files")
         transcribing_progress["v"] = 0
+        transcribing_job_state["id"] += 1
+        job_id = transcribing_job_state["id"]
 
-        def schedule_progress(file_index: int, file_count: int, pct: int, filename: str) -> None:
+        def _publish_transcribe_path_status(path: Optional[Path], text: str) -> None:
+            if path is None:
+                return
+            upload_id = iphone_upload_id_by_path.get(_iphone_path_key(path), "")
+            if upload_id:
+                publish_iphone_upload_status(upload_id, text)
+            else:
+                _publish_console_update(text, key=f"transcribe:path:{path.name}", log=False)
+
+        def schedule_progress(
+            file_index: int,
+            file_count: int,
+            pct: int,
+            filename: str,
+            path: Optional[Path] = None,
+        ) -> None:
+            if job_id != transcribing_job_state["id"]:
+                return
             part_pct = min(100, max(0, int(pct)))
             total_pct = min(
                 100,
                 max(0, int(((file_index + (part_pct / 100.0)) / max(file_count, 1)) * 100)),
             )
             transcribing_progress["v"] = total_pct
+            message = f"Transcribing {file_index + 1}/{file_count}: {filename} ({part_pct}%)"
 
             def _ui() -> None:
-                try:
-                    stt_status.config(
-                        text=f"Transcribing {file_index + 1}/{file_count}: {filename} ({part_pct}%)"
-                    )
-                except tk.TclError:
-                    pass
+                if job_id != transcribing_job_state["id"]:
+                    return
+                _publish_transcribe_path_status(path, message)
+                _publish_console_update(message, key=f"transcribe:progress:{filename}", log=False)
 
             root.after(0, _ui)
+
+        def schedule_status(
+            file_index: int,
+            file_count: int,
+            filename: str,
+            message: str,
+            path: Optional[Path] = None,
+        ) -> None:
+            if job_id != transcribing_job_state["id"]:
+                return
+            detail = (message or "").strip()
+            if not detail:
+                return
+            text = f"Transcribing {file_index + 1}/{file_count}: {filename}. {detail}"
+
+            def _ui() -> None:
+                if job_id != transcribing_job_state["id"]:
+                    return
+                _publish_transcribe_path_status(path, text)
+                _publish_console_update(text, key=f"transcribe:status:{filename}")
+
+            root.after(0, _ui)
+
+        pending_transcript_parts: List[str] = []
+        pending_transcript_lock = threading.Lock()
+
+        def _insert_transcribed_text_now(final_text: str) -> None:
+            if stt_box.get("1.0", "end-1c").strip():
+                stt_box.insert("end", " ")
+            stt_box.insert("end", final_text)
+            save_draft()
+            refresh_save_entry_state()
+
+        def drain_pending_transcript_parts() -> None:
+            with pending_transcript_lock:
+                parts = list(pending_transcript_parts)
+                pending_transcript_parts.clear()
+            for final_text in parts:
+                try:
+                    _insert_transcribed_text_now(final_text)
+                except tk.TclError:
+                    pass
 
         def append_transcribed_text(text: str) -> None:
             final_text = normalize_journal_text_punctuation((text or "").strip())
             if not final_text:
                 return
+            with pending_transcript_lock:
+                pending_transcript_parts.append(final_text)
 
             def _ui() -> None:
-                try:
-                    if stt_box.get("1.0", "end-1c").strip():
-                        stt_box.insert("end", " ")
-                    stt_box.insert("end", final_text)
-                    save_draft()
-                    refresh_save_entry_state()
-                except tk.TclError:
-                    pass
+                drain_pending_transcript_parts()
 
             root.after(0, _ui)
 
@@ -8157,56 +11557,111 @@ def open_journal_window_editor(
 
         transcribing_busy["v"] = True
         update_transcribe_ui()
-        schedule_progress(0, len(ordered_paths), 0, ordered_paths[0].name)
+        schedule_progress(0, len(ordered_paths), 0, ordered_paths[0].name, ordered_paths[0])
+        _append_console_session_update(
+            f"Transcription queue started: {len(ordered_paths)} file(s).",
+            key=f"transcribe:queue:start:{int(time.time())}",
+        )
         lang_snap = _language_code_for_whisper()
+        model_choice_snap = normalize_transcription_model_choice(transcription_model_choice["value"])
 
         def work() -> None:
             error_result = ""
             skipped_results: List[str] = []
+            final_fallback_results: List[Tuple[Path, str]] = []
             try:
                 for file_index, use_path in enumerate(ordered_paths):
                     def _file_progress(pct: int, _idx: int = file_index, _path: Path = use_path) -> None:
-                        schedule_progress(_idx, len(ordered_paths), pct, _path.name)
+                        schedule_progress(_idx, len(ordered_paths), pct, _path.name, _path)
 
-                    result = transcribe_audio_openai(
+                    def _file_status(text: str, _idx: int = file_index, _path: Path = use_path) -> None:
+                        schedule_status(_idx, len(ordered_paths), _path.name, text, _path)
+
+                    live_parts_inserted = {"count": 0}
+
+                    def _file_part(text: str) -> None:
+                        if (text or "").strip():
+                            live_parts_inserted["count"] += 1
+                        append_transcribed_text(text)
+
+                    result = transcribe_audio_with_model(
                         use_path,
                         lang_snap,
+                        model_choice_snap,
                         temperature=0.0,
-                        on_part=append_transcribed_text,
+                        on_part=_file_part,
                         progress=_file_progress,
+                        status=_file_status,
                     )
                     if _is_likely_api_error_message(result):
+                        if "Media Tools add-on" in result:
+                            error_result = result
+                            break
                         if _is_skippable_file_transcribe_error(result):
                             skipped_results.append(f"{use_path.name}: {result}")
-                            schedule_progress(file_index, len(ordered_paths), 100, use_path.name)
+                            schedule_progress(file_index, len(ordered_paths), 100, use_path.name, use_path)
                             continue
                         error_result = result
                         break
-                    schedule_progress(file_index, len(ordered_paths), 100, use_path.name)
+                    if (
+                        result.strip()
+                        and live_parts_inserted["count"] <= 0
+                        and not _is_likely_api_error_message(result)
+                    ):
+                        final_fallback_results.append((use_path, result.strip()))
+                    schedule_progress(file_index, len(ordered_paths), 100, use_path.name, use_path)
             except BaseException as _tw_exc:
                 error_result = f"Whisper request failed: {_tw_exc}"
             finally:
                 try:
                     if not error_result and ordered_paths:
-                        schedule_progress(len(ordered_paths) - 1, len(ordered_paths), 100, ordered_paths[-1].name)
+                        schedule_progress(
+                            len(ordered_paths) - 1,
+                            len(ordered_paths),
+                            100,
+                            ordered_paths[-1].name,
+                            ordered_paths[-1],
+                        )
                 except Exception:
                     pass
 
             def done() -> None:
+                if job_id != transcribing_job_state["id"]:
+                    return
+                transcribing_job_state["id"] += 1
                 transcribing_busy["v"] = False
                 transcribing_progress["v"] = 0
                 update_transcribe_ui()
                 stt_status.config(text="")
+                _clear_console_hint()
                 if error_result:
                     if after_done is not None:
                         after_done(False, ordered_paths)
                     root.after(100, drain_iphone_pending)
+                    if _maybe_prompt_media_tools_from_error(error_result):
+                        return
+                    _append_console_session_update(
+                        f"Transcription queue failed: {error_result[:240]}",
+                        key=f"transcribe:queue:failed:{int(time.time())}",
+                    )
                     messagebox.showerror("Speech to text", error_result[:4000])
                     return
+                if final_fallback_results:
+                    for _path, _text in final_fallback_results:
+                        append_transcribed_text(_text)
+                        _append_console_session_update(
+                            f"Inserted final transcript for {_path.name}.",
+                            key=f"transcribe:fallback:{_iphone_path_key(_path)}:{int(time.time())}",
+                        )
+                drain_pending_transcript_parts()
                 if skipped_results:
                     preview = "\n".join(skipped_results[:12])
                     if len(skipped_results) > 12:
                         preview += f"\n...and {len(skipped_results) - 12} more."
+                    _append_console_session_update(
+                        f"Transcription skipped {len(skipped_results)} file(s).",
+                        key=f"transcribe:queue:skipped:{int(time.time())}",
+                    )
                     messagebox.showinfo(
                         "Speech to text",
                         f"Skipped {len(skipped_results)} file(s) that could not be transcribed:\n{preview}"[:4000],
@@ -8215,6 +11670,16 @@ def open_journal_window_editor(
                 refresh_save_entry_state()
                 if after_done is not None:
                     after_done(True, ordered_paths)
+                _append_console_session_update(
+                    f"Transcription queue finished: {len(ordered_paths)} file(s).",
+                    key=f"transcribe:queue:done:{int(time.time())}",
+                )
+                _publish_console_update(
+                    f"Transcription complete: {len(ordered_paths)} file(s).",
+                    key=f"transcribe:queue:complete:{int(time.time())}",
+                    temp=True,
+                    log=False,
+                )
                 root.after(100, drain_iphone_pending)
 
             root.after(0, done)
@@ -8238,10 +11703,11 @@ def open_journal_window_editor(
             filetypes=[
                 (
                     "Transcribable media",
-                    "*.wav *.mp3 *.m4a *.mp4 *.mov *.webm *.mpeg *.mpga *.flac *.ogg",
+                    "*.wav *.mp3 *.m4a *.aac *.caf *.mp4 *.mov *.webm *.mpeg *.mpga *.flac *.ogg",
                 ),
                 ("iPhone videos", "*.mov *.mp4"),
-                ("Audio files", "*.wav *.mp3 *.m4a *.mpeg *.mpga *.flac *.ogg"),
+                ("iPhone audio / Voice Memos", "*.m4a *.aac *.caf"),
+                ("Audio files", "*.wav *.mp3 *.m4a *.aac *.caf *.mpeg *.mpga *.flac *.ogg"),
                 ("Video files", "*.mp4 *.mov *.webm"),
                 ("All files", "*.*"),
             ],
@@ -8252,9 +11718,25 @@ def open_journal_window_editor(
 
     transcribe_btn.config(command=run_transcribe)
     transcribe_file_btn.config(command=run_transcribe_file)
+    transcribe_model_btn.config(command=lambda: _show_transcription_model_menu(transcribe_model_btn))
+    transcribe_file_model_btn.config(
+        command=lambda: _show_transcription_model_menu(transcribe_file_model_btn)
+    )
     receive_iphone_btn.config(command=toggle_iphone_receiver)
     bind_hover_tooltip(transcribe_btn, transcribe_tooltip_text)
     bind_hover_tooltip(transcribe_file_btn, transcribe_file_tooltip_text)
+    bind_hover_tooltip(
+        transcribe_model_btn,
+        lambda: tr("journal.transcription_model_tooltip").format(
+            model=_transcription_model_display(transcription_model_choice["value"])
+        ),
+    )
+    bind_hover_tooltip(
+        transcribe_file_model_btn,
+        lambda: tr("journal.transcription_model_tooltip").format(
+            model=_transcription_model_display(transcription_model_choice["value"])
+        ),
+    )
     bind_hover_tooltip(receive_iphone_btn, receive_iphone_tooltip_text)
 
     def transcribe_rest_style() -> Tuple[str, str, str, str, str]:
@@ -8280,6 +11762,13 @@ def open_journal_window_editor(
             return ("disabled", b0, b1, b2, b3)
         return t.side_action_bind_rest()
 
+    def transcribe_model_rest_style() -> Tuple[str, str, str, str, str]:
+        t = th()
+        if transcribing_busy["v"] or recording_ui_busy["v"] or transcription_model_download_busy["v"]:
+            b0, b1, b2, b3, b4 = t.transcribe_idle_disabled_config()
+            return ("disabled", b0, b1, b2, b3)
+        return t.side_action_bind_rest()
+
     def receive_iphone_rest_style() -> Tuple[str, str, str, str, str]:
         return th().side_action_bind_rest()
 
@@ -8295,6 +11784,13 @@ def open_journal_window_editor(
         lambda: th().hover_primary,
         lambda: "white",
     )
+    for _model_btn in (transcribe_model_btn, transcribe_file_model_btn):
+        bind_button_hover_if_enabled(
+            _model_btn,
+            transcribe_model_rest_style,
+            lambda: th().hover_primary,
+            lambda: "white",
+        )
     bind_button_hover_if_enabled(
         receive_iphone_btn,
         receive_iphone_rest_style,
@@ -8302,7 +11798,13 @@ def open_journal_window_editor(
         lambda: "white",
     )
     update_transcribe_ui()
-    root.after(300, lambda: enqueue_iphone_imports(list_pending_iphone_inbox_files()))
+    def _startup_iphone_receiver_and_pending() -> None:
+        if iphone_passive_receive_enabled():
+            start_iphone_receiver(show_setup=False, passive=True)
+        receive_iphone_incoming_files(list_incoming_iphone_files())
+        enqueue_iphone_imports(list_pending_iphone_inbox_files())
+
+    root.after(300, _startup_iphone_receiver_and_pending)
     wave_canvas.bind("<Configure>", lambda _e: redraw_waveform_canvas())
     wave_canvas.after(80, redraw_waveform_canvas)
 
@@ -8432,7 +11934,7 @@ def open_journal_window_editor(
         choice = lang_var.get().strip()
         if choice == "English":
             return "en"
-        if choice in ("简体中文", "中文", "Chinese"):
+        if choice in ("ç®€ä½“ä¸­æ–‡", "ä¸­æ–‡", "Chinese"):
             return "zh"
         return None
 
@@ -8449,7 +11951,13 @@ def open_journal_window_editor(
             "Whisper API error",
             "Whisper request failed",
             "Whisper returned",
-            "Whisper transcription rejected",
+        "Whisper transcription rejected",
+        "Local transcription failed",
+        "Local transcription add-on",
+        "Local transcription model",
+        "Could not load local transcription add-on",
+        "Could not load local transcription model",
+            "Media Tools add-on",
             "Unsupported transcription file type",
             "That media file is too large",
             "That iPhone video is too large",
@@ -9074,7 +12582,9 @@ def open_journal_window_editor(
         if not text:
             return
         console_output.config(state="normal")
-        console_output.insert("end", text.rstrip("\n") + "\n")
+        stamp = _console_update_timestamp()
+        lines = (text.rstrip("\n") or "").splitlines() or [text.rstrip("\n")]
+        console_output.insert("end", "\n".join(f"[{stamp}] {line}" for line in lines) + "\n")
         console_output.see("end")
         console_output.config(state="disabled")
 
@@ -9529,6 +13039,10 @@ def open_journal_window_editor(
         startup_toggle_btn.config(
             text=tr("settings.on") if startup_state["enabled"] else tr("settings.off")
         )
+        iphone_receive_toggle_btn.config(
+            text=tr("settings.on") if iphone_receive_state["enabled"] else tr("settings.off")
+        )
+        transcription_models_btn.config(text=tr("settings.manage"))
         settings_theme_btn.config(
             text=tr("theme.dark") if th().is_dark else tr("theme.light")
         )
@@ -9567,9 +13081,13 @@ def open_journal_window_editor(
         transcribe_btn.config(text=tr("journal.transcribe"))
         transcribe_file_btn.config(text=tr("journal.transcribe_file"))
         receive_iphone_btn.config(
-            text=tr("journal.iphone_stop")
-            if bool(iphone_receiver_state.get("active"))
-            else tr("journal.iphone_receive")
+            text=tr("journal.iphone_receive")
+            if bool(iphone_receiver_state.get("passive"))
+            else (
+                tr("journal.iphone_stop")
+                if bool(iphone_receiver_state.get("active"))
+                else tr("journal.iphone_receive")
+            )
         )
         gen_button.config(text=tr("journal.generate_report"))
         save_entry_btn.config(text=tr("journal.save_entry"))
@@ -9659,6 +13177,8 @@ def open_journal_window_editor(
         for _btn in (
             rename_btn,
             startup_toggle_btn,
+            iphone_receive_toggle_btn,
+            transcription_models_btn,
             settings_theme_btn,
             backup_mode_btn,
             backup_manual_btn,
@@ -11639,7 +15159,7 @@ def _apply_typing_casing(user_line: str, completed_canonical: str) -> str:
         return completed_canonical
     if user_line.islower():
         return completed_canonical.lower()
-    # Sentence-style: "Startup t", "Startup ", "Startup true" — first word Title, rest lowercase.
+    # Sentence-style: "Startup t", "Startup ", "Startup true" - first word Title, rest lowercase.
     if " " in user_line:
         first_sp = user_line.find(" ")
         first_word = user_line[:first_sp]
@@ -11932,6 +15452,7 @@ def run() -> None:
     if not _deps_ok:
         return
     migrate_legacy_storage_if_needed()
+    finalize_pending_local_transcription_addon()
     setup_first_time_preferences()
     ensure_backup_folder()
     if sys.platform == "win32":
@@ -11956,3 +15477,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

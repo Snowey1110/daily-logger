@@ -8,4 +8,10 @@ settings/wifi_warn_list.json
 settings/journal_window_draft.json
 daily_logs/
 dist/DailyLogger/
+dist/*.zip
+dist/DailyLoggerLocalTranscriptionAddon/
+dist/DailyLoggerLocalTranscriberBuild/
+dist/DailyLoggerMediaToolsAddon/
+DailyLoggerLocalTranscriber.spec
+build/local_transcriber_helper/
 __pycache__/

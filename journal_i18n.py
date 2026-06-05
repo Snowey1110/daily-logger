@@ -27,6 +27,8 @@ _EN: Dict[str, str] = {
     "settings.lang.chinese": "中文",
     "settings.rename": "Rename",
     "settings.startup": "Start Up Launch",
+    "settings.iphone_receive": "iPhone Receiving",
+    "settings.transcription_models": "Download Manager",
     "settings.theme": "Window Theme",
     "settings.backup": "Back Up",
     "settings.token": "Token",
@@ -37,6 +39,7 @@ _EN: Dict[str, str] = {
     "settings.manual": "Manual",
     "settings.save": "Save",
     "settings.copy": "Copy",
+    "settings.manage": "Manage",
     "settings.start_menu_app": "App",
     "settings.start_menu_journal": "Journal",
     "settings.start_menu_reader": "Reader",
@@ -76,15 +79,108 @@ _EN: Dict[str, str] = {
     "journal.lang_label": "Language:",
     "journal.transcribe": "Transcribe",
     "journal.transcribe_file": "Transcribe File",
+    "journal.transcription_model_title": "Transcription model",
+    "journal.transcription_model_tooltip": "Current model: {model}\nClick to choose or manage transcription models.",
+    "journal.transcription_model_selected": "Transcription model selected: {model}",
+    "journal.transcription_model_busy": "Finish the current recording or transcription before changing models.",
+    "journal.transcription_model_download_confirm": (
+        "Download local transcription model '{model}' now?\n\n"
+        "This uses disk space and may take a while the first time."
+    ),
+    "journal.transcription_model_downloading": "Downloading local transcription model: {model}...",
+    "journal.transcription_model_uninstall": "Uninstall Local - {model}",
+    "journal.transcription_model_uninstall_confirm": (
+        "Uninstall local transcription model '{model}'?\n\n"
+        "You can download it again later."
+    ),
+    "journal.transcription_state_selected": "Selected",
+    "journal.transcription_state_default": "Default",
+    "journal.transcription_state_ready": "Ready",
+    "journal.transcription_state_api_key_required": "API key needed",
+    "journal.transcription_state_downloaded": "Downloaded",
+    "journal.transcription_state_not_downloaded": "Not downloaded",
+    "journal.transcription_state_addon_required": "Add-on required",
+    "journal.local_addon_install": "Install local transcription add-on...",
+    "journal.local_addon_install_short": "Download",
+    "journal.local_addon_repair_short": "Repair local engine",
+    "journal.local_addon_uninstall": "Uninstall local transcription add-on",
+    "journal.local_addon_uninstall_short": "Remove add-on",
+    "journal.local_addon_uninstall_confirm": (
+        "Uninstall the local transcription runtime add-on?\n\n"
+        "Downloaded local models stay on disk, but local transcription will be unavailable until the add-on is installed again."
+    ),
+    "journal.local_addon_choose": "Choose DailyLoggerLocalTranscriptionAddon.zip",
+    "journal.local_addon_no_picker": "File selection is not available.",
+    "journal.local_addon_installing": "Installing local transcription add-on...",
+    "journal.local_addon_installed": "Local transcription add-on installed.",
+    "journal.local_addon_uninstalled": "Local transcription add-on removed.",
+    "journal.transcription_model_download": "Download",
+    "journal.transcription_model_use_default": "Use as default",
+    "journal.transcription_model_uninstall_short": "Uninstall",
+    "journal.transcription_add_api_key": "Enter API key",
+    "journal.transcription_manage_models": "Download/manage free models...",
+    "download_manager.title": "Download Manager",
+    "download_manager.transcription_tab": "Transcription",
+    "download_manager.media_tab": "Media Tools",
+    "download_manager.reader_tab": "Reader",
+    "download_manager.install": "Download",
+    "download_manager.size_summary": (
+        "Base app {base} | Installed addons {addons} | Visible models {visible_models} | "
+        "Other model files {other_models} | Total {total}"
+    ),
+    "download_manager.free_preview": "Free {size}",
+    "download_manager.media_title": "Media Tools add-on",
+    "download_manager.media_stats": "Video/audio conversion | Estimated {size}",
+    "download_manager.media_note": "Needed for iPhone videos, video-to-audio conversion, large media splitting, and some Voice Memo containers.",
+    "download_manager.media_choose": "Choose DailyLoggerMediaToolsAddon.zip",
+    "download_manager.media_installing": "Installing Media Tools add-on...",
+    "download_manager.media_installed": "Media Tools add-on installed.",
+    "download_manager.media_uninstalled": "Media Tools add-on removed.",
+    "download_manager.media_uninstall_confirm": "Remove the Media Tools add-on?\n\nVideo conversion will be unavailable until you install it again.",
+    "download_manager.media_required_prompt": (
+        "This file needs Media Tools for video/audio conversion. Daily Logger saved it as pending. "
+        "Install Media Tools now?"
+    ),
+    "download_manager.reader_title": "Virtual Reader",
+    "download_manager.reader_stats": "Bundled reader assets | {size}",
+    "download_manager.reader_note": "Installed with Daily Logger as part of the journal reading experience.",
+    "download_manager.core_installed": "Core installed",
+    "download_manager.other_models_title": "Other local model files",
+    "download_manager.other_models_stats": "Hidden or legacy model folders | {size}",
+    "download_manager.other_models_note": "Files in the model folder that are not shown as selectable models above.",
+    "download_manager.other_models_confirm": "Remove these hidden or legacy model files?\n\n{names}",
+    "journal.transcription_manager_title": "Download Manager",
+    "journal.transcription_manager_current": "Current default: {model}",
+    "journal.transcription_manager_free_models": "Free local models",
+    "journal.transcription_manager_cloud_models": "Cloud models",
+    "journal.transcription_manager_recommended": "(Recommended)",
+    "journal.transcription_manager_local_stats": "{quality} | {speed} | {disk}",
+    "journal.transcription_manager_cloud_stats": "{quality} | {speed} | {cost}",
+    "journal.transcription_manager_cloud_note": "Small Daily Logger package, needs an OpenAI API key and internet.",
+    "journal.transcription_setup_title": "No transcription model is ready",
+    "journal.transcription_setup_body": (
+        "To transcribe, download the suggested free Local - {model} package or enter an OpenAI API key for cloud transcription."
+    ),
+    "journal.transcription_setup_download": "Download Local - {model}",
+    "journal.transcription_use_downloaded_confirm": "No API key is set. Use {model} for this transcription?",
+    "journal.transcription_use_cloud_confirm": "The selected local model is not ready. Use cloud transcription instead?",
     "journal.iphone_receive": "Receive from iPhone",
     "journal.iphone_stop": "Stop iPhone",
     "journal.iphone_inbox": "iPhone Inbox",
     "journal.iphone_waiting": "Waiting for iPhone upload...",
     "journal.iphone_received": "Received {count} iPhone file(s), transcribing...",
+    "journal.iphone_incoming_status": "Incoming iPhone file(s): {count}",
+    "journal.iphone_incoming_title": "Incoming transcription",
+    "journal.iphone_incoming_body": "Daily Logger received {count} file(s):\n{names}\n\nAccept to transcribe them, or decline to keep them out of the journal.",
+    "journal.iphone_accept": "Accept",
+    "journal.iphone_decline": "Decline",
+    "journal.iphone_declined": "Declined {count} iPhone file(s).",
+    "journal.iphone_turn_off": "Turn off iPhone receiving",
     "journal.iphone_pending": "Pending iPhone files: {count}",
     "journal.iphone_start_failed": "Could not start iPhone receiver: {exc}",
     "journal.iphone_receive_tooltip": "Start iPhone upload receiver.",
     "journal.iphone_active_tooltip": "Receiver is running. Click to stop.",
+    "journal.iphone_passive_tooltip": "Receiver is already running. Click to show QR and Shortcut URL.",
     "journal.iphone_upload_url": "Upload URL",
     "journal.iphone_wifi_url": "Current Wi-Fi URL",
     "journal.iphone_computer_url": "Computer-name URL",
@@ -97,10 +193,16 @@ _EN: Dict[str, str] = {
     "journal.iphone_copy_shortcut": "Copy Shortcut URL",
     "journal.iphone_refresh_qr": "Refresh QR / URL",
     "journal.iphone_qr_hint": (
-        "Scan the QR code with your iPhone to pick videos or audio files and send them to Daily Logger."
+        "Scan the QR code with your iPhone to pick videos, Voice Memos, or audio files and send them to Daily Logger."
     ),
     "journal.iphone_simple_note": (
-        "Shortcut option: copy the URL below into Get Contents of URL for stable Wi-Fi use."
+        "Shortcut option: copy the URL below into Get Contents of URL. For long videos, add Encode Media first and send audio only."
+    ),
+    "journal.iphone_shortcut_guide_compact": (
+        "Share Sheet Shortcut:\n"
+        "1. Details: enable Show in Share Sheet / Use as Quick Action, receive files or media.\n"
+        "2. Get Contents of URL: Method POST, Request Body File, File = Shortcut Input.\n"
+        "Long videos: add Encode Media first, Audio Only, M4A."
     ),
     "journal.iphone_qr_failed": "QR preview is unavailable. Copy the Shortcut URL instead.",
     "journal.iphone_url_note": (
@@ -114,6 +216,8 @@ _EN: Dict[str, str] = {
         "3. Add \"Get Contents of URL\".\n"
         "4. Set URL to one upload URL above.\n"
         "5. Set Method to POST, Request Body to File, and the File value to Shortcut Input.\n\n"
+        "For long videos: add \"Encode Media\" before Get Contents of URL, turn on Audio Only, choose M4A, "
+        "then send the encoded media as the File value.\n\n"
         "Daily use: record video, tap Share, choose the Shortcut. If the PC IP changes, edit only the URL field."
     ),
     "journal.iphone_setup_guide": (
@@ -126,6 +230,8 @@ _EN: Dict[str, str] = {
         "3. Add \"Get Contents of URL\".\n"
         "4. Set URL to the Upload URL above.\n"
         "5. Set Method to POST, Request Body to File, and File to Shortcut Input.\n\n"
+        "For long videos: add \"Encode Media\" before Get Contents of URL, turn on Audio Only, choose M4A, "
+        "then send the encoded media as the File value.\n\n"
         "Daily use: record video, tap Share, choose the Shortcut. If the PC IP changes, update only the URL field. Files save to:\n{inbox}"
     ),
     "journal.transcribe_file_tooltip": (
@@ -134,20 +240,13 @@ _EN: Dict[str, str] = {
     ),
     "journal.transcribe_tooltip_busy": "Transcribing…",
     "journal.transcribe_tooltip_no_audio": "Record an audio first",
-    "journal.transcribe_tooltip_ok": (
-        "Transcribe previous recording to text.\nUses a small amount of API cost."
-    ),
-    "journal.transcribe_tooltip_busy_full": (
-        "Transcribing… ({pct}%)\nUses a small amount of API cost."
-    ),
+    "journal.transcribe_tooltip_ok": "Transcribe previous recording to text.",
+    "journal.transcribe_tooltip_busy_full": "Transcribing… ({pct}%)",
     "journal.transcribe_tooltip_wait_recording": "Finish recording before transcribing.",
-    "journal.transcribe_tooltip_prev_session": (
-        "Transcribe previous recording to text.\nUses a small amount of API cost."
-    ),
+    "journal.transcribe_tooltip_prev_session": "Transcribe previous recording to text.",
     "journal.transcribe_tooltip_archived": (
         "Transcribe the most recent saved recording in your Recording folder.\n"
-        "You will be asked to confirm before it is sent.\n"
-        "Uses a small amount of API cost."
+        "You will be asked to confirm before it starts."
     ),
     "journal.transcribe_tooltip_no_recording": (
         "No recording available. Record audio first, or add rcd*.wav files under:\n{dir}"
@@ -265,6 +364,10 @@ _EN: Dict[str, str] = {
     "status.startup_fail": "Could not update startup launch setting.",
     "status.startup_on": "Startup launch enabled.",
     "status.startup_off": "Startup launch disabled.",
+    "status.iphone_receive_on": "iPhone receiving enabled.",
+    "status.iphone_receive_off": "iPhone receiving disabled.",
+    "status.iphone_receive_save_fail": "Could not save iPhone receiving setting.",
+    "status.transcription_models_not_ready": "Transcription model manager is still loading.",
     "status.backup_mode": "Backup mode set to {mode}.",
     "status.backup_save_fail": "Could not save backup mode setting.",
     "status.backup_skip": "Manual backup skipped: nothing in daily_logs to back up.",
@@ -302,6 +405,8 @@ _ZH: Dict[str, str] = {
     "settings.lang.chinese": "中文",
     "settings.rename": "重命名",
     "settings.startup": "开机启动",
+    "settings.iphone_receive": "iPhone 接收",
+    "settings.transcription_models": "下载管理",
     "settings.theme": "窗口主题",
     "settings.backup": "备份",
     "settings.token": "令牌",
@@ -312,6 +417,7 @@ _ZH: Dict[str, str] = {
     "settings.manual": "立即备份",
     "settings.save": "保存",
     "settings.copy": "复制",
+    "settings.manage": "管理",
     "settings.start_menu_app": "应用",
     "settings.start_menu_journal": "日记",
     "settings.start_menu_reader": "阅读器",
@@ -349,6 +455,85 @@ _ZH: Dict[str, str] = {
     "journal.lang_label": "语言：",
     "journal.transcribe": "转写",
     "journal.transcribe_file": "转写文件",
+    "journal.transcription_model_title": "转写模型",
+    "journal.transcription_model_tooltip": "当前模型：{model}\n点击选择或管理转写模型。",
+    "journal.transcription_model_selected": "已选择转写模型：{model}",
+    "journal.transcription_model_busy": "请先结束当前录音或转写，再切换模型。",
+    "journal.transcription_model_download_confirm": (
+        "现在下载本地转写模型“{model}”吗？\n\n"
+        "首次下载会占用磁盘空间，并且可能需要一些时间。"
+    ),
+    "journal.transcription_model_downloading": "正在下载本地转写模型：{model}...",
+    "journal.transcription_model_uninstall": "卸载本地模型 - {model}",
+    "journal.transcription_model_uninstall_confirm": (
+        "卸载本地转写模型“{model}”吗？\n\n"
+        "之后可以重新下载。"
+    ),
+    "journal.transcription_state_selected": "已选择",
+    "journal.transcription_state_default": "默认",
+    "journal.transcription_state_ready": "可用",
+    "journal.transcription_state_api_key_required": "需要 API Key",
+    "journal.transcription_state_downloaded": "已下载",
+    "journal.transcription_state_not_downloaded": "未下载",
+    "journal.transcription_state_addon_required": "需要附加包",
+    "journal.local_addon_install": "安装本地转写附加包...",
+    "journal.local_addon_install_short": "下载",
+    "journal.local_addon_repair_short": "修复本地引擎",
+    "journal.local_addon_uninstall": "卸载本地转写附加包",
+    "journal.local_addon_uninstall_short": "移除附加包",
+    "journal.local_addon_uninstall_confirm": (
+        "卸载本地转写运行环境附加包吗？\n\n"
+        "已下载的本地模型会保留，但卸载后需要重新安装附加包才能使用本地转写。"
+    ),
+    "journal.local_addon_choose": "选择 DailyLoggerLocalTranscriptionAddon.zip",
+    "journal.local_addon_no_picker": "无法打开文件选择窗口。",
+    "journal.local_addon_installing": "正在安装本地转写附加包...",
+    "journal.local_addon_installed": "本地转写附加包已安装。",
+    "journal.local_addon_uninstalled": "本地转写附加包已移除。",
+    "journal.transcription_model_download": "下载",
+    "journal.transcription_model_use_default": "设为默认",
+    "journal.transcription_model_uninstall_short": "卸载",
+    "journal.transcription_add_api_key": "输入 API Key",
+    "journal.transcription_manage_models": "下载/管理免费模型...",
+    "download_manager.title": "下载管理",
+    "download_manager.transcription_tab": "转写",
+    "download_manager.media_tab": "媒体工具",
+    "download_manager.reader_tab": "阅读器",
+    "download_manager.install": "下载",
+    "download_manager.size_summary": "主程序 {base} | 已安装 addon {addons} | 可见模型 {visible_models} | 其他模型文件 {other_models} | 总计 {total}",
+    "download_manager.free_preview": "释放 {size}",
+    "download_manager.media_title": "媒体工具附加包",
+    "download_manager.media_stats": "视频/音频转换 | 预计 {size}",
+    "download_manager.media_note": "iPhone 视频、视频转音频、大媒体切分，以及部分语音备忘录格式需要此附加包。",
+    "download_manager.media_choose": "选择 DailyLoggerMediaToolsAddon.zip",
+    "download_manager.media_installing": "正在安装媒体工具附加包...",
+    "download_manager.media_installed": "媒体工具附加包已安装。",
+    "download_manager.media_uninstalled": "媒体工具附加包已移除。",
+    "download_manager.media_uninstall_confirm": "移除媒体工具附加包吗？\n\n移除后视频转换会不可用，直到重新安装。",
+    "download_manager.media_required_prompt": "这个文件需要媒体工具进行视频/音频转换。Daily Logger 已将文件保存为待处理。是否现在安装媒体工具？",
+    "download_manager.reader_title": "虚拟阅读器",
+    "download_manager.reader_stats": "内置阅读器资源 | {size}",
+    "download_manager.reader_note": "随 Daily Logger 一起安装，用于日记阅读体验。",
+    "download_manager.core_installed": "核心已安装",
+    "download_manager.other_models_title": "其他本地模型文件",
+    "download_manager.other_models_stats": "隐藏或旧版模型目录 | {size}",
+    "download_manager.other_models_note": "模型文件夹中未在上方显示为可选模型的文件。",
+    "download_manager.other_models_confirm": "移除这些隐藏或旧版模型文件吗？\n\n{names}",
+    "journal.transcription_manager_title": "下载管理",
+    "journal.transcription_manager_current": "当前默认：{model}",
+    "journal.transcription_manager_free_models": "免费本地模型",
+    "journal.transcription_manager_cloud_models": "云端模型",
+    "journal.transcription_manager_recommended": "（推荐）",
+    "journal.transcription_manager_local_stats": "{quality} | {speed} | {disk}",
+    "journal.transcription_manager_cloud_stats": "{quality} | {speed} | {cost}",
+    "journal.transcription_manager_cloud_note": "保持 Daily Logger 主程序小巧，需要 OpenAI API Key 和网络。",
+    "journal.transcription_setup_title": "还没有可用的转写模型",
+    "journal.transcription_setup_body": (
+        "要开始转写，请下载推荐的免费本地模型 Local - {model}，或输入 OpenAI API Key 使用云端转写。"
+    ),
+    "journal.transcription_setup_download": "下载 Local - {model}",
+    "journal.transcription_use_downloaded_confirm": "当前没有 API Key。是否使用 {model} 进行本次转写？",
+    "journal.transcription_use_cloud_confirm": "当前选择的本地模型还不可用。是否改用云端转写？",
     "journal.transcribe_file_tooltip": (
         "选择一个或多个音频/视频文件转写。\n"
         "文件会按时间从旧到新转写，支持应用 WAV 录音和 iPhone 视频。"
@@ -358,10 +543,18 @@ _ZH: Dict[str, str] = {
     "journal.iphone_inbox": "iPhone 收件箱",
     "journal.iphone_waiting": "等待 iPhone 上传...",
     "journal.iphone_received": "已收到 {count} 个 iPhone 文件，正在转写...",
+    "journal.iphone_incoming_status": "收到 iPhone 文件：{count}",
+    "journal.iphone_incoming_title": "收到新的转写文件",
+    "journal.iphone_incoming_body": "Daily Logger 收到 {count} 个文件：\n{names}\n\n点击接受后开始转写，或点击拒绝让它不进入日记。",
+    "journal.iphone_accept": "接受",
+    "journal.iphone_decline": "拒绝",
+    "journal.iphone_declined": "已拒绝 {count} 个 iPhone 文件。",
+    "journal.iphone_turn_off": "关闭 iPhone 接收",
     "journal.iphone_pending": "待处理 iPhone 文件：{count}",
     "journal.iphone_start_failed": "无法启动 iPhone 接收：{exc}",
     "journal.iphone_receive_tooltip": "启动 iPhone 上传接收器。",
     "journal.iphone_active_tooltip": "接收器正在运行，点击可停止。",
+    "journal.iphone_passive_tooltip": "接收器已在后台运行。点击显示二维码和快捷指令 URL。",
     "journal.iphone_upload_url": "上传 URL",
     "journal.iphone_wifi_url": "当前 Wi-Fi URL",
     "journal.iphone_computer_url": "电脑名称 URL",
@@ -375,6 +568,12 @@ _ZH: Dict[str, str] = {
     "journal.iphone_refresh_qr": "刷新二维码 / URL",
     "journal.iphone_qr_hint": "用 iPhone 扫二维码，选择视频或音频文件并发送到 Daily Logger。",
     "journal.iphone_simple_note": "快捷指令选项：稳定 Wi-Fi 下，把下面的 URL 复制到“获取 URL 内容”。",
+    "journal.iphone_shortcut_guide_compact": (
+        "共享快捷指令：\n"
+        "1. 详情：打开“在共享表单中显示”/“用作快速操作”，接收文件或媒体。\n"
+        "2. 获取 URL 内容：方法 POST，请求体 文件，文件 = 快捷指令输入。\n"
+        "长视频：前面加“编码媒体”，开启仅音频，格式 M4A。"
+    ),
     "journal.iphone_qr_failed": "二维码预览不可用。请改为复制快捷指令 URL。",
     "journal.iphone_url_note": (
         "如果 Wi-Fi 变化，点刷新 URL，然后只修改现有快捷指令里的 URL 字段。"
@@ -403,14 +602,13 @@ _ZH: Dict[str, str] = {
     ),
     "journal.transcribe_tooltip_busy": "正在转写…",
     "journal.transcribe_tooltip_no_audio": "请先录音",
-    "journal.transcribe_tooltip_ok": "将上一段录音转为文字。\n会产生少量 API 费用。",
-    "journal.transcribe_tooltip_busy_full": "正在转写…（{pct}%）\n会产生少量 API 费用。",
+    "journal.transcribe_tooltip_ok": "将上一段录音转为文字。",
+    "journal.transcribe_tooltip_busy_full": "正在转写…（{pct}%）",
     "journal.transcribe_tooltip_wait_recording": "请先结束录音再转写。",
-    "journal.transcribe_tooltip_prev_session": "将上一段录音转为文字。\n会产生少量 API 费用。",
+    "journal.transcribe_tooltip_prev_session": "将上一段录音转为文字。",
     "journal.transcribe_tooltip_archived": (
         "转写录音文件夹中最近保存的录音。\n"
-        "发送前会再确认。\n"
-        "会产生少量 API 费用。"
+        "开始前会再确认。"
     ),
     "journal.transcribe_tooltip_no_recording": "没有可用录音。请先录音，或将 rcd*.wav 放到：\n{dir}",
     "msg.journal_window": "日记窗口",
@@ -522,6 +720,10 @@ _ZH: Dict[str, str] = {
     "status.startup_fail": "无法更新开机启动设置。",
     "status.startup_on": "已开启开机启动。",
     "status.startup_off": "已关闭开机启动。",
+    "status.iphone_receive_on": "已开启 iPhone 接收。",
+    "status.iphone_receive_off": "已关闭 iPhone 接收。",
+    "status.iphone_receive_save_fail": "无法保存 iPhone 接收设置。",
+    "status.transcription_models_not_ready": "转写模型管理器仍在加载。",
     "status.backup_mode": "备份模式已设为 {mode}。",
     "status.backup_save_fail": "无法保存备份模式设置。",
     "status.backup_skip": "已跳过手动备份：daily_logs 中没有可备份内容。",
