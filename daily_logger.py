@@ -14,6 +14,7 @@ import atexit
 import json
 import os
 from pathlib import Path, PurePosixPath
+import queue
 import re
 import runpy
 import secrets
@@ -178,6 +179,15 @@ TRANSCRIPTION_CONTENT_TYPES = {
 IPHONE_IMPORT_TOKEN_PREF_KEY = "iphone_import_token"
 IPHONE_PASSIVE_RECEIVE_PREF_KEY = "iphone_passive_receive_enabled"
 TRANSCRIPTION_MODEL_PREF_KEY = "transcription_model"
+RECORD_SOURCE_PREF_KEY = "record_source_mode"
+RECORD_SOURCE_MIC = "mic"
+RECORD_SOURCE_COMPUTER = "computer"
+RECORD_SOURCE_BOTH = "both"
+RECORD_SOURCE_CHOICES = (
+    RECORD_SOURCE_BOTH,
+    RECORD_SOURCE_MIC,
+    RECORD_SOURCE_COMPUTER,
+)
 TRANSCRIPTION_MODEL_CLOUD = "cloud"
 TRANSCRIPTION_DEFAULT_MODEL = TRANSCRIPTION_MODEL_CLOUD
 _TRANSCRIPTION_CLOUD_MODEL_ORDER = [
@@ -652,6 +662,7 @@ def ensure_runtime_dependencies() -> bool:
     ]
     optional_specs: List[Tuple[str, str, str]] = [
         ("sounddevice", "sounddevice", "microphone recording for journal speech-to-text"),
+        ("soundcard", "soundcard", "Windows computer-audio recording for meetings"),
         ("numpy", "numpy", "audio buffers for journal speech-to-text"),
         ("tkcalendar", "tkcalendar", "calendar popup on the journal date field"),
     ]
@@ -1845,6 +1856,7 @@ def save_preferences(prefs: Dict[str, str]) -> bool:
 
 
 LOCAL_TRANSCRIPTION_ADDON_STAGE_PREFIX = "local_transcription_pending"
+LOCAL_TRANSCRIPTION_ADDON_VERSION = "helper-v4"
 LOCAL_TRANSCRIPTION_HELPER_EXE_NAME = "DailyLoggerLocalTranscriber.exe"
 LOCAL_TRANSCRIPTION_CURRENT_FILE = LOCAL_TRANSCRIPTION_ADDON_DIR / "current.json"
 MEDIA_TOOLS_ADDON_MARKER = MEDIA_TOOLS_ADDON_DIR / "addon.json"
@@ -1899,12 +1911,24 @@ def _local_helper_exe_in_dir(path: Path) -> Optional[Path]:
     return matches[0] if matches else None
 
 
-def _read_local_transcription_current() -> str:
+def _read_local_transcription_current_data() -> Dict[str, str]:
     try:
         data = json.loads(LOCAL_TRANSCRIPTION_CURRENT_FILE.read_text(encoding="utf-8"))
-        return str(data.get("runtime") or "").strip()
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items() if isinstance(k, str)}
     except Exception:
-        return ""
+        pass
+    return {}
+
+
+def _read_local_transcription_current() -> str:
+    data = _read_local_transcription_current_data()
+    return str(data.get("runtime") or "").strip()
+
+
+def _local_transcription_current_version() -> str:
+    data = _read_local_transcription_current_data()
+    return str(data.get("version") or "").strip()
 
 
 def _local_transcription_helper_path() -> Optional[Path]:
@@ -2037,6 +2061,16 @@ def ensure_local_transcription_runtime_loaded(force: bool = False) -> Tuple[bool
     helper = _local_transcription_helper_path()
     helper_key = str(helper.resolve()) if helper is not None else ""
     now = time.monotonic()
+    if helper is not None and getattr(sys, "frozen", False):
+        current_version = _local_transcription_current_version()
+        if current_version and current_version != LOCAL_TRANSCRIPTION_ADDON_VERSION:
+            _LOCAL_TRANSCRIPTION_HELPER_HEALTH.update({
+                "path": helper_key,
+                "time": now,
+                "ok": False,
+                "err": "Local transcription add-on needs an update.",
+            })
+            return False, "Local transcription add-on needs an update."
     if (
         not force
         and helper_key
@@ -2179,7 +2213,7 @@ def finalize_pending_local_transcription_addon() -> Tuple[bool, str]:
             runtimes.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             if runtimes:
                 LOCAL_TRANSCRIPTION_CURRENT_FILE.write_text(
-                    json.dumps({"runtime": runtimes[0].name, "version": "helper-v3"}, indent=2),
+                    json.dumps({"runtime": runtimes[0].name, "version": LOCAL_TRANSCRIPTION_ADDON_VERSION}, indent=2),
                     encoding="utf-8",
                 )
         return True, ""
@@ -2262,7 +2296,7 @@ def install_local_transcription_addon(zip_path: Path) -> Tuple[bool, str]:
             json.dumps(
                 {
                     "runtime": runtime_name,
-                    "version": "helper-v3",
+                    "version": LOCAL_TRANSCRIPTION_ADDON_VERSION,
                     "installed_at": datetime.now().isoformat(timespec="seconds"),
                 },
                 indent=2,
@@ -2392,6 +2426,38 @@ def get_selected_transcription_model_choice() -> str:
 def save_selected_transcription_model_choice(choice: str) -> bool:
     prefs = load_preferences()
     prefs[TRANSCRIPTION_MODEL_PREF_KEY] = normalize_transcription_model_choice(choice)
+    return save_preferences(prefs)
+
+
+def normalize_record_source_mode(value: str) -> str:
+    raw = (value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if raw in ("both", "record_both", "mic_computer", "mic_and_computer", "microphone_and_computer"):
+        return RECORD_SOURCE_BOTH
+    if raw in ("mic", "microphone", "microphone_only", "record_mic", "record_microphone"):
+        return RECORD_SOURCE_MIC
+    if raw in (
+        "computer",
+        "computer_audio",
+        "computer_only",
+        "system",
+        "system_audio",
+        "speaker",
+        "speakers",
+        "loopback",
+        "record_computer",
+    ):
+        return RECORD_SOURCE_COMPUTER
+    return RECORD_SOURCE_BOTH
+
+
+def get_selected_record_source_mode() -> str:
+    prefs = load_preferences()
+    return normalize_record_source_mode(prefs.get(RECORD_SOURCE_PREF_KEY, RECORD_SOURCE_BOTH))
+
+
+def save_selected_record_source_mode(mode: str) -> bool:
+    prefs = load_preferences()
+    prefs[RECORD_SOURCE_PREF_KEY] = normalize_record_source_mode(mode)
     return save_preferences(prefs)
 
 
@@ -4549,9 +4615,6 @@ def _transcribe_prepared_upload_local(
         "--cpu-threads",
         str(TRANSCRIPTION_LOCAL_CPU_THREADS),
     ]
-    if language is None:
-        helper_args.append("--auto-fallback-zh")
-
     ok, err_msg, last = _run_local_transcriber_json(
         helper_args,
         on_event=_event,
@@ -4967,20 +5030,47 @@ def write_mono_int16_wav(path: Path, samples: object, sample_rate: int) -> Optio
     return None
 
 
-def record_microphone_session_wav(
+def _put_latest_audio_block(audio_queue: "queue.Queue[Any]", block: Any) -> None:
+    try:
+        audio_queue.put_nowait(block)
+        return
+    except queue.Full:
+        pass
+    try:
+        audio_queue.get_nowait()
+    except queue.Empty:
+        pass
+    try:
+        audio_queue.put_nowait(block)
+    except queue.Full:
+        pass
+
+
+def _drain_latest_audio_block(audio_queue: "queue.Queue[Any]") -> Optional[Any]:
+    latest: Optional[Any] = None
+    while True:
+        try:
+            latest = audio_queue.get_nowait()
+        except queue.Empty:
+            return latest
+
+
+def record_sources_session_wav(
     output_path: Path,
     stop_event: threading.Event,
     *,
+    source_enabled_events: Dict[str, threading.Event],
     sample_rate: int = 16000,
     chunk_interval_sec: float = LIVE_STT_CHUNK_INTERVAL_SEC,
     on_audio_chunk: Optional[Callable[[Path], None]] = None,
     on_pcm_block: Optional[Callable[[Any], None]] = None,
     pause_event: Optional[threading.Event] = None,
+    on_source_error: Optional[Callable[[str, str], None]] = None,
 ) -> Optional[str]:
-    """Record mono WAV until stop_event.
+    """Record selected sources until stop_event and save one mixed mono WAV.
 
     Optional on_audio_chunk(path): periodic temp WAV paths for live STT (legacy).
-    Optional on_pcm_block(block): each captured block as int16 numpy array (mono); runs in the record thread.
+    Optional on_pcm_block(block): each mixed block as int16 numpy array (mono); runs in the record thread.
     Optional pause_event: while set, input is still read (to avoid device overrun) but not written to the
     output buffer and on_pcm_block is not called so metering/waveform can stay frozen until resumed.
     """
@@ -5000,48 +5090,199 @@ def record_microphone_session_wav(
     block_samples = (
         WAVEFORM_INPUT_BLOCK_SAMPLES if on_pcm_block is not None else 4096
     )
+    block_interval = max(0.02, block_samples / max(1, sample_rate))
+    source_stop = threading.Event()
+    source_queues: Dict[str, "queue.Queue[Any]"] = {
+        RECORD_SOURCE_MIC: queue.Queue(maxsize=12),
+        RECORD_SOURCE_COMPUTER: queue.Queue(maxsize=12),
+    }
+    source_threads: Dict[str, threading.Thread] = {}
+    source_errors: Dict[str, str] = {}
+    source_lock = threading.Lock()
+
+    def _source_enabled(source: str) -> bool:
+        evt = source_enabled_events.get(source)
+        return evt is not None and evt.is_set()
+
+    def _set_source_failed(source: str, err: str) -> None:
+        detail = (err or "").strip() or "Unknown error"
+        with source_lock:
+            if source in source_errors:
+                return
+            source_errors[source] = detail
+        evt = source_enabled_events.get(source)
+        if evt is not None:
+            evt.clear()
+        if on_source_error is not None:
+            try:
+                on_source_error(source, detail)
+            except Exception:
+                pass
+
+    def _normalize_input_block(data: Any) -> Any:
+        arr = np.asarray(data)
+        if arr.size == 0:
+            return np.zeros((0, 1), dtype=np.int16)
+        if arr.dtype != np.int16:
+            arr = arr.astype(np.int16)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        elif arr.ndim > 1 and arr.shape[1] > 1:
+            arr = np.mean(arr.astype(np.float64), axis=1).astype(np.int16).reshape(-1, 1)
+        return arr.reshape(-1, 1)
+
+    def _soundcard_float_block_to_int16(data: Any) -> Any:
+        arr = np.asarray(data, dtype=np.float32)
+        if arr.size == 0:
+            return np.zeros((0, 1), dtype=np.int16)
+        if arr.ndim == 1:
+            mono = arr
+        elif arr.shape[1] == 1:
+            mono = arr[:, 0]
+        else:
+            mono = np.mean(arr, axis=1)
+        mono = np.nan_to_num(mono, nan=0.0, posinf=0.0, neginf=0.0)
+        mono = np.clip(mono, -1.0, 1.0)
+        return (mono * 32767.0).astype(np.int16).reshape(-1, 1)
+
+    def _mic_capture_loop() -> None:
+        try:
+            with sd.InputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype=np.int16,
+                blocksize=block_samples,
+            ) as stream:
+                while not source_stop.is_set():
+                    data, _overflowed = stream.read(block_samples)
+                    block = _normalize_input_block(data)
+                    if block.size:
+                        _put_latest_audio_block(source_queues[RECORD_SOURCE_MIC], block.copy())
+        except Exception as exc:
+            _set_source_failed(RECORD_SOURCE_MIC, str(exc))
+
+    def _computer_capture_loop() -> None:
+        try:
+            import soundcard as sc
+        except Exception as exc:
+            _set_source_failed(
+                RECORD_SOURCE_COMPUTER,
+                "Install soundcard for Windows computer-audio recording. "
+                f"Details: {exc}",
+            )
+            return
+        try:
+            speaker = sc.default_speaker()
+            loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+            with loopback.recorder(
+                samplerate=sample_rate,
+                channels=1,
+                blocksize=block_samples,
+            ) as recorder:
+                while not source_stop.is_set():
+                    data = recorder.record(numframes=block_samples)
+                    block = _soundcard_float_block_to_int16(data)
+                    if block.size:
+                        _put_latest_audio_block(
+                            source_queues[RECORD_SOURCE_COMPUTER],
+                            block.copy(),
+                        )
+        except Exception as exc:
+            _set_source_failed(RECORD_SOURCE_COMPUTER, str(exc))
+
+    def _ensure_source_thread(source: str) -> None:
+        if source in source_threads or source in source_errors:
+            return
+        target = _mic_capture_loop if source == RECORD_SOURCE_MIC else _computer_capture_loop
+        thread = threading.Thread(target=target, daemon=True)
+        source_threads[source] = thread
+        thread.start()
+
+    def _enabled_source_names() -> List[str]:
+        return [
+            source
+            for source in (RECORD_SOURCE_MIC, RECORD_SOURCE_COMPUTER)
+            if _source_enabled(source)
+        ]
+
     try:
-        with sd.InputStream(
-            samplerate=sample_rate,
-            channels=1,
-            dtype=np.int16,
-            blocksize=block_samples,
-        ) as stream:
-            while not stop_event.is_set():
-                data, _overflowed = stream.read(block_samples)
-                if not data.size:
-                    continue
-                if pause_event is not None and pause_event.is_set():
-                    continue
-                frames.append(data.copy())
-                if on_pcm_block is not None:
+        while not stop_event.is_set():
+            active_sources = _enabled_source_names()
+            if not active_sources:
+                if source_errors:
+                    break
+                time.sleep(0.05)
+                continue
+            for source in active_sources:
+                _ensure_source_thread(source)
+
+            blocks: List[Any] = []
+            for source in active_sources:
+                block = _drain_latest_audio_block(source_queues[source])
+                if block is None:
                     try:
-                        on_pcm_block(data.copy())
-                    except Exception:
-                        pass
-                if on_audio_chunk is not None:
-                    now = time.monotonic()
-                    if now >= next_chunk_at and frames:
-                        big = np.concatenate(frames, axis=0)
-                        delta = big[last_flushed_samples:]
-                        if delta.size >= LIVE_STT_MIN_CHUNK_SAMPLES:
-                            fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="stt_chunk_")
-                            os.close(fd)
-                            chunk_path = Path(tmp_name)
-                            werr = write_mono_int16_wav(chunk_path, delta, sample_rate)
-                            if werr is None:
-                                on_audio_chunk(chunk_path)
-                                last_flushed_samples = int(big.shape[0])
-                            else:
-                                try:
-                                    chunk_path.unlink(missing_ok=True)
-                                except OSError:
-                                    pass
-                        next_chunk_at = now + chunk_interval_sec
+                        block = source_queues[source].get(timeout=block_interval * 0.75)
+                    except queue.Empty:
+                        block = None
+                if block is not None:
+                    normalized = _normalize_input_block(block)
+                    if normalized.size:
+                        blocks.append(normalized)
+            if not blocks:
+                time.sleep(block_interval * 0.25)
+                continue
+
+            max_len = max(int(block.shape[0]) for block in blocks)
+            mixed = np.zeros(max_len, dtype=np.float64)
+            for block in blocks:
+                flat = block.reshape(-1).astype(np.float64)
+                if flat.shape[0] < max_len:
+                    padded = np.zeros(max_len, dtype=np.float64)
+                    padded[: flat.shape[0]] = flat
+                    flat = padded
+                mixed += flat
+            if len(blocks) > 1:
+                mixed /= float(len(blocks))
+            mixed_block = np.clip(mixed, -32768, 32767).astype(np.int16).reshape(-1, 1)
+
+            if pause_event is not None and pause_event.is_set():
+                continue
+            frames.append(mixed_block.copy())
+            if on_pcm_block is not None:
+                try:
+                    on_pcm_block(mixed_block.copy())
+                except Exception:
+                    pass
+            if on_audio_chunk is not None:
+                now = time.monotonic()
+                if now >= next_chunk_at and frames:
+                    big = np.concatenate(frames, axis=0)
+                    delta = big[last_flushed_samples:]
+                    if delta.size >= LIVE_STT_MIN_CHUNK_SAMPLES:
+                        fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="stt_chunk_")
+                        os.close(fd)
+                        chunk_path = Path(tmp_name)
+                        werr = write_mono_int16_wav(chunk_path, delta, sample_rate)
+                        if werr is None:
+                            on_audio_chunk(chunk_path)
+                            last_flushed_samples = int(big.shape[0])
+                        else:
+                            try:
+                                chunk_path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                    next_chunk_at = now + chunk_interval_sec
     except Exception as exc:
         return str(exc)
+    finally:
+        source_stop.set()
+        for thread in list(source_threads.values()):
+            if thread.is_alive():
+                thread.join(timeout=1.0)
 
     if not frames:
+        if source_errors:
+            return "; ".join(f"{source}: {err}" for source, err in source_errors.items())
         return "No audio captured."
 
     audio = np.concatenate(frames, axis=0)
@@ -5049,6 +5290,30 @@ def record_microphone_session_wav(
     if werr is not None:
         return werr
     return None
+
+
+def record_microphone_session_wav(
+    output_path: Path,
+    stop_event: threading.Event,
+    *,
+    sample_rate: int = 16000,
+    chunk_interval_sec: float = LIVE_STT_CHUNK_INTERVAL_SEC,
+    on_audio_chunk: Optional[Callable[[Path], None]] = None,
+    on_pcm_block: Optional[Callable[[Any], None]] = None,
+    pause_event: Optional[threading.Event] = None,
+) -> Optional[str]:
+    mic_event = threading.Event()
+    mic_event.set()
+    return record_sources_session_wav(
+        output_path,
+        stop_event,
+        source_enabled_events={RECORD_SOURCE_MIC: mic_event},
+        sample_rate=sample_rate,
+        chunk_interval_sec=chunk_interval_sec,
+        on_audio_chunk=on_audio_chunk,
+        on_pcm_block=on_pcm_block,
+        pause_event=pause_event,
+    )
 
 
 def generate_journal_report_from_sources(
@@ -5849,11 +6114,23 @@ def open_journal_window_editor(
         cursor="xterm",
     )
     stt_saved_path_entry.grid(row=0, column=1, sticky="ew", padx=(14, 8))
+    stt_saved_path_full_text: Dict[str, str] = {"text": ""}
 
     def _set_stt_saved_path_display(text: str) -> None:
+        raw = str(text or "")
+        stt_saved_path_full_text["text"] = raw
+        display = raw
+        match = re.search(r"([A-Za-z]:\\[^\n]+)$", raw.strip())
+        if match:
+            path_text = match.group(1).strip()
+            path_name = Path(path_text).name
+            if path_name:
+                display = raw[: match.start(1)] + path_name
         stt_saved_path_entry.config(state="normal")
-        stt_saved_path_var.set(text)
+        stt_saved_path_var.set(display)
         stt_saved_path_entry.config(state="readonly")
+
+    bind_hover_tooltip(stt_saved_path_entry, lambda: stt_saved_path_full_text["text"])
 
     def open_journal_recording_folder() -> None:
         try:
@@ -5891,7 +6168,7 @@ def open_journal_window_editor(
 
     stt_top = tk.Frame(stt_outer, bg=t_init.panel, bd=0, highlightthickness=0)
     stt_top.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-    stt_top.grid_columnconfigure(5, weight=1)
+    stt_top.grid_columnconfigure(4, weight=1)
     lang_var = tk.StringVar(value="Auto")
 
     stt_status = tk.Label(
@@ -5909,13 +6186,13 @@ def open_journal_window_editor(
         lang_combo = ttk.Combobox(
             stt_top,
             textvariable=lang_var,
-            values=("Auto", "English", "ç®€ä½“ä¸­æ–‡"),
+            values=("Auto", "English", "\u7b80\u4f53\u4e2d\u6587"),
             state="readonly",
             width=11,
             style="Journal.TCombobox",
         )
     else:
-        lang_combo = tk.OptionMenu(stt_top, lang_var, "Auto", "English", "ç®€ä½“ä¸­æ–‡")
+        lang_combo = tk.OptionMenu(stt_top, lang_var, "Auto", "English", "\u7b80\u4f53\u4e2d\u6587")
         lang_combo.config(bg=t_init.panel, fg=t_init.text, highlightthickness=0)
 
     stt_frame = tk.Frame(stt_outer, bg=t_init.panel, bd=0, highlightthickness=0)
@@ -5970,8 +6247,30 @@ def open_journal_window_editor(
     transcribe_hover = tk.Frame(stt_frame, bg=t_init.panel)
     transcribe_hover.grid(row=1, column=2, sticky="ns", padx=(2, 10), pady=(4, 10))
     _tid = t_init.transcribe_idle_disabled_config()
+    transcription_model_combo_map: Dict[str, str] = {}
+    transcription_model_selector_is_combo = False
+
+    def _make_transcription_model_selector(parent: Any, variable: Any) -> Any:
+        return tk.Button(
+            parent,
+            text="▼",
+            state="normal",
+            width=3,
+            bg=_tid[0],
+            fg=_tid[1],
+            activebackground=_tid[2],
+            activeforeground=_tid[3],
+            disabledforeground=_tid[4],
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=0,
+            pady=8,
+            cursor="hand2",
+        )
+
     transcribe_btn_row = tk.Frame(transcribe_hover, bg=t_init.panel)
-    transcribe_btn_row.pack()
+    transcribe_btn_row.pack(fill="x")
+    transcribe_btn_row.grid_columnconfigure(0, weight=1)
     transcribe_btn = tk.Button(
         transcribe_btn_row,
         text="Transcribe",
@@ -5988,26 +6287,16 @@ def open_journal_window_editor(
         pady=8,
         cursor="hand2",
     )
-    transcribe_btn.pack(side="left")
-    transcribe_model_btn = tk.Button(
+    transcribe_btn.grid(row=0, column=0, sticky="ew")
+    transcribe_model_var = tk.StringVar(value="Model")
+    transcribe_model_btn = _make_transcription_model_selector(
         transcribe_btn_row,
-        text="v",
-        state="normal",
-        width=2,
-        bg=_tid[0],
-        fg=_tid[1],
-        activebackground=_tid[2],
-        activeforeground=_tid[3],
-        disabledforeground=_tid[4],
-        relief="flat",
-        font=("Segoe UI", 9, "bold"),
-        padx=0,
-        pady=8,
-        cursor="hand2",
+        transcribe_model_var,
     )
-    transcribe_model_btn.pack(side="left", padx=(2, 0))
+    transcribe_model_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0))
     transcribe_file_btn_row = tk.Frame(transcribe_hover, bg=t_init.panel)
-    transcribe_file_btn_row.pack(pady=(6, 0))
+    transcribe_file_btn_row.pack(fill="x", pady=(6, 0))
+    transcribe_file_btn_row.grid_columnconfigure(0, weight=1)
     transcribe_file_btn = tk.Button(
         transcribe_file_btn_row,
         text="Transcribe File",
@@ -6024,29 +6313,21 @@ def open_journal_window_editor(
         pady=8,
         cursor="hand2",
     )
-    transcribe_file_btn.pack(side="left")
-    transcribe_file_model_btn = tk.Button(
+    transcribe_file_btn.grid(row=0, column=0, sticky="ew")
+    transcribe_file_model_var = tk.StringVar(value="Model")
+    transcribe_file_model_btn = _make_transcription_model_selector(
         transcribe_file_btn_row,
-        text="v",
-        state="normal",
-        width=2,
-        bg=_tid[0],
-        fg=_tid[1],
-        activebackground=_tid[2],
-        activeforeground=_tid[3],
-        disabledforeground=_tid[4],
-        relief="flat",
-        font=("Segoe UI", 9, "bold"),
-        padx=0,
-        pady=8,
-        cursor="hand2",
+        transcribe_file_model_var,
     )
-    transcribe_file_model_btn.pack(side="left", padx=(2, 0))
+    transcribe_file_model_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0))
+    receive_iphone_btn_row = tk.Frame(transcribe_hover, bg=t_init.panel)
+    receive_iphone_btn_row.pack(fill="x", pady=(6, 0))
+    receive_iphone_btn_row.grid_columnconfigure(0, weight=1)
     receive_iphone_btn = tk.Button(
-        transcribe_hover,
+        receive_iphone_btn_row,
         text="Receive from iPhone",
         state="normal",
-        width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+        width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH - 3,
         bg=_tid[0],
         fg=_tid[1],
         activebackground=_tid[2],
@@ -6058,7 +6339,7 @@ def open_journal_window_editor(
         pady=8,
         cursor="hand2",
     )
-    receive_iphone_btn.pack(pady=(6, 0))
+    receive_iphone_btn.grid(row=0, column=0, columnspan=2, sticky="ew")
     stt_box.insert("1.0", draft_speech)
 
     report_outer = tk.Frame(right_col, bg=t_init.surface)
@@ -8693,8 +8974,11 @@ def open_journal_window_editor(
 
     record_stop = threading.Event()
     record_pause = threading.Event()
+    record_mic_enabled = threading.Event()
+    record_computer_enabled = threading.Event()
     record_thread_holder: Dict[str, object] = {"thread": None}
     record_path_holder: Dict[str, object] = {"path": None}
+    record_source_mode: Dict[str, str] = {"value": get_selected_record_source_mode()}
     recording_ui_busy = {"v": False}
     recording_background_mode = {"v": False}
     record_close_requested = {"v": False}
@@ -9850,6 +10134,10 @@ def open_journal_window_editor(
             _refresh_transcription_model_manager_window()
         except NameError:
             pass
+        try:
+            _refresh_transcription_model_selectors()
+        except NameError:
+            pass
 
     def _install_local_addon(on_success: Optional[Callable[[], None]] = None) -> None:
         if transcription_model_download_busy["v"] or transcribing_busy["v"] or recording_ui_busy["v"]:
@@ -10904,9 +11192,9 @@ def open_journal_window_editor(
         selected = normalize_transcription_model_choice(transcription_model_choice["value"])
         for cloud_name in TRANSCRIPTION_CLOUD_MODEL_NAMES:
             cloud_choice = normalize_transcription_model_choice(f"cloud:{cloud_name}")
-            cloud_suffix = tr("journal.transcription_state_default") if selected == cloud_choice else ""
+            cloud_prefix = "[x] " if selected == cloud_choice else "    "
             menu.add_command(
-                label=f"{_transcription_model_display(cloud_choice)} {cloud_suffix}".strip(),
+                label=f"{cloud_prefix}{_transcription_model_display(cloud_choice)}",
                 command=lambda c=cloud_choice: _set_transcription_model_choice(c),
             )
         downloaded_choices = [
@@ -10918,9 +11206,9 @@ def open_journal_window_editor(
             menu.add_separator()
         for model_name in downloaded_choices:
             choice = f"local:{model_name}"
-            suffix = tr("journal.transcription_state_default") if selected == choice else ""
+            prefix = "[x] " if selected == choice else "    "
             menu.add_command(
-                label=f"{_transcription_model_display(choice)} {suffix}".strip(),
+                label=f"{prefix}{_transcription_model_display(choice)}",
                 command=lambda c=choice: _set_transcription_model_choice(c),
             )
         menu.add_separator()
@@ -10935,6 +11223,66 @@ def open_journal_window_editor(
                 menu.grab_release()
             except tk.TclError:
                 pass
+
+    def _transcription_model_selector_label() -> str:
+        return tr("journal.transcription_model_short")
+
+    def _transcription_model_selector_entries() -> List[Tuple[str, str]]:
+        selected = normalize_transcription_model_choice(transcription_model_choice["value"])
+        entries: List[Tuple[str, str]] = []
+        for cloud_name in TRANSCRIPTION_CLOUD_MODEL_NAMES:
+            cloud_choice = normalize_transcription_model_choice(f"cloud:{cloud_name}")
+            suffix = tr("journal.transcription_state_default") if selected == cloud_choice else ""
+            entries.append(
+                (
+                    f"{_transcription_model_display(cloud_choice)} {suffix}".strip(),
+                    cloud_choice,
+                )
+            )
+        for model_name in downloaded_local_transcription_model_names():
+            if not local_transcription_model_is_downloaded(model_name):
+                continue
+            choice = f"local:{model_name}"
+            suffix = tr("journal.transcription_state_default") if selected == choice else ""
+            entries.append(
+                (
+                    f"{_transcription_model_display(choice)} {suffix}".strip(),
+                    choice,
+                )
+            )
+        entries.append((tr("journal.transcription_manage_models"), "__manage__"))
+        return entries
+
+    def _refresh_transcription_model_selectors() -> None:
+        if not transcription_model_selector_is_combo:
+            return
+        transcription_model_combo_map.clear()
+        values: List[str] = []
+        for label, action in _transcription_model_selector_entries():
+            transcription_model_combo_map[label] = action
+            values.append(label)
+        if not values:
+            values = [_transcription_model_selector_label()]
+        for widget, var in (
+            (transcribe_model_btn, transcribe_model_var),
+            (transcribe_file_model_btn, transcribe_file_model_var),
+        ):
+            try:
+                widget.config(values=tuple(values))
+                var.set(_transcription_model_selector_label())
+            except tk.TclError:
+                pass
+
+    def _on_transcription_model_selector_change(variable: Any) -> None:
+        label = str(variable.get() or "")
+        action = transcription_model_combo_map.get(label, "")
+        variable.set(_transcription_model_selector_label())
+        if not action:
+            return
+        if action == "__manage__":
+            _open_transcription_downloads_manager("transcription")
+            return
+        _set_transcription_model_choice(action)
 
     transcription_setup_prompt_window: Dict[str, Any] = {"win": None}
 
@@ -11064,8 +11412,9 @@ def open_journal_window_editor(
     def update_transcribe_ui() -> None:
         t = th()
         _update_iphone_receive_button()
+        _refresh_transcription_model_selectors()
 
-        for row in (transcribe_btn_row, transcribe_file_btn_row):
+        for row in (transcribe_btn_row, transcribe_file_btn_row, receive_iphone_btn_row):
             row.configure(bg=t.panel)
 
         def _set_model_buttons_enabled(enabled: bool) -> None:
@@ -11074,13 +11423,16 @@ def open_journal_window_editor(
             if not enabled:
                 bg, fg, abg, afg, _dfg = t.transcribe_idle_disabled_config()
             for btn in (transcribe_model_btn, transcribe_file_model_btn):
-                btn.config(
-                    state=state,
-                    bg=bg,
-                    fg=fg,
-                    activebackground=abg,
-                    activeforeground=afg,
-                )
+                if transcription_model_selector_is_combo:
+                    btn.config(state="readonly" if enabled else "disabled")
+                else:
+                    btn.config(
+                        state=state,
+                        bg=bg,
+                        fg=fg,
+                        activebackground=abg,
+                        activeforeground=afg,
+                    )
 
         def _set_transcribe_file_button_enabled(enabled: bool) -> None:
             if enabled:
@@ -11718,10 +12070,22 @@ def open_journal_window_editor(
 
     transcribe_btn.config(command=run_transcribe)
     transcribe_file_btn.config(command=run_transcribe_file)
-    transcribe_model_btn.config(command=lambda: _show_transcription_model_menu(transcribe_model_btn))
-    transcribe_file_model_btn.config(
-        command=lambda: _show_transcription_model_menu(transcribe_file_model_btn)
-    )
+    if transcription_model_selector_is_combo:
+        transcribe_model_btn.bind(
+            "<<ComboboxSelected>>",
+            lambda _evt: _on_transcription_model_selector_change(transcribe_model_var),
+        )
+        transcribe_file_model_btn.bind(
+            "<<ComboboxSelected>>",
+            lambda _evt: _on_transcription_model_selector_change(transcribe_file_model_var),
+        )
+    else:
+        transcribe_model_btn.config(
+            command=lambda: _show_transcription_model_menu(transcribe_model_btn)
+        )
+        transcribe_file_model_btn.config(
+            command=lambda: _show_transcription_model_menu(transcribe_file_model_btn)
+        )
     receive_iphone_btn.config(command=toggle_iphone_receiver)
     bind_hover_tooltip(transcribe_btn, transcribe_tooltip_text)
     bind_hover_tooltip(transcribe_file_btn, transcribe_file_tooltip_text)
@@ -11784,13 +12148,14 @@ def open_journal_window_editor(
         lambda: th().hover_primary,
         lambda: "white",
     )
-    for _model_btn in (transcribe_model_btn, transcribe_file_model_btn):
-        bind_button_hover_if_enabled(
-            _model_btn,
-            transcribe_model_rest_style,
-            lambda: th().hover_primary,
-            lambda: "white",
-        )
+    if not transcription_model_selector_is_combo:
+        for _model_btn in (transcribe_model_btn, transcribe_file_model_btn):
+            bind_button_hover_if_enabled(
+                _model_btn,
+                transcribe_model_rest_style,
+                lambda: th().hover_primary,
+                lambda: "white",
+            )
     bind_button_hover_if_enabled(
         receive_iphone_btn,
         receive_iphone_rest_style,
@@ -11798,6 +12163,122 @@ def open_journal_window_editor(
         lambda: "white",
     )
     update_transcribe_ui()
+
+    def _record_source_label(mode: str) -> str:
+        normalized = normalize_record_source_mode(mode)
+        if normalized == RECORD_SOURCE_MIC:
+            return tr("journal.rec.source.mic")
+        if normalized == RECORD_SOURCE_COMPUTER:
+            return tr("journal.rec.source.computer")
+        return tr("journal.rec.source.both")
+
+    def _record_source_mode_from_label(label: str) -> str:
+        text = (label or "").strip()
+        for mode in RECORD_SOURCE_CHOICES:
+            if text == _record_source_label(mode):
+                return mode
+        return normalize_record_source_mode(text)
+
+    def _record_mode_from_enabled_events() -> str:
+        mic_on = record_mic_enabled.is_set()
+        computer_on = record_computer_enabled.is_set()
+        if mic_on and computer_on:
+            return RECORD_SOURCE_BOTH
+        if computer_on:
+            return RECORD_SOURCE_COMPUTER
+        return RECORD_SOURCE_MIC
+
+    def _record_source_status_text() -> str:
+        mode = _record_mode_from_enabled_events() if recording_ui_busy["v"] else record_source_mode["value"]
+        return tr("journal.status.recording_sources").format(sources=_record_source_label(mode))
+
+    def _refresh_record_source_selector() -> None:
+        mode = _record_mode_from_enabled_events() if recording_ui_busy["v"] else record_source_mode["value"]
+        try:
+            record_source_var.set(_record_source_label(mode))
+            record_source_combo.config(text="▼")
+        except Exception:
+            pass
+
+    def _apply_record_source_mode(mode: str, *, persist: bool = True, update_status: bool = True) -> None:
+        normalized = normalize_record_source_mode(mode)
+        if normalized in (RECORD_SOURCE_BOTH, RECORD_SOURCE_MIC):
+            record_mic_enabled.set()
+        else:
+            record_mic_enabled.clear()
+        if normalized in (RECORD_SOURCE_BOTH, RECORD_SOURCE_COMPUTER):
+            record_computer_enabled.set()
+        else:
+            record_computer_enabled.clear()
+        if not record_mic_enabled.is_set() and not record_computer_enabled.is_set():
+            record_mic_enabled.set()
+            normalized = RECORD_SOURCE_MIC
+            try:
+                messagebox.showinfo("Speech to text", tr("journal.rec.source_guard"))
+            except Exception:
+                pass
+        record_source_mode["value"] = normalized
+        if persist:
+            save_selected_record_source_mode(normalized)
+        _refresh_record_source_selector()
+        if update_status and recording_ui_busy["v"] and not record_pause.is_set():
+            try:
+                stt_status.config(text=_record_source_status_text())
+            except tk.TclError:
+                pass
+
+    def _on_record_source_selected(_evt: Optional[Any] = None) -> None:
+        _apply_record_source_mode(
+            _record_source_mode_from_label(record_source_var.get()),
+            persist=True,
+            update_status=True,
+        )
+
+    def _show_record_source_menu(anchor: Any) -> None:
+        menu = tk.Menu(anchor, tearoff=0)
+        current = _record_mode_from_enabled_events() if recording_ui_busy["v"] else record_source_mode["value"]
+        for mode in RECORD_SOURCE_CHOICES:
+            prefix = "[x] " if normalize_record_source_mode(mode) == normalize_record_source_mode(current) else "    "
+            menu.add_command(
+                label=f"{prefix}{_record_source_label(mode)}",
+                command=lambda m=mode: _apply_record_source_mode(
+                    m,
+                    persist=True,
+                    update_status=True,
+                ),
+            )
+        try:
+            menu.tk_popup(anchor.winfo_rootx(), anchor.winfo_rooty() + anchor.winfo_height())
+        finally:
+            try:
+                menu.grab_release()
+            except tk.TclError:
+                pass
+
+    def _on_record_source_error_from_worker(source: str, detail: str) -> None:
+        def _ui() -> None:
+            if source == RECORD_SOURCE_COMPUTER:
+                msg = tr("journal.status.computer_audio_unavailable")
+            elif source == RECORD_SOURCE_MIC:
+                msg = tr("journal.status.mic_unavailable")
+            else:
+                msg = tr("journal.status.source_unavailable").format(source=source)
+            _refresh_record_source_selector()
+            _publish_console_update(
+                f"{msg} {detail}".strip(),
+                key=f"record:source:{source}:failed",
+            )
+            if recording_ui_busy["v"] and not recording_background_mode["v"]:
+                try:
+                    stt_status.config(text=msg)
+                except tk.TclError:
+                    pass
+
+        try:
+            root.after(0, _ui)
+        except tk.TclError:
+            pass
+
     def _startup_iphone_receiver_and_pending() -> None:
         if iphone_passive_receive_enabled():
             start_iphone_receiver(show_setup=False, passive=True)
@@ -11934,7 +12415,7 @@ def open_journal_window_editor(
         choice = lang_var.get().strip()
         if choice == "English":
             return "en"
-        if choice in ("ç®€ä½“ä¸­æ–‡", "ä¸­æ–‡", "Chinese"):
+        if choice in ("\u7b80\u4f53\u4e2d\u6587", "\u4e2d\u6587", "Chinese"):
             return "zh"
         return None
 
@@ -12131,13 +12612,18 @@ def open_journal_window_editor(
         update_transcribe_ui()
 
     def record_worker_main(wav_path: Path) -> None:
-        err = record_microphone_session_wav(
+        err = record_sources_session_wav(
             wav_path,
             record_stop,
+            source_enabled_events={
+                RECORD_SOURCE_MIC: record_mic_enabled,
+                RECORD_SOURCE_COMPUTER: record_computer_enabled,
+            },
             chunk_interval_sec=LIVE_STT_CHUNK_INTERVAL_SEC,
             on_audio_chunk=None,
             on_pcm_block=(None if recording_background_mode["v"] else on_pcm_block_journal),
             pause_event=record_pause,
+            on_source_error=_on_record_source_error_from_worker,
         )
         if record_close_requested["v"]:
             if err is None and wav_path.exists():
@@ -12154,7 +12640,8 @@ def open_journal_window_editor(
     def start_recording(*, background: bool = False) -> bool:
         if recording_ui_busy["v"]:
             return False
-        fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="journal_mic_")
+        _apply_record_source_mode(record_source_mode["value"], persist=False, update_status=False)
+        fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="journal_recording_")
         os.close(fd)
         tmp = Path(tmp_name)
         record_path_holder["path"] = tmp
@@ -12182,7 +12669,7 @@ def open_journal_window_editor(
             lang_combo.config(state="disabled")
         else:
             lang_combo.config(state="disabled")
-        stt_status.config(text=tr("journal.status.recording"))
+        stt_status.config(text=_record_source_status_text())
         th = threading.Thread(target=record_worker_main, args=(tmp,), daemon=True)
         record_thread_holder["thread"] = th
         th.start()
@@ -12219,13 +12706,14 @@ def open_journal_window_editor(
         if record_pause.is_set():
             record_pause.clear()
             pause_rec_button.config(text=tr("journal.rec.pause"))
-            stt_status.config(text=tr("journal.status.recording"))
+            stt_status.config(text=_record_source_status_text())
         else:
             record_pause.set()
             pause_rec_button.config(text=tr("journal.rec.resume"))
             stt_status.config(text=tr("journal.status.paused"))
 
     _sr_bg, _sr_fg, _sr_abg, _sr_afg = t_init.side_action_config()
+    record_source_var = tk.StringVar(value=_record_source_label(record_source_mode["value"]))
     start_rec_button = tk.Button(
         stt_top,
         text="Start recording",
@@ -12237,6 +12725,21 @@ def open_journal_window_editor(
         relief="flat",
         font=("Segoe UI", 9, "bold"),
         padx=10,
+        pady=6,
+        cursor="hand2",
+    )
+    record_source_combo = tk.Button(
+        stt_top,
+        text="▼",
+        command=lambda: _show_record_source_menu(record_source_combo),
+        width=3,
+        bg=_sr_bg,
+        fg=_sr_fg,
+        activebackground=_sr_abg,
+        activeforeground=_sr_afg,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=4,
         pady=6,
         cursor="hand2",
     )
@@ -12261,8 +12764,9 @@ def open_journal_window_editor(
     _journal_rec_btn_set(pause_rec_button, False)
     _journal_rec_btn_set(stop_rec_button, False)
     start_rec_button.grid(row=0, column=0, sticky="w", padx=(12, 4), pady=8)
-    pause_rec_button.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=8)
-    stop_rec_button.grid(row=0, column=2, sticky="w", padx=(0, 8), pady=8)
+    record_source_combo.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=8)
+    pause_rec_button.grid(row=0, column=2, sticky="w", padx=(0, 4), pady=8)
+    stop_rec_button.grid(row=0, column=3, sticky="w", padx=(0, 8), pady=8)
 
     def rec_primary_rest(btn: Any) -> Tuple[str, str, str, str, str]:
         t = th()
@@ -12278,6 +12782,20 @@ def open_journal_window_editor(
         lambda: th().hover_primary,
         lambda: "white",
     )
+    bind_hover_tooltip(
+        record_source_combo,
+        lambda: _record_source_label(
+            _record_mode_from_enabled_events()
+            if recording_ui_busy["v"]
+            else record_source_mode["value"]
+        ),
+    )
+    bind_button_hover_if_enabled(
+        record_source_combo,
+        lambda b=record_source_combo: rec_primary_rest(b),
+        lambda: th().hover_primary,
+        lambda: "white",
+    )
     bind_button_hover_if_enabled(
         pause_rec_button,
         lambda b=pause_rec_button: rec_primary_rest(b),
@@ -12290,7 +12808,7 @@ def open_journal_window_editor(
         lambda: th().hover_primary,
         lambda: "white",
     )
-    stt_status.grid(row=0, column=3, sticky="ew", padx=(4, 12), pady=8)
+    stt_status.grid(row=0, column=4, sticky="ew", padx=(4, 12), pady=8)
     stt_lang_lbl = tk.Label(
         stt_top,
         text="Language:",
@@ -12298,8 +12816,8 @@ def open_journal_window_editor(
         fg=t_init.muted,
         font=("Segoe UI", 9),
     )
-    stt_lang_lbl.grid(row=0, column=4, sticky="w", padx=(4, 0), pady=8)
-    lang_combo.grid(row=0, column=5, sticky="ew", padx=(8, 12), pady=8)
+    stt_lang_lbl.grid(row=0, column=5, sticky="w", padx=(4, 0), pady=8)
+    lang_combo.grid(row=0, column=6, sticky="ew", padx=(8, 12), pady=8)
 
     report_progress_state: Dict[str, object] = {
         "busy": False,
@@ -12600,23 +13118,43 @@ def open_journal_window_editor(
             console_history.append(raw)
         console_hist_index["value"] = len(console_history)
         cmd = raw.upper()
-        if cmd in {"RC", "RECORD"}:
-            if transcribing_busy["v"]:
-                console_append("Finish the current transcription before starting a background recording.")
-                return
-            if recording_ui_busy["v"]:
-                console_append("Recording is already running. Type RECORD STOP or rs to stop it.")
-                return
-            if start_recording(background=True):
-                console_append("Background recording started. Type RECORD STOP or rs to stop and save it.")
-            else:
-                console_append("Could not start background recording.")
-            return
+        cmd_parts = cmd.split()
         if cmd in {"RS", "RECORD STOP", "RECORDSTOP"}:
             if stop_recording():
                 console_append("Stopping recording; it will save to the Recording folder.")
             else:
                 console_append("No active recording to stop.")
+            return
+
+        record_start_mode = ""
+        if cmd == "RC":
+            record_start_mode = record_source_mode["value"]
+        elif cmd == "RECORD":
+            record_start_mode = record_source_mode["value"]
+        elif len(cmd_parts) == 2 and cmd_parts[0] == "RECORD":
+            requested_source = cmd_parts[1]
+            if requested_source in {"MIC", "MICROPHONE"}:
+                record_start_mode = RECORD_SOURCE_MIC
+            elif requested_source in {"COMPUTER", "COMPUTERAUDIO", "SYSTEM", "SYSTEMAUDIO", "PC"}:
+                record_start_mode = RECORD_SOURCE_COMPUTER
+            elif requested_source in {"BOTH", "ALL"}:
+                record_start_mode = RECORD_SOURCE_BOTH
+        if record_start_mode:
+            if transcribing_busy["v"]:
+                console_append("Finish the current transcription before starting a background recording.")
+                return
+            if recording_ui_busy["v"]:
+                _apply_record_source_mode(record_start_mode, persist=True, update_status=True)
+                console_append(f"Recording source changed to {_record_source_label(record_start_mode)}.")
+                return
+            _apply_record_source_mode(record_start_mode, persist=True, update_status=False)
+            if start_recording(background=True):
+                console_append(
+                    f"Background recording started: {_record_source_label(record_start_mode)}. "
+                    "Type RECORD STOP or rs to stop and save it."
+                )
+            else:
+                console_append("Could not start background recording.")
             return
         if bool(js_gui_state.get("active")):
             # First token after JS is treated as "journal_settings_menu" choice.
@@ -13093,6 +13631,8 @@ def open_journal_window_editor(
         save_entry_btn.config(text=tr("journal.save_entry"))
         start_rec_button.config(text=tr("journal.rec.start"))
         stop_rec_button.config(text=tr("journal.rec.stop"))
+        _refresh_record_source_selector()
+        _refresh_transcription_model_selectors()
         if recording_ui_busy["v"]:
             pause_rec_button.config(
                 text=tr("journal.rec.resume")
@@ -13418,6 +13958,10 @@ def open_journal_window_editor(
                 lang_combo.config(bg=t.panel, fg=t.text)
             except tk.TclError:
                 pass
+            try:
+                record_source_combo.config(bg=t.panel, fg=t.text)
+            except tk.TclError:
+                pass
         if str(gen_button.cget("state")) == "normal":
             _gs, gb, gf, gab, gaf = t.gen_bind_rest()
             gen_button.config(
@@ -13436,7 +13980,7 @@ def open_journal_window_editor(
                 cursor="arrow",
             )
         update_transcribe_ui()
-        for _b in (start_rec_button, pause_rec_button, stop_rec_button):
+        for _b in (start_rec_button, record_source_combo, pause_rec_button, stop_rec_button):
             if _b is stop_rec_button and recording_background_mode["v"]:
                 _journal_rec_btn_set_disabled_look_clickable(_b)
             else:
@@ -14730,7 +15274,8 @@ def print_main_help() -> None:
     print("      Examples: R notes.txt | RT daily_logs/meeting.md")
     print("  C      - Chatbot")
     print("  CT     - Chatbot (thinking)")
-    print("  RC / RECORD - start background recording")
+    print("  RC / RECORD - start background recording with the selected source")
+    print("  RECORD MIC / RECORD COMPUTER / RECORD BOTH - start or switch recording source")
     print("  RS / RECORD STOP - stop background recording and save it")
     print("  H/HELP - show this help")
     print("  J SETTINGS / J SETTING / JOURNAL SETTINGS / JS - open journal command menu")

@@ -563,7 +563,7 @@ def command_transcribe(args: argparse.Namespace) -> int:
         first = transcribe_once(language, args.prompt or "", progress_start=24, progress_span=56)
         selected = first
         first_detected = str(first.get("language") or "").strip().lower()
-        auto_fallback_enabled = args.auto_fallback_zh or language is None
+        auto_fallback_enabled = bool(args.auto_fallback_zh)
         needs_chinese_check = (
             _cjk_count(first["text"]) == 0
             or first_detected not in ("", "en", "zh", "zh-cn", "zh-tw", "yue", "cmn")

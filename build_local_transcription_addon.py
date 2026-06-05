@@ -76,7 +76,7 @@ def build_addon() -> Path:
         json.dumps(
             {
                 "name": "Daily Logger Local Transcription Add-on",
-                "version": "helper-v3",
+                "version": "helper-v4",
                 "runtime": "DailyLoggerLocalTranscriber",
             },
             indent=2,
