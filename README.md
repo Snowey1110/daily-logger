@@ -26,13 +26,9 @@ The app can also install supported add-ons from **Settings > Download Manager**.
 | --- | --- |
 | <img src="images/iPhone%20QR%20Transfer.png" alt="Sanitized iPhone QR upload window" width="620" /> | <img src="images/Download%20Manager.png" alt="Daily Logger Download Manager for models and add-ons" width="620" /> |
 
-| Console Progress | Virtual Reader |
+| Virtual Reader Cover | Virtual Reader Double-Page Journal |
 | --- | --- |
-| <img src="images/Console%20Progress.png" alt="Daily Logger console progress log" width="620" /> | <img src="images/Virtual%20Reader%20Spread.png" alt="Virtual Reader double-page journal spread" width="620" /> |
-
-| Virtual Reader Cover |
-| --- |
-| <img src="images/Virtual%20Reader%20Cover.png" alt="Virtual Reader cover page" width="620" /> |
+| <img src="images/Virtual%20Reader%20Cover.png" alt="Virtual Reader cover page" width="620" /> | <img src="images/Virtual%20Reader%20Spread.png" alt="Virtual Reader double-page journal spread" width="620" /> |
 
 The public iPhone screenshot hides private network details. Its QR code is a demo code, not a real local upload address.
 
