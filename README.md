@@ -1,81 +1,170 @@
 # Daily Logger
 
-Daily Logger is a Windows-first personal journal for fast daily capture, rich review, and Excel-backed storage. It opens into a desktop Journal Window, saves entries locally, and can optionally use OpenAI features for recap, chat, transcription, and AI reports.
+Daily Logger is a Windows-first journal app for fast daily notes, recordings, speech-to-text, AI summaries, and book-style review. It stores your journal locally in Excel, opens quickly as a portable app, and keeps large optional features as separate downloads so the normal package stays small.
 
 <p align="center">
-  <a href="https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerPortable.zip"><strong>Download the latest DailyLoggerPortable.zip</strong></a>
+  <a href="https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerPortable.zip"><strong>Download DailyLoggerPortable.zip</strong></a>
 </p>
 
-## Highlights
+## Downloads
 
-- Journal Window for quick writing, recording, transcription, and AI report generation.
-- Virtual Journal Reader for browsing entries as a book in the browser.
-- Editable reader pages with text, sketch, image, and layer-order controls.
-- Excel storage in `Journal.xlsx` with per-day sheets and a rebuilt `Master Journal`.
-- Portable folder build for faster repeat startup than the old single-file EXE package.
-- Background daily backup after the journal UI finishes loading.
-- Optional OpenAI recap/chat tools; normal journaling works without an API key.
+| Package | Use it for | Link |
+| --- | --- | --- |
+| Daily Logger Portable | Main app with journal, cloud transcription, AI tools, reader, settings, and backups. | [Download](https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerPortable.zip) |
+| Local Transcription Addon | Optional offline Whisper helper for local `tiny`, `base`, `small`, and `medium` transcription models. | [Download](https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerLocalTranscriptionAddon.zip) |
+| Media Tools Addon | Optional video/audio conversion tools for iPhone videos, Voice Memos, large media splitting, and file preparation. | [Download](https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerMediaToolsAddon.zip) |
+
+The app can also install supported add-ons from **Settings > Download Manager**.
 
 ## Screenshots
 
-| Journal Window - Dark Theme | Journal Window - Light Theme |
+| Journal Window - Dark | Journal Window - Light |
 | --- | --- |
-| <img src="images/Dark%20Theme.png" alt="Daily Logger current dark theme journal window" width="520" /> | <img src="images/Light%20Theme.png" alt="Daily Logger current light theme journal window" width="520" /> |
+| <img src="images/Dark%20Theme.png" alt="Daily Logger dark journal window" width="620" /> | <img src="images/Light%20Theme.png" alt="Daily Logger light journal window" width="620" /> |
 
-| Virtual Reader Cover | Virtual Reader Double-Page Journal |
+| iPhone Transfer | Download Manager |
 | --- | --- |
-| <img src="images/Virtual%20Reader%20Cover.png" alt="Actual Virtual Reader cover page" width="520" /> | <img src="images/Virtual%20Reader%20Spread.png" alt="Actual Virtual Reader double-page journal spread with text, sketch, and image layers" width="520" /> |
+| <img src="images/iPhone%20QR%20Transfer.png" alt="Sanitized iPhone QR upload window" width="620" /> | <img src="images/Download%20Manager.png" alt="Daily Logger Download Manager for models and add-ons" width="620" /> |
 
-## Virtual Journal Reader
+| Console Progress | Virtual Reader |
+| --- | --- |
+| <img src="images/Console%20Progress.png" alt="Daily Logger console progress log" width="620" /> | <img src="images/Virtual%20Reader%20Spread.png" alt="Virtual Reader double-page journal spread" width="620" /> |
 
-Virtual Journal Reader turns `Journal.xlsx` into a local browser-based book view. It opens from the Journal Window navigation rail with **Virtual Reader**, or from `launch_journal_reader.bat`.
+| Virtual Reader Cover |
+| --- |
+| <img src="images/Virtual%20Reader%20Cover.png" alt="Virtual Reader cover page" width="620" /> |
 
-Reader features:
+The public iPhone screenshot hides private network details. Its QR code is a demo code, not a real local upload address.
 
-- Book-style browsing with journal, speech-to-text, and AI report sections.
-- Inline page editing for journal text, date, and time.
-- Sketch layer with color, line width, eraser, undo/redo, and Shift straight-line drawing.
-- Image layer with upload/paste, drag, resize, delete, and layer ordering.
-- Theme settings, sort order, single-page mode, English/Chinese UI, and optional LAN viewing.
+## Current Features
 
-How the reader is found:
-
-- PyInstaller builds can bundle `virtual-journal-reader/dist` and `serve_reader.py` through `DailyLogger.spec`.
-- Source runs use `virtual-journal-reader/serve_reader.py` and `virtual-journal-reader/dist/`.
-- If `virtual-journal-reader.zip` is copied next to the app, Daily Logger can extract it automatically the first time Virtual Reader opens.
-- EXE builds launch the reader server through Daily Logger's internal `--serve-virtual-reader` mode, so opening the reader does not create another Daily Logger window.
-
-The local reader server uses port `8765` by default. If an old reader server is already running, Daily Logger checks its health and refuses stale builds instead of silently opening the wrong UI.
+- **Journal Window** for writing daily entries, recording audio, transcribing speech, restoring drafts, and saving to Excel.
+- **Speech to text** with cloud transcription or optional local Whisper models.
+- **Transcribe File** for app recordings, audio files, iPhone videos, and Voice Memos.
+- **iPhone Inbox** for QR upload and Share Sheet Shortcut uploads while Daily Logger is open.
+- **Download Manager** for local transcription models, add-ons, storage visibility, install, uninstall, and default model selection.
+- **AI report, AI recap, and chatbot** using an optional OpenAI API key.
+- **Virtual Journal Reader** with book-style browsing, journal pages, speech-to-text pages, AI report pages, sketches, images, and page editing.
+- **Excel-backed storage** in `Journal.xlsx`, with per-day sheets and a rebuilt `Master Journal`.
+- **Background backup** that lets the Journal Window open first, then runs daily backup work after startup.
+- **Portable build** that avoids the slow single-file EXE unpack step.
 
 ## Quick Start
-
-### Run the Portable App
 
 1. Download [DailyLoggerPortable.zip](https://github.com/Snowey1110/daily-logger/releases/latest/download/DailyLoggerPortable.zip).
 2. Extract the zip.
 3. Open the extracted `DailyLogger` folder.
 4. Run `DailyLogger.exe`.
-5. On first launch, choose an app name and whether to start with Windows.
+5. On first launch, choose the app name and startup preference.
 
-No Python installation is required for the portable build. Keep the extracted folder together; `DailyLogger.exe` uses the bundled `_internal` runtime files next to it. The portable folder avoids the old single-file EXE unpack step, which improves repeat launch time.
+No Python installation is required for the portable build. Keep the extracted folder together because `DailyLogger.exe` uses the bundled `_internal` runtime folder next to it.
 
-### Run from Source
+## Speech To Text
+
+Daily Logger supports two transcription paths:
+
+- **Cloud models**: ready immediately when an OpenAI API key is saved.
+- **Local models**: require the Local Transcription Addon and a downloaded model.
+
+The transcription dropdown beside **Transcribe** and **Transcribe File** shows cloud models first, then installed local models. Use **Settings > Download Manager** to download or remove local models and add-ons.
+
+For long videos, install the Media Tools Addon. Daily Logger can convert video to audio, split oversized audio into safe pieces, and append completed transcript parts as progress finishes.
+
+## iPhone Transfer
+
+Daily Logger can receive iPhone media while the app is open.
+
+- **QR upload**: click **Receive from iPhone**, scan the QR code, choose videos, Voice Memos, or audio files, then upload from the phone page.
+- **Share Sheet Shortcut**: copy the Shortcut URL from the iPhone Inbox window and use it in an iPhone Shortcut with `Get Contents of URL`.
+- **Large videos**: for best reliability, use the Shortcut to encode audio-only M4A first, then upload that audio.
+- **Incoming files**: received files are accepted or declined on the PC before transcription begins.
+
+If Media Tools is missing and a video needs conversion, Daily Logger keeps the file pending and prompts for the add-on instead of losing the upload.
+
+## Virtual Journal Reader
+
+Virtual Reader turns `Journal.xlsx` into a local browser-based book view. It opens from the left navigation rail with **Virtual Reader**.
+
+Reader features include:
+
+- Double-page journal spreads.
+- Journal, speech-to-text, and AI report bookmarks.
+- Per-page sketch and image overlays.
+- Inline page editing for text, date, time, sketches, images, and layer order.
+- Scrollable right-page content for long journal overflow, transcripts, and AI reports.
+- Theme settings, sort order, single-page mode, English/Chinese UI, and optional LAN viewing.
+
+## AI Features
+
+OpenAI is optional. Without a key, local journaling, Excel storage, settings, backups, the reader, and downloaded local transcription still work.
+
+OpenAI-powered features include:
+
+- AI recap over journal entries.
+- Chatbot mode.
+- AI report generation from journal text and speech-to-text.
+- Cloud transcription.
+
+Set a key in the Settings page, with the console command below, or with the `OPENAI_API_KEY` environment variable:
+
+```text
+TOKEN ADD [OPENAI API TOKEN]
+```
+
+## Console Commands
+
+The Journal Window includes a console for quick actions. Type:
+
+```text
+HELP
+```
+
+The live help list is the source of truth because commands change with the app. Stable examples include:
+
+| Command | Action |
+| --- | --- |
+| `J` | Open the Journal Window. |
+| `R` / `RT` | Run AI recap, with `RT` using the thinking model. |
+| `C` / `CT` | Open chatbot, with `CT` using the thinking model. |
+| `RC` / `RECORD` | Start background recording. |
+| `RS` / `RECORD STOP` | Stop background recording and save it. |
+| `RESTORE` | Reopen the latest unsaved Journal Window draft. |
+| `OPEN JOURNAL` | Open `Journal.xlsx`. |
+| `OPEN DIRECTORY` | Open the Daily Logger app-data folder. |
+| `BACKUP START` | Create a backup now. |
+| `TOKEN ADD`, `TOKEN RESET`, `TOKEN COPY` | Manage the saved OpenAI API key. |
+| `LANGUAGE English`, `LANGUAGE Chinese` | Switch UI language. |
+
+## Data And Storage
+
+Daily Logger stores user data outside the repo so source runs and portable builds share the same files:
+
+```text
+%APPDATA%\DailyLogger\
+```
+
+Important folders and files:
+
+- `daily_logs/Journal.xlsx` - main Excel journal workbook.
+- `daily_logs/Recording/` - saved app recordings and imported media.
+- `daily_logs/Recording/iPhone Inbox/` - accepted iPhone uploads waiting for processing.
+- `daily_logs/backup/` - backup zip files.
+- `settings/daily_logger_prefs.json` - local preferences.
+- `settings/journal_window_draft.json` - autosaved unsaved draft.
+- `settings/journal_reader_sketches.json` - Virtual Reader page overlays.
+- `settings/daily_logger_api_key.txt` - optional saved OpenAI API key.
+- `addons/` - optional downloaded add-on runtimes.
+- `models/whisper/` - optional downloaded local transcription models.
+
+## Build From Source
+
+Run the app from source:
 
 ```bash
 python daily_logger.py
 ```
 
-Or on Windows:
-
-```text
-launch_daily_logger.bat
-```
-
-Daily Logger checks required and optional Python packages at startup. Required packages are needed to run; optional packages enable features such as microphone recording and the calendar date picker.
-
-### Build the Virtual Reader UI
-
-Only needed when developing or rebuilding the browser reader:
+Build the Virtual Reader web UI:
 
 ```bash
 cd virtual-journal-reader
@@ -83,100 +172,29 @@ npm install
 npm run build
 ```
 
-## Console Commands
+Build release artifacts:
 
-The Journal Window has a built-in console. Press `H` or `HELP` to see the current command list.
-
-| Command | Action |
-| --- | --- |
-| `J` | Open journal flow. |
-| `J SETTINGS`, `J SETTING`, `JOURNAL SETTINGS`, `JS` | Open the journal command menu. |
-| `R`, `RT` | Run AI recap, with `RT` using the thinking model. |
-| `R [date range]`, `RT [date range]` | Recap entries within a date range, such as `4/27 - 4/30`. |
-| `R [file]`, `RT [file]` | Recap using file text as context. |
-| `C`, `CT` | Open chatbot, with `CT` using the thinking model. |
-| `RESTORE` | Reopen the latest unsaved Journal Window draft. |
-| `OPEN DIRECTORY` | Open the app data folder. |
-| `OPEN JOURNAL` | Open `Journal.xlsx`. |
-| `OPEN SCREENSHOTS` | Open the chat screenshots folder. |
-| `STARTUP TRUE`, `STARTUP FALSE` | Enable or disable launch at Windows sign-in. |
-| `DEFAULT WINDOWS`, `DEFAULT CONSOLE` | Choose whether `J` opens the window directly or shows journal choices. |
-| `BACKUP START` | Create a backup zip now. |
-| `BACKUP TRUE`, `BACKUP FALSE`, `BACKUP LIMITED` | Enable, disable, or limit automatic backups. |
-| `TOKEN ADD [token]`, `TOKEN RESET`, `TOKEN COPY` | Manage the stored OpenAI API key. |
-| `LAN cn`, `LAN en`, `LANGUAGE Chinese`, `LANGUAGE English` | Switch UI language. |
-| `SB bat`, `SB journal`, `SB reader` | Create Start Menu search shortcuts. |
-| `WIFI WARN [name]` | Warn when connected to the named Wi-Fi network. |
-| `RENAME` | Change the app name shown in the UI. |
-| `TS` | Take a screenshot for chat workflows. |
-| `UNINSTALL`, `CONFIRM UNINSTALL` | Request and confirm local app-data cleanup. |
-
-## Data and Storage
-
-Daily Logger stores user data outside the repo so EXE and source runs share the same files:
-
-```text
-%APPDATA%\DailyLogger\
+```bash
+python -m PyInstaller DailyLogger.spec
+python build_local_transcription_addon.py
+python build_media_tools_addon.py
 ```
-
-Important files and folders:
-
-- `daily_logs/Journal.xlsx` - main Excel journal file.
-- `daily_logs/Recording/` - saved recording files.
-- `daily_logs/backup/` - backup zip files.
-- `settings/daily_logger_prefs.json` - local preferences.
-- `settings/journal_window_draft.json` - autosaved unsaved draft.
-- `settings/journal_reader_sketches.json` - reader sketches and page overlays.
-- `settings/daily_logger_api_key.txt` - optional saved OpenAI API key.
-
-Journal workbook behavior:
-
-- Entries save to date sheets such as `2026-05-22`.
-- `Master Journal` is rebuilt from date sheets.
-- Date sheets are ordered newest to oldest behind `Master Journal`.
-- Old repo-local `daily_logs/` and `settings/` data can be migrated into `%APPDATA%\DailyLogger`.
-
-Backup behavior:
-
-- Automatic backup runs once per new day when enabled.
-- Startup is kept responsive: the journal window opens first, then backup runs in the background.
-- Limited backup mode keeps a small rotating set of backup zip files.
-
-## OpenAI Features
-
-OpenAI is optional. Without a key, local journaling, Excel storage, the reader, settings, backups, and shortcuts still work.
-
-OpenAI-powered features include:
-
-- AI recap over journal entries.
-- General chatbot mode.
-- AI report generation from journal text and speech-to-text.
-- Speech transcription when recording dependencies are installed.
-
-Set a key with:
-
-```text
-TOKEN ADD [OPENAI API TOKEN]
-```
-
-You can also use the `OPENAI_API_KEY` environment variable.
 
 ## Project Layout
 
 ```text
-daily_logger.py                 Main desktop app
-journal_i18n.py                 Journal Window translations
-launch_daily_logger.bat         Windows app launcher
-launch_journal_reader.bat       Virtual Reader launcher
-DailyLogger.spec                PyInstaller portable-folder build spec
-dist/DailyLoggerPortable.zip    Portable release package
-virtual-journal-reader/         React/Vite reader UI and server
-virtual-journal-reader.zip      Runnable reader add-on package
-images/                         README screenshots and feature mockups
+daily_logger.py                      Main desktop app
+journal_i18n.py                      English/Chinese UI text
+local_transcriber_helper.py          Optional local transcription helper source
+DailyLogger.spec                     Portable-folder PyInstaller build
+build_local_transcription_addon.py   Local transcription add-on builder
+build_media_tools_addon.py           Media Tools add-on builder
+virtual-journal-reader/              React/Vite reader UI and server
+images/                              README screenshots
 ```
 
 ## Notes
 
-- This project is designed primarily for Windows.
-- Settings, generated journals, backups, recordings, and API keys are local user data and should not be committed.
-- The reader is served locally by default; LAN viewing can be toggled from the reader settings when needed.
+- Daily Logger is designed primarily for Windows.
+- Settings, generated journals, backups, recordings, models, add-ons, and API keys are local user data and should not be committed.
+- The normal portable package is cloud-ready and small; local transcription and media conversion are optional add-ons.
