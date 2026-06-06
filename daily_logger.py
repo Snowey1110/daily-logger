@@ -120,6 +120,15 @@ WAVEFORM_MAX_DRAW_SAMPLES = 4000
 WAVEFORM_RMS_NORM = 6000.0
 # Smaller input blocks when metering so the canvas updates often enough to feel live.
 WAVEFORM_INPUT_BLOCK_SAMPLES = 512
+APP_VERSION = "1.0.3"
+APP_GITHUB_REPO = "Snowey1110/daily-logger"
+APP_RELEASE_API_URL = f"https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest"
+APP_RELEASE_PAGE_URL = f"https://github.com/{APP_GITHUB_REPO}/releases/latest"
+APP_PORTABLE_ZIP_NAME = "DailyLoggerPortable.zip"
+UPDATE_CHECK_ENABLED_PREF_KEY = "update_check_enabled"
+UPDATE_LAST_CHECK_DATE_PREF_KEY = "last_update_check_date"
+UPDATE_LAST_SEEN_RELEASE_PREF_KEY = "last_seen_release_tag"
+UPDATE_DISMISSED_RELEASE_PREF_KEY = "dismissed_release_tag"
 # Journal STT / AI report: same button width (text units) and grid min width so text areas align.
 JOURNAL_SIDE_ACTION_BTN_WIDTH_CH = 16
 JOURNAL_SIDE_ACTION_GRID_MINSIZE = 130
@@ -266,6 +275,11 @@ TRANSCRIPTION_CLOUD_MODEL_STATS = {
 ADDON_RELEASE_BASE_URL = "https://github.com/Snowey1110/daily-logger/releases/latest/download"
 LOCAL_TRANSCRIPTION_ADDON_ZIP_NAME = "DailyLoggerLocalTranscriptionAddon.zip"
 MEDIA_TOOLS_ADDON_ZIP_NAME = "DailyLoggerMediaToolsAddon.zip"
+UPDATE_RELEASE_ASSET_NAMES = (
+    APP_PORTABLE_ZIP_NAME,
+    LOCAL_TRANSCRIPTION_ADDON_ZIP_NAME,
+    MEDIA_TOOLS_ADDON_ZIP_NAME,
+)
 LOCAL_TRANSCRIPTION_ADDON_ESTIMATED_BYTES = 70 * 1024 * 1024
 MEDIA_TOOLS_ADDON_ESTIMATED_BYTES = 85 * 1024 * 1024
 TRANSCRIPTION_LOCAL_CPU_THREADS = 4
@@ -1855,8 +1869,109 @@ def save_preferences(prefs: Dict[str, str]) -> bool:
         return False
 
 
+def normalize_release_tag(tag: str) -> str:
+    text = (tag or "").strip()
+    if text.lower().startswith("v"):
+        text = text[1:]
+    return text.strip()
+
+
+def release_version_parts(tag: str) -> Tuple[int, ...]:
+    normalized = normalize_release_tag(tag)
+    parts: List[int] = []
+    for raw in normalized.split("."):
+        match = re.match(r"(\d+)", raw.strip())
+        if not match:
+            parts.append(0)
+            continue
+        try:
+            parts.append(int(match.group(1)))
+        except ValueError:
+            parts.append(0)
+    while parts and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts or [0])
+
+
+def release_tag_is_newer(latest_tag: str, current_version: str = APP_VERSION) -> bool:
+    latest = list(release_version_parts(latest_tag))
+    current = list(release_version_parts(current_version))
+    max_len = max(len(latest), len(current))
+    latest.extend([0] * (max_len - len(latest)))
+    current.extend([0] * (max_len - len(current)))
+    return tuple(latest) > tuple(current)
+
+
+def update_check_enabled() -> bool:
+    prefs = load_preferences()
+    return prefs.get(UPDATE_CHECK_ENABLED_PREF_KEY, "true").strip().lower() != "false"
+
+
+def save_update_check_enabled(enabled: bool) -> bool:
+    prefs = load_preferences()
+    prefs[UPDATE_CHECK_ENABLED_PREF_KEY] = "true" if enabled else "false"
+    return save_preferences(prefs)
+
+
+def today_update_check_key() -> str:
+    return date.today().isoformat()
+
+
+def release_notes_preview(body: str, limit: int = 1000) -> str:
+    text = (body or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def parse_github_release_info(raw: Dict[str, Any]) -> Dict[str, Any]:
+    assets: Dict[str, str] = {}
+    for asset in raw.get("assets", []):
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "").strip()
+        url = str(asset.get("browser_download_url") or "").strip()
+        if name and url:
+            assets[name] = url
+    tag = str(raw.get("tag_name") or "").strip()
+    html_url = str(raw.get("html_url") or "").strip() or APP_RELEASE_PAGE_URL
+    return {
+        "tag": tag,
+        "version": normalize_release_tag(tag),
+        "name": str(raw.get("name") or tag or "Daily Logger release").strip(),
+        "body": str(raw.get("body") or "").strip(),
+        "html_url": html_url,
+        "published_at": str(raw.get("published_at") or "").strip(),
+        "assets": assets,
+    }
+
+
+def fetch_latest_release_info(timeout_sec: float = 8.0) -> Tuple[Optional[Dict[str, Any]], str]:
+    req = request.Request(
+        APP_RELEASE_API_URL,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"DailyLogger/{APP_VERSION}",
+        },
+    )
+    try:
+        with request.urlopen(req, timeout=timeout_sec) as response:
+            raw_text = response.read().decode("utf-8", errors="replace")
+        parsed = json.loads(raw_text)
+        if not isinstance(parsed, dict):
+            return None, "GitHub returned an unexpected release response."
+        info = parse_github_release_info(parsed)
+        if not info.get("tag"):
+            return None, "GitHub release response did not include a version tag."
+        return info, ""
+    except error.HTTPError as exc:
+        return None, f"GitHub update check failed ({exc.code})."
+    except (OSError, TimeoutError, json.JSONDecodeError) as exc:
+        return None, f"Could not check for updates: {exc}"
+
+
 LOCAL_TRANSCRIPTION_ADDON_STAGE_PREFIX = "local_transcription_pending"
-LOCAL_TRANSCRIPTION_ADDON_VERSION = "helper-v4"
+LOCAL_TRANSCRIPTION_ADDON_VERSION = "helper-v5"
 LOCAL_TRANSCRIPTION_HELPER_EXE_NAME = "DailyLoggerLocalTranscriber.exe"
 LOCAL_TRANSCRIPTION_CURRENT_FILE = LOCAL_TRANSCRIPTION_ADDON_DIR / "current.json"
 MEDIA_TOOLS_ADDON_MARKER = MEDIA_TOOLS_ADDON_DIR / "addon.json"
@@ -3161,47 +3276,130 @@ def open_path_with_default_app(path: Path) -> bool:
         return False
 
 
-def _remove_path_quietly(path: Path) -> None:
+def _resolve_path_for_compare(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path.absolute()
+
+
+def _path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _current_app_folder() -> Path:
+    if getattr(sys, "frozen", False):
+        return _resolve_path_for_compare(Path(sys.executable).parent)
+    return _resolve_path_for_compare(BASE_DIR)
+
+
+def _path_is_current_app_file(path: Path) -> bool:
+    resolved = _resolve_path_for_compare(path)
+    current_app = _current_app_folder()
+    return resolved == current_app or _path_is_relative_to(resolved, current_app)
+
+
+def _remove_path_quietly(path: Path, *, protect_current_app: bool = True) -> bool:
+    if protect_current_app and _path_is_current_app_file(path):
+        return False
     try:
         if path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-        elif path.exists():
+            shutil.rmtree(path)
+            return not path.exists()
+        if path.exists():
             path.unlink()
+            return not path.exists()
+        return True
     except OSError:
-        pass
+        return False
 
 
-def _schedule_windows_self_delete(exe_path: Path) -> None:
-    script_path = Path(tempfile.gettempdir()) / f"daily_logger_uninstall_{int(time.time())}.cmd"
-    script = (
-        "@echo off\n"
-        "timeout /t 2 /nobreak >nul\n"
-        f'del /f /q "{exe_path}" >nul 2>&1\n'
-        f'del /f /q "{script_path}" >nul 2>&1\n'
-    )
+def _remove_empty_dir_quietly(path: Path) -> bool:
+    if _path_is_current_app_file(path):
+        return False
     try:
-        script_path.write_text(script, encoding="utf-8")
-        subprocess.Popen(
-            ["cmd", "/c", str(script_path)],
-            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-        )
+        path.rmdir()
+        return True
     except OSError:
-        pass
+        return False
+
+
+def _remove_daily_logger_start_menu_shortcuts() -> int:
+    removed = 0
+    programs = get_start_menu_programs_dir()
+    if programs is None:
+        return removed
+    folder = programs / "Daily Logger"
+    for name in (
+        "Daily Logger BAT Launcher.lnk",
+        "Daily Logger Journal Excel.lnk",
+        "Virtual Journal Reader.lnk",
+    ):
+        shortcut = folder / name
+        if shortcut.exists() and _remove_path_quietly(shortcut, protect_current_app=False):
+            removed += 1
+    _remove_empty_dir_quietly(folder)
+    return removed
+
+
+def _cleanup_download_leftovers() -> int:
+    removed = 0
+    artifact_names = (
+        APP_PORTABLE_ZIP_NAME,
+        LOCAL_TRANSCRIPTION_ADDON_ZIP_NAME,
+        MEDIA_TOOLS_ADDON_ZIP_NAME,
+    )
+    candidate_dirs = [
+        ADDON_DOWNLOAD_DIR,
+        USER_DATA_ROOT,
+        BASE_DIR,
+        BASE_DIR.parent,
+    ]
+    seen: set[Path] = set()
+    for directory in candidate_dirs:
+        for name in artifact_names:
+            candidate = directory / name
+            resolved = _resolve_path_for_compare(candidate)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if candidate.exists() and _remove_path_quietly(candidate, protect_current_app=False):
+                removed += 1
+    return removed
 
 
 def run_clean_uninstall() -> None:
-    remove_startup_shortcut()
-    _remove_path_quietly(DATA_DIR)
-    _remove_path_quietly(SETTINGS_DIR)
+    removed_items = 0
+    if remove_startup_shortcut():
+        removed_items += 1
+    removed_items += _remove_daily_logger_start_menu_shortcuts()
 
-    if getattr(sys, "frozen", False):
-        exe_path = Path(sys.executable).resolve()
-        _schedule_windows_self_delete(exe_path)
-        print("Uninstall started. App data folders and this EXE will be removed after this window closes.")
-        return
+    cleanup_targets = [
+        (DATA_DIR, False),
+        (SETTINGS_DIR, False),
+        (USER_DATA_ROOT / "addons", False),
+        (USER_DATA_ROOT / "models", False),
+        (ADDON_DOWNLOAD_DIR, False),
+        (LEGACY_DATA_DIR, False),
+        (LEGACY_SETTINGS_DIR, False),
+        (USER_DATA_ROOT / "_internal", True),
+    ]
+    for target, protect_current_app in cleanup_targets:
+        if target.exists() and _remove_path_quietly(target, protect_current_app=protect_current_app):
+            removed_items += 1
+    removed_items += _cleanup_download_leftovers()
 
-    # Dev-mode fallback: do not delete source code automatically.
-    print("Uninstall cleaned app data folders (daily_logs/settings).")
+    _remove_empty_dir_quietly(USER_DATA_ROOT)
+
+    print(
+        "Uninstall cleanup complete. Removed Daily Logger user data, add-ons, models, "
+        "downloads, and shortcuts."
+    )
+    print(f"Current Daily Logger app files were kept: {_current_app_folder()}")
 
 
 def get_start_menu_programs_dir() -> Optional[Path]:
@@ -8026,6 +8224,49 @@ def open_journal_window_editor(
     )
     transcription_models_btn.pack(side="left")
 
+    updates_row, _ = _make_settings_row("settings.updates")
+    updates_state = {"enabled": update_check_enabled(), "busy": False}
+    updates_toggle_btn = tk.Button(
+        updates_row,
+        text=tr("settings.on") if updates_state["enabled"] else tr("settings.off"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+        width=7,
+    )
+    updates_toggle_btn.pack(side="left", padx=(0, 8))
+    updates_check_btn = tk.Button(
+        updates_row,
+        text=tr("settings.check_now"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+        width=12,
+    )
+    updates_check_btn.pack(side="left")
+    updates_status_var = tk.StringVar(value="")
+    updates_status_lbl = tk.Label(
+        updates_row,
+        textvariable=updates_status_var,
+        bg=t_init.surface,
+        fg=t_init.muted,
+        font=("Segoe UI", 9),
+        anchor="w",
+    )
+    updates_status_lbl.pack(side="left", fill="x", expand=True, padx=(10, 0))
+
     def _refresh_iphone_settings_toggle_btn() -> None:
         iphone_receive_state["enabled"] = iphone_passive_receive_enabled()
         try:
@@ -8268,6 +8509,252 @@ def open_journal_window_editor(
             return
         _set_settings_status(tr("status.transcription_models_not_ready"))
 
+    def _release_download_url(info: Dict[str, Any], asset_name: str) -> str:
+        assets = info.get("assets")
+        if isinstance(assets, dict):
+            url = str(assets.get(asset_name) or "").strip()
+            if url:
+                return url
+        return f"{ADDON_RELEASE_BASE_URL}/{asset_name}"
+
+    def _release_asset_names(info: Dict[str, Any]) -> List[str]:
+        assets = info.get("assets")
+        if not isinstance(assets, dict):
+            return []
+        return [name for name in UPDATE_RELEASE_ASSET_NAMES if name in assets]
+
+    def _installed_addon_release_names(info: Dict[str, Any]) -> List[str]:
+        assets = info.get("assets")
+        if not isinstance(assets, dict):
+            return []
+        names: List[str] = []
+        if local_transcription_addon_is_installed() and LOCAL_TRANSCRIPTION_ADDON_ZIP_NAME in assets:
+            names.append("Local Transcription")
+        if media_tools_addon_is_installed() and MEDIA_TOOLS_ADDON_ZIP_NAME in assets:
+            names.append("Media Tools")
+        return names
+
+    update_dialog_ref: Dict[str, Any] = {"window": None}
+
+    def _show_update_dialog(info: Dict[str, Any]) -> None:
+        tag = str(info.get("tag") or "").strip()
+        if not tag:
+            return
+        existing = update_dialog_ref.get("window")
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.lift()
+                return
+        except tk.TclError:
+            pass
+        prefs = load_preferences()
+        prefs[UPDATE_LAST_SEEN_RELEASE_PREF_KEY] = tag
+        save_preferences(prefs)
+
+        t = th()
+        dlg = tk.Toplevel(root)
+        update_dialog_ref["window"] = dlg
+        dlg.title(tr("updates.title"))
+        dlg.configure(bg=t.surface)
+        dlg.transient(root)
+        dlg.geometry("560x460")
+        dlg.minsize(500, 360)
+
+        wrap = tk.Frame(dlg, bg=t.surface)
+        wrap.pack(fill="both", expand=True, padx=18, pady=18)
+        title_lbl = tk.Label(
+            wrap,
+            text=tr("updates.available"),
+            bg=t.surface,
+            fg=t.text,
+            font=("Segoe UI", 14, "bold"),
+            anchor="w",
+        )
+        title_lbl.pack(fill="x", pady=(0, 10))
+
+        published = str(info.get("published_at") or "").strip()
+        if "T" in published:
+            published = published.split("T", 1)[0]
+        detail_lines = [
+            tr("updates.current").format(version=APP_VERSION),
+            tr("updates.latest").format(version=str(info.get("version") or tag)),
+        ]
+        if published:
+            detail_lines.append(tr("updates.published").format(date=published))
+        assets = _release_asset_names(info)
+        if assets:
+            detail_lines.append(tr("updates.assets").format(assets=", ".join(assets)))
+        addon_names = _installed_addon_release_names(info)
+        if addon_names:
+            detail_lines.append(tr("updates.addons").format(addons=", ".join(addon_names)))
+        details_lbl = tk.Label(
+            wrap,
+            text="\n".join(detail_lines),
+            bg=t.surface,
+            fg=t.muted,
+            font=("Segoe UI", 10),
+            anchor="w",
+            justify="left",
+        )
+        details_lbl.pack(fill="x", pady=(0, 10))
+
+        notes = release_notes_preview(str(info.get("body") or "")) or tr("updates.notes_empty")
+        notes_box = tk.Text(
+            wrap,
+            height=10,
+            wrap="word",
+            bg=t.field,
+            fg=t.text,
+            insertbackground=t.text,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+            font=("Segoe UI", 9),
+        )
+        notes_box.pack(fill="both", expand=True, pady=(0, 12))
+        notes_box.insert("1.0", notes)
+        notes_box.config(state="disabled")
+
+        btn_row = tk.Frame(wrap, bg=t.surface)
+        btn_row.pack(fill="x")
+
+        def _close() -> None:
+            try:
+                dlg.destroy()
+            except tk.TclError:
+                pass
+
+        def _open_release() -> None:
+            webbrowser.open(str(info.get("html_url") or APP_RELEASE_PAGE_URL))
+
+        def _download_portable() -> None:
+            webbrowser.open(_release_download_url(info, APP_PORTABLE_ZIP_NAME))
+
+        def _skip_version() -> None:
+            prefs_inner = load_preferences()
+            prefs_inner[UPDATE_DISMISSED_RELEASE_PREF_KEY] = tag
+            save_preferences(prefs_inner)
+            _close()
+
+        def _make_dialog_button(label: str, command: Callable[[], None]) -> Any:
+            btn = tk.Button(
+                btn_row,
+                text=label,
+                command=command,
+                bg=t.btn_secondary,
+                fg=t.text,
+                activebackground=t.secondary_hover,
+                activeforeground=t.text,
+                relief="flat",
+                font=("Segoe UI", 9, "bold"),
+                padx=10,
+                pady=7,
+                cursor="hand2",
+            )
+            btn.pack(side="left", padx=(0, 8))
+            return btn
+
+        _make_dialog_button(tr("updates.open_release"), _open_release)
+        _make_dialog_button(tr("updates.download_portable"), _download_portable)
+        _make_dialog_button(tr("updates.remind_later"), _close)
+        _make_dialog_button(tr("updates.skip_version"), _skip_version)
+
+        dlg.protocol("WM_DELETE_WINDOW", _close)
+        try:
+            dlg.lift()
+        except tk.TclError:
+            pass
+
+    def _set_updates_buttons_busy(busy: bool) -> None:
+        updates_state["busy"] = busy
+        state = "disabled" if busy else "normal"
+        try:
+            updates_toggle_btn.config(state=state)
+            updates_check_btn.config(state=state)
+        except tk.TclError:
+            pass
+
+    def _set_updates_status(text: str) -> None:
+        try:
+            updates_status_var.set((text or "").strip())
+        except tk.TclError:
+            pass
+
+    def _finish_update_check(info: Optional[Dict[str, Any]], err_msg: str, *, manual: bool) -> None:
+        _set_updates_buttons_busy(False)
+        prefs = load_preferences()
+        prefs[UPDATE_LAST_CHECK_DATE_PREF_KEY] = today_update_check_key()
+        save_preferences(prefs)
+        if err_msg:
+            if manual:
+                text = tr("status.update_failed").format(error=err_msg)
+                _set_updates_status(text)
+                _set_settings_status(text)
+            else:
+                _append_console_session_update(
+                    tr("status.update_failed").format(error=err_msg),
+                    key="updates:auto_failed",
+                )
+            return
+        if not info:
+            return
+        tag = str(info.get("tag") or "").strip()
+        is_new = release_tag_is_newer(tag, APP_VERSION)
+        if not is_new:
+            if manual:
+                _set_updates_status(tr("status.update_current"))
+                _set_settings_status(tr("status.update_current"))
+            return
+        if not manual and prefs.get(UPDATE_DISMISSED_RELEASE_PREF_KEY, "").strip() == tag:
+            return
+        status_text = tr("status.update_available").format(version=str(info.get("version") or tag))
+        _set_updates_status(status_text)
+        _set_settings_status(status_text)
+        _show_update_dialog(info)
+
+    def _check_updates_async(*, manual: bool = False, force: bool = False) -> None:
+        if updates_state["busy"]:
+            if manual:
+                _set_updates_status(tr("status.update_checking"))
+                _set_settings_status(tr("status.update_checking"))
+            return
+        prefs = load_preferences()
+        if not manual and not update_check_enabled():
+            return
+        if (
+            not manual
+            and not force
+            and prefs.get(UPDATE_LAST_CHECK_DATE_PREF_KEY, "").strip() == today_update_check_key()
+        ):
+            return
+        _set_updates_buttons_busy(True)
+        if manual:
+            _set_updates_status(tr("status.update_checking"))
+            _set_settings_status(tr("status.update_checking"))
+
+        def _work() -> None:
+            info, err_msg = fetch_latest_release_info(timeout_sec=8)
+            try:
+                root.after(0, lambda: _finish_update_check(info, err_msg, manual=manual))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_toggle_updates() -> None:
+        should_enable = not updates_state["enabled"]
+        if not save_update_check_enabled(should_enable):
+            _set_settings_status(tr("status.update_failed").format(error="Could not save setting."))
+            return
+        updates_state["enabled"] = should_enable
+        updates_toggle_btn.config(
+            text=tr("settings.on") if should_enable else tr("settings.off")
+        )
+        status_text = tr("status.update_on") if should_enable else tr("status.update_off")
+        _set_updates_status(status_text)
+        _set_settings_status(status_text)
+
     def _persist_backup_mode(mode: str) -> None:
         prefs = load_preferences()
         if mode == "On":
@@ -8358,6 +8845,8 @@ def open_journal_window_editor(
     startup_toggle_btn.config(command=_on_toggle_startup)
     iphone_receive_toggle_btn.config(command=_on_toggle_iphone_receive)
     transcription_models_btn.config(command=_on_open_transcription_models)
+    updates_toggle_btn.config(command=_on_toggle_updates)
+    updates_check_btn.config(command=lambda: _check_updates_async(manual=True, force=True))
     backup_mode_btn.config(command=_on_cycle_backup_mode)
     backup_manual_btn.config(command=_on_manual_backup)
     token_save_btn.config(command=_on_token_save)
@@ -12286,6 +12775,7 @@ def open_journal_window_editor(
         enqueue_iphone_imports(list_pending_iphone_inbox_files())
 
     root.after(300, _startup_iphone_receiver_and_pending)
+    root.after(1500, lambda: _check_updates_async(manual=False))
     wave_canvas.bind("<Configure>", lambda _e: redraw_waveform_canvas())
     wave_canvas.after(80, redraw_waveform_canvas)
 
@@ -13581,6 +14071,10 @@ def open_journal_window_editor(
             text=tr("settings.on") if iphone_receive_state["enabled"] else tr("settings.off")
         )
         transcription_models_btn.config(text=tr("settings.manage"))
+        updates_toggle_btn.config(
+            text=tr("settings.on") if updates_state["enabled"] else tr("settings.off")
+        )
+        updates_check_btn.config(text=tr("settings.check_now"))
         settings_theme_btn.config(
             text=tr("theme.dark") if th().is_dark else tr("theme.light")
         )
@@ -13696,6 +14190,7 @@ def open_journal_window_editor(
         settings_wrap.configure(bg=t.surface)
         settings_title.configure(bg=t.surface, fg=t.text)
         settings_status_lbl.configure(bg=t.surface, fg=t.muted)
+        updates_status_lbl.configure(bg=t.surface, fg=t.muted)
         for _w in settings_rows:
             _w.configure(bg=t.surface)
         for _w in settings_labels:
@@ -13719,6 +14214,8 @@ def open_journal_window_editor(
             startup_toggle_btn,
             iphone_receive_toggle_btn,
             transcription_models_btn,
+            updates_toggle_btn,
+            updates_check_btn,
             settings_theme_btn,
             backup_mode_btn,
             backup_manual_btn,
@@ -15293,7 +15790,7 @@ def print_main_help() -> None:
     print("  BACKUP FALSE   - disable auto backup")
     print("  BACKUP LIMITED - keep at most 3 zip files; remove latest when adding")
     print("  UNINSTALL - request uninstall (requires CONFIRM UNINSTALL)")
-    print("  CONFIRM UNINSTALL - permanently remove app data/app files")
+    print("  CONFIRM UNINSTALL - remove user data, add-ons, downloads, and shortcuts; keep current app files")
     print("  WIFI WARN [name] - warn when connected to that Wi-Fi")
     print("  RESTORE - reopen latest unsaved journal window draft")
     print("  TOKEN ADD [token] - save API token")
@@ -15334,7 +15831,10 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
         return True, app_name
     if key == "UNINSTALL":
         PENDING_UNINSTALL_CONFIRM = True
-        print('Uninstall requested. Type "CONFIRM UNINSTALL" to continue.')
+        print(
+            'Uninstall requested. This cleans Daily Logger data, add-ons, downloads, '
+            'and shortcuts, but keeps the current app folder. Type "CONFIRM UNINSTALL" to continue.'
+        )
         return True, app_name
     if key == "CONFIRM UNINSTALL":
         if not PENDING_UNINSTALL_CONFIRM:

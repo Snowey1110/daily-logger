@@ -5,12 +5,14 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import types
 import unicodedata
+import wave
 from typing import Any, Dict, Optional
 
 
@@ -347,16 +349,70 @@ def find_ffmpeg() -> Optional[str]:
     appdata = os.getenv("APPDATA", "").strip()
     if appdata:
         candidates.append(str(Path(appdata) / "DailyLogger" / "addons" / "media_tools" / "ffmpeg.exe"))
-    candidates.append("ffmpeg")
+    candidates.append(shutil.which("ffmpeg"))
     for candidate in candidates:
-        if candidate == "ffmpeg":
-            return candidate
+        if not candidate:
+            continue
         try:
             if Path(candidate).is_file():
                 return candidate
         except OSError:
             pass
     return None
+
+
+def decode_pcm_wav(input_file: Any, sampling_rate: int, split_stereo: bool) -> Any:
+    import numpy as np
+
+    path = Path(os.fspath(input_file))
+    with wave.open(str(path), "rb") as wav_file:
+        channels = int(wav_file.getnchannels())
+        source_rate = int(wav_file.getframerate())
+        sample_width = int(wav_file.getsampwidth())
+        frame_count = int(wav_file.getnframes())
+        raw = wav_file.readframes(frame_count)
+    if not raw or channels <= 0 or source_rate <= 0:
+        return (np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)) if split_stereo else np.zeros(0, dtype=np.float32)
+    if sample_width == 1:
+        audio = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif sample_width == 2:
+        audio = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    elif sample_width == 3:
+        data = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+        values = (
+            data[:, 0].astype(np.int32)
+            | (data[:, 1].astype(np.int32) << 8)
+            | (data[:, 2].astype(np.int32) << 16)
+        )
+        values = np.where(values & 0x800000, values - 0x1000000, values)
+        audio = values.astype(np.float32) / 8388608.0
+    elif sample_width == 4:
+        audio = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+    else:
+        raise RuntimeError(f"Unsupported WAV sample width: {sample_width} bytes.")
+    usable = (audio.size // channels) * channels
+    audio = audio[:usable].reshape(-1, channels)
+    if split_stereo:
+        if channels == 1:
+            left = right = audio[:, 0]
+        else:
+            left = audio[:, 0]
+            right = audio[:, 1]
+        return resample_audio(left, source_rate, sampling_rate), resample_audio(right, source_rate, sampling_rate)
+    mono = audio[:, 0] if channels == 1 else np.mean(audio, axis=1)
+    return resample_audio(mono, source_rate, sampling_rate)
+
+
+def resample_audio(audio: Any, source_rate: int, target_rate: int) -> Any:
+    import numpy as np
+
+    arr = np.asarray(audio, dtype=np.float32)
+    if arr.size == 0 or source_rate == target_rate:
+        return arr.astype(np.float32, copy=False)
+    target_len = max(1, int(round(arr.size * float(target_rate) / float(source_rate))))
+    source_index = np.linspace(0.0, 1.0, num=arr.size, endpoint=False, dtype=np.float64)
+    target_index = np.linspace(0.0, 1.0, num=target_len, endpoint=False, dtype=np.float64)
+    return np.interp(target_index, source_index, arr).astype(np.float32)
 
 
 def install_audio_shim() -> None:
@@ -366,10 +422,18 @@ def install_audio_shim() -> None:
     def decode_audio(input_file: Any, sampling_rate: int = 16000, split_stereo: bool = False) -> Any:
         import numpy as np
 
+        input_name = str(getattr(input_file, "name", "") or os.fspath(input_file))
+        if Path(input_name).suffix.lower() == ".wav":
+            try:
+                return decode_pcm_wav(input_name, sampling_rate, split_stereo)
+            except wave.Error as exc:
+                raise RuntimeError(f"Could not read that WAV file: {exc}") from exc
         ffmpeg = find_ffmpeg()
         if not ffmpeg:
-            raise RuntimeError("Media Tools are required for local transcription audio decoding.")
-        input_name = str(getattr(input_file, "name", "") or os.fspath(input_file))
+            raise RuntimeError(
+                "Media Tools are required for local transcription of this file type. "
+                "Install Media Tools from Download Manager, or use an app-recorded WAV file."
+            )
         channels = "2" if split_stereo else "1"
         cmd = [
             ffmpeg,

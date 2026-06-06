@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import stat
 from pathlib import Path
 import zipfile
 
@@ -21,7 +23,14 @@ ADDON_HELPER_ROOT = ADDON_ROOT / HELPER_NAME
 
 def remove_tree(path: Path) -> None:
     if path.exists():
-        shutil.rmtree(path)
+        def _retry_writable(function, failed_path, _exc_info):
+            try:
+                os.chmod(failed_path, stat.S_IWRITE)
+            except OSError:
+                pass
+            function(failed_path)
+
+        shutil.rmtree(path, onexc=_retry_writable)
 
 
 def build_helper() -> Path:
@@ -76,7 +85,7 @@ def build_addon() -> Path:
         json.dumps(
             {
                 "name": "Daily Logger Local Transcription Add-on",
-                "version": "helper-v4",
+                "version": "helper-v5",
                 "runtime": "DailyLoggerLocalTranscriber",
             },
             indent=2,
