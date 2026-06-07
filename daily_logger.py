@@ -314,6 +314,11 @@ TOOLTIP_WRAP_PX = 220
 TOOLTIP_WRAP_PX_MAX = 280
 JOURNAL_PREF_THEME_KEY = "journal_window_theme"
 JOURNAL_PREF_FULLSCREEN_KEY = "journal_window_fullscreen"
+SIDEBAR_MODULE_ORDER_PREF_KEY = "sidebar_module_order"
+SIDEBAR_DEFAULT_MODULE_ORDER = ("journal", "ai_recap", "chatbot", "console", "reader", "settings")
+SIDEBAR_TOP_SLOT_COUNT = 8
+SIDEBAR_BOTTOM_SLOT_COUNT = 2
+SIDEBAR_TOTAL_SLOT_COUNT = SIDEBAR_TOP_SLOT_COUNT + SIDEBAR_BOTTOM_SLOT_COUNT
 JOURNAL_TEXT_FONT_FAMILY = "Microsoft YaHei UI"
 
 
@@ -6018,7 +6023,8 @@ def open_journal_window_editor(
 
     nav_rail = tk.Frame(shell, bg=t_init.panel, width=170, bd=0, highlightthickness=0)
     nav_rail.grid(row=0, column=0, sticky="nsw")
-    nav_rail.grid_rowconfigure(100, weight=1)
+    nav_rail.grid_rowconfigure(98, weight=1)
+    nav_rail.grid_rowconfigure(100, weight=0)
     nav_rail.grid_columnconfigure(0, weight=1)
     nav_rail.grid_propagate(False)
 
@@ -6037,7 +6043,15 @@ def open_journal_window_editor(
     chatbot_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
     console_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
     settings_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
-    for _p in (journal_page, ai_recap_page, chatbot_page, console_page, settings_page):
+    module_library_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
+    for _p in (
+        journal_page,
+        ai_recap_page,
+        chatbot_page,
+        console_page,
+        settings_page,
+        module_library_page,
+    ):
         _p.grid(row=0, column=0, sticky="nsew")
     # Ensure first paint shows Journal instead of last-created stacked page.
     journal_page.tkraise()
@@ -6056,8 +6070,19 @@ def open_journal_window_editor(
     nav_title.grid(row=0, column=0, sticky="w", padx=(12, 0), pady=(14, 10))
 
     nav_buttons: Dict[str, Any] = {}
-    nav_extra_buttons: List[Any] = []
-    _virtual_reader_nav_btn_slot: List[Any] = [None]
+    nav_module_widgets: Dict[str, Dict[str, Any]] = {}
+    nav_module_order_state: Dict[str, List[str]] = {"ids": []}
+    nav_edit_state: Dict[str, Any] = {
+        "active": False,
+        "press_module": "",
+        "press_after": None,
+        "long_hold": False,
+        "dragging": False,
+        "drag_module": "",
+        "placeholder_index": None,
+        "hover_replace_module": "",
+        "library_drag_module": "",
+    }
     active_page = {"key": "journal"}
     active_page_frame: Dict[str, Any] = {"frame": None}
     page_leave_reset_handlers: Dict[str, Callable[[], None]] = {}
@@ -6093,6 +6118,7 @@ def open_journal_window_editor(
             "chatbot": chatbot_page,
             "console": console_page,
             "settings": settings_page,
+            "module_library": module_library_page,
         }
         prev_key = active_page["key"]
         if page_key == "console":
@@ -6108,13 +6134,10 @@ def open_journal_window_editor(
         console_row = console_input_holder.get("row")
         if console_row is not None:
             _layout_console_row(frame)
-        for key, btn in nav_buttons.items():
-            if key == page_key:
-                btn.config(bg=th().accent, fg="white")
-            else:
-                btn.config(bg=th().btn_secondary, fg=th().text)
-        for btn in nav_extra_buttons:
-            btn.config(bg=th().btn_secondary, fg=th().text)
+        try:
+            _refresh_sidebar_module_styles()
+        except NameError:
+            pass
 
     page_toggle_buttons: List[Any] = []
     nav_summon_btn = tk.Button(
@@ -6236,7 +6259,14 @@ def open_journal_window_editor(
                 for btn in page_toggle_buttons:
                     _place_page_toggle(btn)
                 restore_key = nav_restore_page.get("key", "journal")
-                if restore_key in ("journal", "ai_recap", "chatbot", "console", "settings"):
+                if restore_key in (
+                    "journal",
+                    "ai_recap",
+                    "chatbot",
+                    "console",
+                    "settings",
+                    "module_library",
+                ):
                     show_page(restore_key)
 
             _animate_width(0, nav_full_width, _on_expand_done)
@@ -14540,14 +14570,8 @@ def open_journal_window_editor(
         start_menu_app_btn.config(text=tr("settings.start_menu_app"))
         start_menu_journal_btn.config(text=tr("settings.start_menu_journal"))
         start_menu_reader_btn.config(text=tr("settings.start_menu_reader"))
-        nav_buttons["journal"].config(text=tr("nav.journal"))
-        nav_buttons["ai_recap"].config(text=tr("nav.ai_recap"))
-        nav_buttons["chatbot"].config(text=tr("nav.chatbot"))
-        nav_buttons["console"].config(text=tr("nav.console"))
-        _vr_nav = _virtual_reader_nav_btn_slot[0]
-        if _vr_nav is not None:
-            _vr_nav.config(text=tr("nav.reader_short"))
-        nav_settings_btn.config(text=tr("nav.settings"))
+        _refresh_sidebar_module_styles()
+        _render_module_library()
         date_lbl.config(text=tr("journal.date"))
         time_lbl.config(text=tr("journal.time"))
         update_time_btn.config(text=tr("journal.update_time"))
@@ -14614,18 +14638,16 @@ def open_journal_window_editor(
         shell.configure(bg=t.surface)
         nav_rail.configure(bg=t.panel)
         nav_title.configure(bg=t.panel, fg=t.muted)
-        nav_bottom_row.configure(bg=t.panel)
+        nav_modules_frame.configure(bg=t.panel)
+        nav_bottom_frame.configure(bg=t.panel)
+        nav_add_canvas.configure(bg=t.panel)
+        for _placeholder in nav_drop_placeholders:
+            _placeholder.configure(bg=t.panel)
         nav_summon_btn.configure(
             bg=t.toolbar_btn_config()[0],
             fg=t.toolbar_btn_config()[1],
             activebackground=t.toolbar_btn_config()[2],
             activeforeground=t.toolbar_btn_config()[3],
-        )
-        nav_settings_btn.configure(
-            bg=t.btn_secondary,
-            fg=t.text,
-            activebackground=t.secondary_hover,
-            activeforeground=t.text,
         )
         content_host.configure(bg=t.surface)
         journal_page.configure(bg=t.surface)
@@ -14633,6 +14655,9 @@ def open_journal_window_editor(
         chatbot_page.configure(bg=t.surface)
         console_page.configure(bg=t.surface)
         settings_page.configure(bg=t.surface)
+        module_library_page.configure(bg=t.surface)
+        _refresh_sidebar_module_styles()
+        _render_module_library()
         for _w in placeholder_frames:
             _w.configure(bg=t.surface)
         for _w in placeholder_title_labels:
@@ -14695,28 +14720,7 @@ def open_journal_window_editor(
                 activebackground=t.toolbar_btn_config()[2],
                 activeforeground=t.toolbar_btn_config()[3],
             )
-        for key, btn in nav_buttons.items():
-            if active_page["key"] == key:
-                btn.config(
-                    bg=t.accent,
-                    fg="white",
-                    activebackground=t.hover_primary,
-                    activeforeground="white",
-                )
-            else:
-                btn.config(
-                    bg=t.btn_secondary,
-                    fg=t.text,
-                    activebackground=t.secondary_hover,
-                    activeforeground=t.text,
-                )
-        for btn in nav_extra_buttons:
-            btn.config(
-                bg=t.btn_secondary,
-                fg=t.text,
-                activebackground=t.secondary_hover,
-                activeforeground=t.text,
-            )
+        _refresh_sidebar_module_styles()
         top.configure(bg=t.panel)
         top.pack_configure(padx=t.pad_outer, pady=t.pad_top_y)
         find_row.configure(bg=t.panel)
@@ -14950,113 +14954,958 @@ def open_journal_window_editor(
         theme_holder[0] = journal_window_theme_spec_for_key(nxt)
         apply_journal_window_colors()
 
-    nav_specs: List[Tuple[str, str]] = [
-        ("journal", "Journal"),
-        ("ai_recap", "AI Recap"),
-        ("chatbot", "Chatbot"),
-        ("console", "Console"),
-    ]
-    for _idx, (_key, _label) in enumerate(nav_specs, start=1):
-        _btn = tk.Button(
-            nav_rail,
-            text=_label,
-            command=lambda k=_key: show_page(k),
-            relief="flat",
-            font=("Segoe UI", 10, "bold"),
-            padx=10,
-            pady=8,
-            anchor="w",
-            cursor="hand2",
-        )
-        _nav_row = 5 if _key == "console" else _idx
-        _btn.grid(row=_nav_row, column=0, sticky="ew", padx=10, pady=(0, 8))
-        nav_buttons[_key] = _btn
-        bind_button_hover_if_enabled(
-            _btn,
-            lambda b=_btn, k=_key: (
-                "normal",
-                th().accent if active_page["key"] == k else th().btn_secondary,
-                "white" if active_page["key"] == k else th().text,
-                th().hover_primary if active_page["key"] == k else th().secondary_hover,
-                "white" if active_page["key"] == k else th().text,
-            ),
-            lambda k=_key: th().hover_primary if active_page["key"] == k else th().secondary_hover,
-            lambda k=_key: "white" if active_page["key"] == k else th().text,
-        )
-
     def on_virtual_reader_nav_clicked() -> None:
         ok, err = open_virtual_reader_nav_action()
         if not ok and err:
             messagebox.showerror(tr("msg.virtual_reader_title"), err)
 
-    nav_bottom_row = tk.Frame(nav_rail, bg=t_init.panel)
-    nav_bottom_row.grid(row=101, column=0, sticky="ew", padx=10, pady=(0, 10))
-    nav_bottom_row.grid_columnconfigure(0, weight=1, uniform="nav_bottom")
-    nav_bottom_row.grid_columnconfigure(1, weight=1, uniform="nav_bottom")
+    sidebar_module_defs: Dict[str, Dict[str, Any]] = {
+        "journal": {"label_key": "nav.journal", "page": "journal"},
+        "ai_recap": {"label_key": "nav.ai_recap", "page": "ai_recap"},
+        "chatbot": {"label_key": "nav.chatbot", "page": "chatbot"},
+        "console": {"label_key": "nav.console", "page": "console"},
+        "reader": {
+            "label_key": "nav.virtual_reader",
+            "short_label_key": "nav.reader_short",
+            "action": on_virtual_reader_nav_clicked,
+        },
+        "settings": {"label_key": "nav.settings", "page": "settings"},
+    }
+    sidebar_all_module_ids = tuple(
+        mid for mid in SIDEBAR_DEFAULT_MODULE_ORDER if mid in sidebar_module_defs
+    )
 
-    _vr_nav_btn = tk.Button(
-        nav_bottom_row,
-        text=tr("nav.reader_short"),
-        command=on_virtual_reader_nav_clicked,
-        bg=t_init.btn_secondary,
-        fg=t_init.text,
-        activebackground=t_init.secondary_hover,
-        activeforeground=t_init.text,
-        relief="flat",
-        font=("Segoe UI", 10, "bold"),
-        padx=10,
-        pady=8,
-        anchor="w",
-        cursor="hand2",
+    def _sidebar_module_label(module_id: str, *, short: bool = False) -> str:
+        info = sidebar_module_defs.get(module_id, {})
+        key = str(info.get("short_label_key" if short else "label_key") or info.get("label_key") or module_id)
+        return tr(key)
+
+    def _default_sidebar_slots() -> List[str]:
+        slots = [""] * SIDEBAR_TOTAL_SLOT_COUNT
+        for index, module_id in enumerate(("journal", "ai_recap", "chatbot", "console")):
+            if index < SIDEBAR_TOP_SLOT_COUNT:
+                slots[index] = module_id
+        slots[SIDEBAR_TOP_SLOT_COUNT] = "reader"
+        slots[SIDEBAR_TOP_SLOT_COUNT + 1] = "settings"
+        return slots
+
+    def _slot_is_bottom(slot_index: int) -> bool:
+        return slot_index >= SIDEBAR_TOP_SLOT_COUNT
+
+    def _normalize_sidebar_module_order(order: List[str]) -> List[str]:
+        slots = [""] * SIDEBAR_TOTAL_SLOT_COUNT
+        used: set[str] = set()
+        saw_empty = False
+        legacy_modules: List[str] = []
+        for item in order:
+            module_id = str(item or "").strip()
+            if not module_id:
+                saw_empty = True
+                legacy_modules.append("")
+            elif module_id in sidebar_module_defs and module_id not in used:
+                used.add(module_id)
+                legacy_modules.append(module_id)
+        if not saw_empty and [mid for mid in legacy_modules if mid] == list(sidebar_all_module_ids):
+            return _default_sidebar_slots()
+        if saw_empty:
+            for index, module_id in enumerate(legacy_modules[:SIDEBAR_TOTAL_SLOT_COUNT]):
+                slots[index] = module_id if module_id in sidebar_module_defs else ""
+            return slots
+        for index, module_id in enumerate(mid for mid in legacy_modules if mid):
+            if index >= SIDEBAR_TOTAL_SLOT_COUNT:
+                break
+            slots[index] = module_id
+        return slots
+
+    def _top_sidebar_module_ids() -> List[str]:
+        return list(nav_module_order_state["ids"][:SIDEBAR_TOP_SLOT_COUNT])
+
+    def _bottom_sidebar_module_ids() -> List[str]:
+        return list(nav_module_order_state["ids"][SIDEBAR_TOP_SLOT_COUNT:SIDEBAR_TOTAL_SLOT_COUNT])
+
+    def _visible_sidebar_module_ids() -> List[str]:
+        return [mid for mid in nav_module_order_state["ids"] if mid]
+
+    def _module_slot_index(module_id: str) -> Optional[int]:
+        for index, slot_module_id in enumerate(nav_module_order_state["ids"]):
+            if slot_module_id == module_id:
+                return index
+        return None
+
+    def _sidebar_is_bottom_module(module_id: str) -> bool:
+        index = _module_slot_index(module_id)
+        return bool(index is not None and _slot_is_bottom(index))
+
+    def _load_sidebar_module_order() -> List[str]:
+        prefs = load_preferences()
+        if SIDEBAR_MODULE_ORDER_PREF_KEY not in prefs:
+            return _default_sidebar_slots()
+        raw = str(prefs.get(SIDEBAR_MODULE_ORDER_PREF_KEY, "") or "").strip()
+        try:
+            parsed = json.loads(raw)
+            source = parsed if isinstance(parsed, list) else []
+        except Exception:
+            source = [part.strip() for part in raw.split(",")] if raw else []
+        order: List[str] = []
+        used: set[str] = set()
+        for item in source:
+            module_id = str(item).strip()
+            if not module_id:
+                order.append("")
+            elif module_id in sidebar_module_defs and module_id not in used:
+                order.append(module_id)
+                used.add(module_id)
+        return _normalize_sidebar_module_order(order)
+
+    def _save_sidebar_module_order() -> None:
+        prefs = load_preferences()
+        prefs[SIDEBAR_MODULE_ORDER_PREF_KEY] = json.dumps(nav_module_order_state["ids"])
+        save_preferences(prefs)
+
+    nav_modules_frame = tk.Frame(nav_rail, bg=t_init.panel, bd=0, highlightthickness=0)
+    nav_modules_frame.grid(row=1, column=0, sticky="new", padx=0, pady=(0, 0))
+    nav_modules_frame.grid_columnconfigure(0, weight=1)
+
+    nav_bottom_frame = tk.Frame(nav_rail, bg=t_init.panel, bd=0, highlightthickness=0)
+    nav_bottom_frame.grid(row=101, column=0, sticky="ew", padx=10, pady=(0, 10))
+    nav_bottom_frame.grid_columnconfigure(0, weight=1, uniform="nav_bottom")
+    nav_bottom_frame.grid_columnconfigure(1, weight=1, uniform="nav_bottom")
+
+    nav_drop_placeholders: List[Any] = []
+    nav_slot_spacers: List[Any] = []
+    nav_drag_preview: Dict[str, Any] = {"window": None, "canvas": None, "module": ""}
+
+    nav_add_canvas = tk.Canvas(
+        nav_rail,
+        height=44,
+        bg=t_init.panel,
         bd=0,
         highlightthickness=0,
+        cursor="hand2",
     )
-    _virtual_reader_nav_btn_slot[0] = _vr_nav_btn
-    nav_extra_buttons.append(_vr_nav_btn)
-    bind_button_hover_if_enabled(
-        _vr_nav_btn,
-        lambda: (
-            "normal",
-            th().btn_secondary,
-            th().text,
-            th().secondary_hover,
-            th().text,
-        ),
-        lambda: th().secondary_hover,
-        lambda: th().text,
-    )
-    _vr_nav_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    nav_add_canvas.grid(row=99, column=0, sticky="ew", padx=10, pady=(6, 12))
 
-    nav_settings_btn = tk.Button(
-        nav_bottom_row,
-        text="Settings",
-        command=lambda: show_page("settings"),
+    module_library_wrap = tk.Frame(module_library_page, bg=t_init.surface)
+    module_library_wrap.pack(fill="both", expand=True, padx=28, pady=28)
+    module_library_title = tk.Label(
+        module_library_wrap,
+        text=tr("module_library.title"),
+        bg=t_init.surface,
+        fg=t_init.text,
+        font=("Segoe UI", 18, "bold"),
+        anchor="w",
+    )
+    module_library_title.pack(anchor="w")
+    module_library_body = tk.Label(
+        module_library_wrap,
+        text=tr("module_library.body"),
+        bg=t_init.surface,
+        fg=t_init.muted,
+        font=("Segoe UI", 10),
+        anchor="w",
+        justify="left",
+        wraplength=720,
+    )
+    module_library_body.pack(anchor="w", pady=(6, 18))
+    module_library_restore_btn = tk.Button(
+        module_library_wrap,
+        text=tr("module_library.restore_defaults"),
         bg=t_init.btn_secondary,
         fg=t_init.text,
         activebackground=t_init.secondary_hover,
         activeforeground=t_init.text,
         relief="flat",
         font=("Segoe UI", 9, "bold"),
-        padx=10,
+        padx=12,
         pady=8,
         cursor="hand2",
-        bd=0,
-        highlightthickness=0,
     )
-    nav_settings_btn.grid(row=0, column=1, sticky="ew")
-    nav_buttons["settings"] = nav_settings_btn
-    bind_button_hover_if_enabled(
-        nav_settings_btn,
-        lambda: (
-            "normal",
-            th().btn_secondary,
-            th().text,
-            th().secondary_hover,
-            th().text,
-        ),
-        lambda: th().secondary_hover,
-        lambda: th().text,
-    )
+    module_library_restore_btn.pack(anchor="e", pady=(0, 14))
+    module_library_cards = tk.Frame(module_library_wrap, bg=t_init.surface)
+    module_library_cards.pack(fill="both", expand=True)
+
+    def _draw_plus_canvas() -> None:
+        t = th()
+        nav_add_canvas.delete("all")
+        w = max(120, nav_add_canvas.winfo_width())
+        h = max(40, nav_add_canvas.winfo_height())
+        nav_add_canvas.configure(bg=t.panel)
+        nav_add_canvas.create_rectangle(
+            2,
+            2,
+            w - 2,
+            h - 2,
+            outline=t.muted,
+            dash=(4, 3),
+            width=1,
+            fill=t.panel,
+        )
+        nav_add_canvas.create_text(
+            w / 2,
+            h / 2,
+            text="+",
+            fill=t.muted,
+            font=("Segoe UI", 18, "bold"),
+        )
+
+    def _draw_drop_placeholder(canvas: Any, index: int, *, active: bool = False) -> None:
+        t = th()
+        canvas.delete("all")
+        w = max(72, canvas.winfo_width())
+        h = max(38, canvas.winfo_height())
+        canvas.configure(bg=t.panel)
+        outline = t.accent if active else t.muted
+        fill = t.field if active else t.panel
+        canvas.create_rectangle(
+            1,
+            1,
+            w - 1,
+            h - 1,
+            outline=outline,
+            dash=(4, 3),
+            width=1,
+            fill=fill,
+        )
+
+    def _make_drop_placeholder(index: int) -> Any:
+        parent = nav_bottom_frame if _slot_is_bottom(index) else nav_modules_frame
+        canvas = tk.Canvas(
+            parent,
+            height=38 if _slot_is_bottom(index) else 42,
+            bg=t_init.panel,
+            bd=0,
+            highlightthickness=0,
+        )
+        setattr(canvas, "_sidebar_placeholder_index", index)
+        canvas.bind(
+            "<Configure>",
+            lambda _e, c=canvas, i=index: _draw_drop_placeholder(
+                c, i, active=(nav_edit_state.get("placeholder_index") == i)
+            ),
+            add="+",
+        )
+        return canvas
+
+    def _make_slot_spacer(index: int) -> Any:
+        parent = nav_bottom_frame if _slot_is_bottom(index) else nav_modules_frame
+        spacer = tk.Frame(
+            parent,
+            height=38 if _slot_is_bottom(index) else 42,
+            bg=t_init.panel,
+            bd=0,
+            highlightthickness=0,
+        )
+        setattr(spacer, "_sidebar_spacer_index", index)
+        return spacer
+
+    def _ensure_drop_placeholders(count: int) -> None:
+        while len(nav_drop_placeholders) < count:
+            nav_drop_placeholders.append(_make_drop_placeholder(len(nav_drop_placeholders)))
+        for index, placeholder in enumerate(nav_drop_placeholders):
+            if index >= count:
+                try:
+                    placeholder.grid_forget()
+                except tk.TclError:
+                    pass
+
+    def _ensure_slot_spacers(count: int) -> None:
+        while len(nav_slot_spacers) < count:
+            nav_slot_spacers.append(_make_slot_spacer(len(nav_slot_spacers)))
+        for index, spacer in enumerate(nav_slot_spacers):
+            if index >= count:
+                try:
+                    spacer.grid_forget()
+                except tk.TclError:
+                    pass
+
+    def _normal_slot_should_leave_gap(slots: List[str], index: int) -> bool:
+        return any(bool(module_id) for module_id in slots[index + 1 :])
+
+    def _sidebar_edit_placeholder_count() -> int:
+        try:
+            rail_height = int(nav_rail.winfo_height())
+        except tk.TclError:
+            rail_height = 0
+        if rail_height <= 1:
+            return 4
+        top_rows = len(_top_sidebar_module_ids())
+        bottom_rows = 1 if _bottom_sidebar_module_ids() else 0
+        used_height = 86 + (top_rows * 52) + (bottom_rows * 48) + 58
+        available = max(56, rail_height - used_height)
+        return max(2, min(6, available // 50))
+
+    def _hide_drag_preview() -> None:
+        win = nav_drag_preview.get("window")
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+        nav_drag_preview.update({"window": None, "canvas": None, "module": ""})
+
+    def _draw_drag_preview_canvas(canvas: Any, module_id: str) -> None:
+        t = th()
+        width = max(96, int(canvas.winfo_width() or 140))
+        height = max(38, int(canvas.winfo_height() or 44))
+        canvas.delete("all")
+        canvas.configure(bg=t.panel)
+        canvas.create_rectangle(
+            1,
+            1,
+            width - 1,
+            height - 1,
+            fill=t.btn_secondary,
+            outline=t.accent,
+            dash=(4, 3),
+            width=1,
+        )
+        canvas.create_text(
+            14,
+            height / 2,
+            text=_sidebar_module_label(module_id, short=(module_id == "reader")),
+            fill=t.text,
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+        )
+
+    def _move_drag_preview(
+        module_id: str,
+        x_root: int,
+        y_root: int,
+        *,
+        snap_index: Optional[int] = None,
+    ) -> None:
+        if not module_id:
+            _hide_drag_preview()
+            return
+        win = nav_drag_preview.get("window")
+        canvas = nav_drag_preview.get("canvas")
+        if win is None or canvas is None or nav_drag_preview.get("module") != module_id:
+            _hide_drag_preview()
+            win = tk.Toplevel(root)
+            win.overrideredirect(True)
+            try:
+                win.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            canvas = tk.Canvas(
+                win,
+                width=140,
+                height=44,
+                bg=th().panel,
+                bd=0,
+                highlightthickness=0,
+            )
+            canvas.pack(fill="both", expand=True)
+            nav_drag_preview.update({"window": win, "canvas": canvas, "module": module_id})
+        width = 140
+        height = 44
+        target_x = int(x_root - (width / 2))
+        target_y = int(y_root - (height / 2))
+        if snap_index is not None and 0 <= snap_index < len(nav_drop_placeholders):
+            placeholder = nav_drop_placeholders[snap_index]
+            try:
+                if placeholder.winfo_ismapped():
+                    target_x = placeholder.winfo_rootx()
+                    target_y = placeholder.winfo_rooty()
+                    width = max(96, placeholder.winfo_width())
+                    height = max(38, placeholder.winfo_height())
+            except tk.TclError:
+                pass
+        try:
+            canvas.configure(width=width, height=height)
+            _draw_drag_preview_canvas(canvas, module_id)
+            win.geometry(f"{width}x{height}+{target_x}+{target_y}")
+        except tk.TclError:
+            pass
+
+    def _module_canvas_active(module_id: str) -> bool:
+        page = str(sidebar_module_defs.get(module_id, {}).get("page") or "")
+        return bool(page and active_page["key"] == page)
+
+    def _draw_module_canvas(module_id: str) -> None:
+        data = nav_module_widgets.get(module_id)
+        if not data:
+            return
+        canvas = data["canvas"]
+        t = th()
+        edit_active = bool(nav_edit_state.get("active"))
+        is_active = _module_canvas_active(module_id)
+        bg = t.accent if is_active and not edit_active else t.btn_secondary
+        fg = "white" if is_active and not edit_active else t.text
+        outline = t.accent if edit_active else bg
+        dash = (4, 3) if edit_active else None
+        w = max(48, canvas.winfo_width())
+        h = max(34, canvas.winfo_height())
+        canvas.delete("all")
+        canvas.configure(bg=t.panel)
+        canvas.create_rectangle(
+            1,
+            1,
+            w - 1,
+            h - 1,
+            fill=bg,
+            outline=outline,
+            dash=dash,
+            width=1,
+        )
+        label = _sidebar_module_label(module_id, short=(module_id == "reader"))
+        text_x = 14
+        if edit_active:
+            canvas.create_text(
+                12,
+                h / 2,
+                text="⋮⋮",
+                fill=t.muted,
+                font=("Segoe UI", 8, "bold"),
+                anchor="w",
+            )
+            text_x = 30
+        canvas.create_text(
+            text_x,
+            h / 2,
+            text=label,
+            fill=fg,
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+        )
+        if edit_active:
+            x0 = max(6, w - 25)
+            canvas.create_oval(x0, 9, x0 + 18, 27, fill=t.surface, outline=t.border)
+            canvas.create_text(x0 + 9, 18, text="×", fill=t.text, font=("Segoe UI", 10, "bold"))
+
+    def _refresh_sidebar_module_styles() -> None:
+        for module_id in list(nav_module_widgets):
+            _draw_module_canvas(module_id)
+        _draw_plus_canvas()
+        active_index = nav_edit_state.get("placeholder_index")
+        for index, placeholder in enumerate(nav_drop_placeholders):
+            _draw_drop_placeholder(placeholder, index, active=(active_index == index))
+        for spacer in nav_slot_spacers:
+            try:
+                spacer.configure(bg=th().panel)
+            except tk.TclError:
+                pass
+
+    def _layout_sidebar_modules() -> None:
+        for data in nav_module_widgets.values():
+            try:
+                data["canvas"].grid_forget()
+            except tk.TclError:
+                pass
+        for placeholder in nav_drop_placeholders:
+            try:
+                placeholder.grid_forget()
+            except tk.TclError:
+                pass
+        for spacer in nav_slot_spacers:
+            try:
+                spacer.grid_forget()
+            except tk.TclError:
+                pass
+        edit_active = bool(nav_edit_state.get("active"))
+        row = 0
+        _ensure_drop_placeholders(SIDEBAR_TOTAL_SLOT_COUNT)
+        _ensure_slot_spacers(SIDEBAR_TOTAL_SLOT_COUNT)
+        top_slots = nav_module_order_state["ids"][:SIDEBAR_TOP_SLOT_COUNT]
+        for slot_index, module_id in enumerate(top_slots):
+            if module_id:
+                data = nav_module_widgets.get(module_id)
+                if data:
+                    data["canvas"].grid(row=row, column=0, sticky="ew", padx=10, pady=(0, 8))
+                    row += 1
+            elif edit_active and slot_index < len(nav_drop_placeholders):
+                nav_drop_placeholders[slot_index].grid(
+                    row=row,
+                    column=0,
+                    sticky="ew",
+                    padx=10,
+                    pady=(0, 8),
+                )
+                row += 1
+            elif (
+                not edit_active
+                and slot_index < len(nav_slot_spacers)
+                and _normal_slot_should_leave_gap(top_slots, slot_index)
+            ):
+                nav_slot_spacers[slot_index].grid(
+                    row=row,
+                    column=0,
+                    sticky="ew",
+                    padx=10,
+                    pady=(0, 8),
+                )
+                row += 1
+        if edit_active or not _visible_sidebar_module_ids():
+            nav_add_canvas.grid(row=99, column=0, sticky="ew", padx=10, pady=(6, 12))
+        else:
+            nav_add_canvas.grid_forget()
+        bottom_slots = _bottom_sidebar_module_ids()
+        show_bottom = any(bottom_slots) or edit_active
+        if show_bottom:
+            nav_bottom_frame.grid(row=101, column=0, sticky="ew", padx=10, pady=(0, 10))
+            for col in (0, 1):
+                nav_bottom_frame.grid_columnconfigure(col, weight=1, uniform="nav_bottom")
+            for bottom_index, module_id in enumerate(bottom_slots[:SIDEBAR_BOTTOM_SLOT_COUNT]):
+                slot_index = SIDEBAR_TOP_SLOT_COUNT + bottom_index
+                padx = (0, 6) if bottom_index == 0 else (0, 0)
+                if module_id:
+                    data = nav_module_widgets.get(module_id)
+                    if not data:
+                        continue
+                    canvas = data["canvas"]
+                    canvas.configure(height=38)
+                    canvas.grid(row=0, column=bottom_index, sticky="ew", padx=padx)
+                elif edit_active and slot_index < len(nav_drop_placeholders):
+                    nav_drop_placeholders[slot_index].grid(
+                        row=0,
+                        column=bottom_index,
+                        sticky="ew",
+                        padx=padx,
+                    )
+                elif (
+                    not edit_active
+                    and slot_index < len(nav_slot_spacers)
+                    and _normal_slot_should_leave_gap(bottom_slots, bottom_index)
+                ):
+                    nav_slot_spacers[slot_index].grid(
+                        row=0,
+                        column=bottom_index,
+                        sticky="ew",
+                        padx=padx,
+                    )
+        else:
+            nav_bottom_frame.grid_forget()
+        _refresh_sidebar_module_styles()
+
+    def _target_sidebar_module_from_pointer(x_root: int, y_root: int) -> str:
+        try:
+            widget = root.winfo_containing(x_root, y_root)
+        except tk.TclError:
+            return ""
+        while widget is not None:
+            module_id = getattr(widget, "_sidebar_module_id", "")
+            if module_id:
+                return str(module_id)
+            widget = getattr(widget, "master", None)
+        return ""
+
+    def _drop_index_from_root_y(y_root: int) -> int:
+        order = _top_sidebar_module_ids()
+        for index, module_id in enumerate(order):
+            data = nav_module_widgets.get(module_id)
+            if not data:
+                continue
+            canvas = data["canvas"]
+            try:
+                mid_y = canvas.winfo_rooty() + (canvas.winfo_height() / 2)
+            except tk.TclError:
+                continue
+            if y_root < mid_y:
+                return index
+        return len(order)
+
+    def _placeholder_index_from_pointer(x_root: int, y_root: int) -> Optional[int]:
+        for index, placeholder in enumerate(nav_drop_placeholders):
+            try:
+                if not placeholder.winfo_ismapped():
+                    continue
+                left = int(placeholder.winfo_rootx())
+                top = int(placeholder.winfo_rooty())
+                width = int(placeholder.winfo_width())
+                height = int(placeholder.winfo_height())
+            except tk.TclError:
+                continue
+            margin = 12
+            if (
+                left - margin <= x_root <= left + width + margin
+                and top - margin <= y_root <= top + height + margin
+            ):
+                return index
+        return None
+
+    def _insert_index_for_placeholder(module_id: str, placeholder_index: int) -> int:
+        return max(0, min(placeholder_index, SIDEBAR_TOTAL_SLOT_COUNT - 1))
+
+    def _first_empty_sidebar_slot() -> Optional[int]:
+        for index, module_id in enumerate(nav_module_order_state["ids"]):
+            if not module_id:
+                return index
+        return None
+
+    def _target_insert_index_from_pointer(module_id: str, x_root: int, y_root: int) -> Optional[int]:
+        target_module = _target_sidebar_module_from_pointer(x_root, y_root)
+        if not target_module or target_module == module_id:
+            return None
+        return _module_slot_index(target_module)
+
+    def _sidebar_close_hit(canvas: Any, event: Any) -> bool:
+        try:
+            x = int(getattr(event, "x", 0))
+            y = int(getattr(event, "y", 0))
+            width = int(canvas.winfo_width())
+            height = int(canvas.winfo_height())
+        except (tk.TclError, TypeError, ValueError):
+            return False
+        close_left = max(0, width - 32)
+        close_top = 4
+        close_bottom = min(height, 32)
+        return close_left <= x <= width and close_top <= y <= close_bottom
+
+    def _pointer_inside_sidebar(x_root: int, y_root: int) -> bool:
+        try:
+            left = nav_rail.winfo_rootx()
+            top = nav_rail.winfo_rooty()
+            return (
+                left <= x_root <= left + nav_rail.winfo_width()
+                and top <= y_root <= top + nav_rail.winfo_height()
+            )
+        except tk.TclError:
+            return False
+
+    def _enter_sidebar_edit_mode(module_id: str = "") -> None:
+        nav_edit_state["active"] = True
+        nav_edit_state["long_hold"] = True
+        nav_edit_state["drag_module"] = module_id
+        nav_edit_state["placeholder_index"] = None
+        _layout_sidebar_modules()
+
+    def _exit_sidebar_edit_mode() -> None:
+        _hide_drag_preview()
+        after_id = nav_edit_state.get("press_after")
+        if after_id is not None:
+            try:
+                root.after_cancel(after_id)
+            except Exception:
+                pass
+        nav_edit_state.update(
+            {
+                "active": False,
+                "press_module": "",
+                "press_after": None,
+                "long_hold": False,
+                "dragging": False,
+                "drag_module": "",
+                "placeholder_index": None,
+                "library_drag_module": "",
+            }
+        )
+        _layout_sidebar_modules()
+
+    def _show_first_sidebar_page_or_library() -> None:
+        for module_id in _visible_sidebar_module_ids():
+            page = str(sidebar_module_defs.get(module_id, {}).get("page") or "")
+            if page:
+                show_page(page)
+                return
+        show_page("module_library")
+
+    def _show_module_library() -> None:
+        _render_module_library()
+        show_page("module_library")
+
+    def _set_sidebar_order(order: List[str], *, persist: bool = True) -> None:
+        cleaned = _normalize_sidebar_module_order(order)
+        nav_module_order_state["ids"] = cleaned
+        if persist:
+            _save_sidebar_module_order()
+        _rebuild_sidebar_module_widgets()
+        _render_module_library()
+        if not _visible_sidebar_module_ids() and active_page["key"] != "module_library":
+            show_page("module_library")
+
+    def _remove_sidebar_module(module_id: str) -> None:
+        if module_id not in nav_module_order_state["ids"]:
+            return
+        removed_page = str(sidebar_module_defs.get(module_id, {}).get("page") or "")
+        slots = list(nav_module_order_state["ids"])
+        for index, slot_module_id in enumerate(slots):
+            if slot_module_id == module_id:
+                slots[index] = ""
+        _set_sidebar_order(slots)
+        if removed_page and active_page["key"] == removed_page:
+            _show_first_sidebar_page_or_library()
+
+    def _move_sidebar_module(module_id: str, index: int) -> None:
+        slots = list(nav_module_order_state["ids"])
+        if not slots:
+            slots = [""] * SIDEBAR_TOTAL_SLOT_COUNT
+        index = max(0, min(index, SIDEBAR_TOTAL_SLOT_COUNT - 1))
+        source_index = _module_slot_index(module_id)
+        if source_index == index:
+            _layout_sidebar_modules()
+            return
+        target_module = slots[index] if index < len(slots) else ""
+        if source_index is not None and source_index < len(slots):
+            slots[source_index] = target_module if target_module != module_id else ""
+        slots[index] = module_id
+        _set_sidebar_order(slots)
+
+    def _drop_library_module(module_id: str, *, index: Optional[int] = None, replace_id: str = "") -> None:
+        if module_id not in sidebar_module_defs:
+            return
+        slots = list(nav_module_order_state["ids"])
+        for slot_index, slot_module_id in enumerate(slots):
+            if slot_module_id == module_id:
+                slots[slot_index] = ""
+        target_index = _module_slot_index(replace_id) if replace_id else index
+        if target_index is None:
+            target_index = _first_empty_sidebar_slot()
+        if target_index is None:
+            target_index = SIDEBAR_TOTAL_SLOT_COUNT - 1
+        target_index = max(0, min(target_index, SIDEBAR_TOTAL_SLOT_COUNT - 1))
+        slots[target_index] = module_id
+        _set_sidebar_order(slots)
+
+    def _handle_sidebar_module_action(module_id: str) -> None:
+        if nav_edit_state.get("active"):
+            return
+        info = sidebar_module_defs.get(module_id, {})
+        page = str(info.get("page") or "")
+        if page:
+            show_page(page)
+            return
+        action = info.get("action")
+        if callable(action):
+            action()
+
+    def _cancel_sidebar_long_hold() -> None:
+        after_id = nav_edit_state.get("press_after")
+        if after_id is not None:
+            try:
+                root.after_cancel(after_id)
+            except Exception:
+                pass
+        nav_edit_state["press_after"] = None
+
+    def _on_sidebar_module_press(module_id: str, event: Any) -> str:
+        nav_edit_state["press_module"] = module_id
+        nav_edit_state["long_hold"] = False
+        nav_edit_state["dragging"] = False
+        nav_edit_state["drag_module"] = module_id
+        nav_edit_state["press_y_root"] = int(getattr(event, "y_root", 0))
+        _cancel_sidebar_long_hold()
+        nav_edit_state["press_after"] = root.after(
+            600, lambda mid=module_id: _enter_sidebar_edit_mode(mid)
+        )
+        return "break"
+
+    def _on_sidebar_module_motion(module_id: str, event: Any) -> str:
+        if not nav_edit_state.get("active"):
+            return "break"
+        was_dragging = bool(nav_edit_state.get("dragging"))
+        nav_edit_state["dragging"] = True
+        nav_edit_state["drag_module"] = module_id
+        x_root = int(getattr(event, "x_root", 0))
+        y_root = int(getattr(event, "y_root", 0))
+        index = _placeholder_index_from_pointer(x_root, y_root)
+        if (not was_dragging) or nav_edit_state.get("placeholder_index") != index:
+            nav_edit_state["placeholder_index"] = index
+            _layout_sidebar_modules()
+        _move_drag_preview(
+            module_id,
+            x_root,
+            y_root,
+            snap_index=index if isinstance(index, int) else None,
+        )
+        return "break"
+
+    def _on_sidebar_module_release(module_id: str, event: Any) -> str:
+        _cancel_sidebar_long_hold()
+        canvas = nav_module_widgets.get(module_id, {}).get("canvas")
+        if nav_edit_state.get("active"):
+            if canvas is not None and _sidebar_close_hit(canvas, event):
+                _hide_drag_preview()
+                _remove_sidebar_module(module_id)
+                return "break"
+            if nav_edit_state.get("dragging"):
+                _hide_drag_preview()
+                index = nav_edit_state.get("placeholder_index")
+                nav_edit_state["placeholder_index"] = None
+                if isinstance(index, int):
+                    _move_sidebar_module(module_id, _insert_index_for_placeholder(module_id, index))
+                else:
+                    x_root = int(getattr(event, "x_root", 0))
+                    y_root = int(getattr(event, "y_root", 0))
+                    target_index = _target_insert_index_from_pointer(module_id, x_root, y_root)
+                    if isinstance(target_index, int):
+                        _move_sidebar_module(module_id, target_index)
+                    else:
+                        _layout_sidebar_modules()
+                return "break"
+            _hide_drag_preview()
+            _refresh_sidebar_module_styles()
+            return "break"
+        if not nav_edit_state.get("long_hold"):
+            _handle_sidebar_module_action(module_id)
+        return "break"
+
+    def _make_sidebar_module_canvas(module_id: str) -> Any:
+        parent = nav_bottom_frame if _sidebar_is_bottom_module(module_id) else nav_modules_frame
+        canvas = tk.Canvas(
+            parent,
+            height=44,
+            bg=t_init.panel,
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        setattr(canvas, "_sidebar_module_id", module_id)
+        canvas.bind("<ButtonPress-1>", lambda e, mid=module_id: _on_sidebar_module_press(mid, e), add="+")
+        canvas.bind("<B1-Motion>", lambda e, mid=module_id: _on_sidebar_module_motion(mid, e), add="+")
+        canvas.bind("<ButtonRelease-1>", lambda e, mid=module_id: _on_sidebar_module_release(mid, e), add="+")
+        canvas.bind("<Configure>", lambda _e, mid=module_id: _draw_module_canvas(mid), add="+")
+        return canvas
+
+    def _rebuild_sidebar_module_widgets() -> None:
+        for data in list(nav_module_widgets.values()):
+            try:
+                data["canvas"].destroy()
+            except tk.TclError:
+                pass
+        nav_module_widgets.clear()
+        nav_buttons.clear()
+        for module_id in nav_module_order_state["ids"]:
+            if not module_id:
+                continue
+            canvas = _make_sidebar_module_canvas(module_id)
+            nav_module_widgets[module_id] = {"canvas": canvas}
+            nav_buttons[module_id] = canvas
+        _layout_sidebar_modules()
+
+    def _on_plus_clicked(_event: Optional[Any] = None) -> str:
+        if not nav_edit_state.get("active"):
+            nav_edit_state["active"] = True
+            nav_edit_state["long_hold"] = True
+        nav_edit_state["placeholder_index"] = None
+        _layout_sidebar_modules()
+        _show_module_library()
+        return "break"
+
+    def _library_card_bind_drag(widget: Any, module_id: str) -> None:
+        def _press(event: Any, mid: str = module_id) -> str:
+            nav_edit_state["library_drag_module"] = mid
+            nav_edit_state["active"] = True
+            nav_edit_state["placeholder_index"] = None
+            _refresh_sidebar_module_styles()
+            _move_drag_preview(mid, int(event.x_root), int(event.y_root))
+            return "break"
+
+        def _motion(event: Any, mid: str = module_id) -> str:
+            if not nav_edit_state.get("library_drag_module"):
+                return "break"
+            nav_edit_state["placeholder_index"] = _placeholder_index_from_pointer(
+                int(event.x_root),
+                int(event.y_root),
+            )
+            _layout_sidebar_modules()
+            index = nav_edit_state.get("placeholder_index")
+            _move_drag_preview(
+                mid,
+                int(event.x_root),
+                int(event.y_root),
+                snap_index=index if isinstance(index, int) else None,
+            )
+            return "break"
+
+        def _release(event: Any, mid: str = module_id) -> str:
+            _hide_drag_preview()
+            replace_id = _target_sidebar_module_from_pointer(int(event.x_root), int(event.y_root))
+            drop_index = nav_edit_state.get("placeholder_index")
+            nav_edit_state["library_drag_module"] = ""
+            nav_edit_state["placeholder_index"] = None
+            if replace_id:
+                target_index = _target_insert_index_from_pointer(mid, int(event.x_root), int(event.y_root))
+                _drop_library_module(mid, index=target_index if isinstance(target_index, int) else None)
+            elif isinstance(drop_index, int):
+                _drop_library_module(mid, index=_insert_index_for_placeholder(mid, drop_index))
+            else:
+                _layout_sidebar_modules()
+                _render_module_library()
+            return "break"
+
+        widget.bind("<ButtonPress-1>", _press, add="+")
+        widget.bind("<B1-Motion>", _motion, add="+")
+        widget.bind("<ButtonRelease-1>", _release, add="+")
+
+    def _render_module_library() -> None:
+        for child in list(module_library_cards.winfo_children()):
+            child.destroy()
+        t = th()
+        visible = set(_visible_sidebar_module_ids())
+        module_library_wrap.configure(bg=t.surface)
+        module_library_cards.configure(bg=t.surface)
+        module_library_title.configure(bg=t.surface, fg=t.text, text=tr("module_library.title"))
+        module_library_body.configure(bg=t.surface, fg=t.muted, text=tr("module_library.body"))
+        module_library_restore_btn.configure(
+            text=tr("module_library.restore_defaults"),
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+        )
+        for index, module_id in enumerate(sidebar_all_module_ids):
+            card = tk.Frame(
+                module_library_cards,
+                bg=t.panel,
+                highlightthickness=1,
+                highlightbackground=t.border,
+                bd=0,
+            )
+            card.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0, 12), pady=(0, 12))
+            module_library_cards.grid_columnconfigure(index % 2, weight=1)
+            setattr(card, "_library_module_id", module_id)
+            _library_card_bind_drag(card, module_id)
+            title = tk.Label(
+                card,
+                text=_sidebar_module_label(module_id),
+                bg=t.panel,
+                fg=t.text,
+                font=("Segoe UI", 11, "bold"),
+                anchor="w",
+            )
+            title.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 2))
+            status_key = "module_library.visible" if module_id in visible else "module_library.hidden"
+            status = tk.Label(
+                card,
+                text=tr(status_key),
+                bg=t.panel,
+                fg=t.muted,
+                font=("Segoe UI", 9),
+                anchor="w",
+            )
+            status.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 10))
+            add_btn = tk.Button(
+                card,
+                text=tr("module_library.add"),
+                command=lambda mid=module_id: _drop_library_module(mid),
+                bg=t.btn_secondary,
+                fg=t.text,
+                activebackground=t.secondary_hover,
+                activeforeground=t.text,
+                relief="flat",
+                font=("Segoe UI", 9, "bold"),
+                padx=10,
+                pady=6,
+                cursor="hand2",
+            )
+            add_btn.grid(row=0, column=1, rowspan=2, padx=(0, 12), pady=10)
+            card.grid_columnconfigure(0, weight=1)
+            if module_id in visible:
+                add_btn.config(state="disabled", cursor="arrow")
+            for widget in (title, status):
+                _library_card_bind_drag(widget, module_id)
+
+    def _restore_default_sidebar_modules() -> None:
+        _exit_sidebar_edit_mode()
+        _set_sidebar_order(list(sidebar_all_module_ids))
+        _show_first_sidebar_page_or_library()
+
+    nav_add_canvas.bind("<Button-1>", _on_plus_clicked, add="+")
+    nav_add_canvas.bind("<Configure>", lambda _e: _draw_plus_canvas(), add="+")
+    module_library_restore_btn.config(command=_restore_default_sidebar_modules)
+    nav_module_order_state["ids"] = _load_sidebar_module_order()
+    _rebuild_sidebar_module_widgets()
 
     nav_summon_btn.config(command=lambda: set_nav_visible(True))
     def _on_content_host_configure(_e: Optional[Any] = None) -> None:
@@ -15093,15 +15942,43 @@ def open_journal_window_editor(
         if evt is None:
             return
         w = getattr(evt, "widget", None)
+        if nav_edit_state.get("active"):
+            current = w
+            inside_nav = False
+            inside_library = False
+            while current is not None:
+                if current is nav_rail:
+                    inside_nav = True
+                    break
+                if current is module_library_page:
+                    inside_library = True
+                    break
+                current = getattr(current, "master", None)
+            if inside_nav:
+                target_module = _target_sidebar_module_from_pointer(
+                    int(getattr(evt, "x_root", 0)),
+                    int(getattr(evt, "y_root", 0)),
+                )
+                is_placeholder = any(w is placeholder for placeholder in nav_drop_placeholders)
+                if not target_module and w is not nav_add_canvas and not is_placeholder:
+                    _exit_sidebar_edit_mode()
+            elif not inside_library:
+                _exit_sidebar_edit_mode()
         if isinstance(w, tk.Button) and w is not console_entry:
             root.focus_set()
 
     root.bind_all("<Button-1>", _unfocus_console_on_button_click, add="+")
     root.bind("<F11>", _on_toggle_fullscreen, add="+")
     _startup_step("splash.detail.finalize")
-    show_page("journal")
+    if "journal" in nav_module_order_state["ids"]:
+        show_page("journal")
+    else:
+        _show_first_sidebar_page_or_library()
 
     def _on_escape(event=None) -> None:
+        if nav_edit_state.get("active"):
+            _exit_sidebar_edit_mode()
+            return
         if str(find_row.winfo_manager()) == "pack":
             _find_close()
             return
