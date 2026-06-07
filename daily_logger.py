@@ -595,7 +595,7 @@ def load_journal_window_theme_spec() -> JournalWindowThemeSpec:
     prefs = load_preferences()
     return (
         JOURNAL_THEME_DARK
-        if normalize_journal_window_theme_key(prefs.get(JOURNAL_PREF_THEME_KEY, "light"))
+        if normalize_journal_window_theme_key(prefs.get(JOURNAL_PREF_THEME_KEY, "dark"))
         == "dark"
         else JOURNAL_THEME_LIGHT
     )
@@ -3394,17 +3394,43 @@ def _safe_to_schedule_app_folder_delete(app_folder: Path, exe_path: Path) -> Tup
     return True, ""
 
 
+def _safe_empty_parent_after_app_delete(app_folder: Path) -> Optional[Path]:
+    folder = _resolve_path_for_compare(app_folder)
+    parent = _resolve_path_for_compare(folder.parent)
+    try:
+        if parent == folder or parent == Path(parent.anchor):
+            return None
+    except OSError:
+        return None
+    parent_name = parent.name.casefold()
+    folder_name = folder.name.casefold()
+    if folder_name != "dailylogger":
+        return None
+    if not (
+        parent_name == "dailyloggerportable"
+        or parent_name.startswith("dailyloggerportable")
+        or parent_name in {"daily logger portable", "daily logger"}
+    ):
+        return None
+    return parent
+
+
 def _schedule_windows_app_folder_delete(app_folder: Path, exe_path: Path) -> Tuple[bool, str]:
     ok, reason = _safe_to_schedule_app_folder_delete(app_folder, exe_path)
     if not ok:
         return False, reason
     script_path = Path(tempfile.gettempdir()) / f"daily_logger_uninstall_{int(time.time())}_{secrets.token_hex(3)}.cmd"
     app_dir = str(_resolve_path_for_compare(app_folder))
+    parent_dir = ""
+    safe_parent = _safe_empty_parent_after_app_delete(app_folder)
+    if safe_parent is not None:
+        parent_dir = str(safe_parent)
     pid = os.getpid()
     script = (
         "@echo off\n"
         "setlocal\n"
         f'set "APP_DIR={app_dir}"\n'
+        f'set "APP_PARENT={parent_dir}"\n'
         f"set \"APP_PID={pid}\"\n"
         ":wait_for_daily_logger\n"
         'tasklist /FI "PID eq %APP_PID%" 2>nul | find "%APP_PID%" >nul\n'
@@ -3414,6 +3440,7 @@ def _schedule_windows_app_folder_delete(app_folder: Path, exe_path: Path) -> Tup
         ")\n"
         'cd /d "%TEMP%" >nul 2>&1\n'
         'rmdir /s /q "%APP_DIR%" >nul 2>&1\n'
+        'if not "%APP_PARENT%"=="" rmdir "%APP_PARENT%" >nul 2>&1\n'
         'del /f /q "%~f0" >nul 2>&1\n'
     )
     try:
@@ -3452,7 +3479,10 @@ def run_clean_uninstall() -> None:
             removed_items += 1
     removed_items += _cleanup_download_leftovers()
 
-    _remove_empty_dir_quietly(USER_DATA_ROOT)
+    if USER_DATA_ROOT.exists() and _remove_path_quietly(USER_DATA_ROOT, protect_current_app=True):
+        removed_items += 1
+    else:
+        _remove_empty_dir_quietly(USER_DATA_ROOT)
 
     scheduled_app_delete = False
     schedule_err = ""
@@ -8901,8 +8931,10 @@ def open_journal_window_editor(
         is_new = release_tag_is_newer(tag, APP_VERSION)
         if not is_new:
             if manual:
-                _set_updates_status(tr("status.update_current"))
-                _set_settings_status(tr("status.update_current"))
+                current_version = normalize_release_tag(APP_VERSION) or APP_VERSION
+                status_text = tr("status.update_current").format(version=current_version)
+                _set_updates_status(status_text)
+                _set_settings_status(status_text)
             return
         if not manual and prefs.get(UPDATE_DISMISSED_RELEASE_PREF_KEY, "").strip() == tag:
             return
@@ -13114,10 +13146,8 @@ def open_journal_window_editor(
         apply_draft_dict_to_ui(d)
         save_draft()
 
-    journal_top_actions = tk.Frame(top, bg=t_init.panel)
-    journal_top_actions.grid(row=0, column=5, sticky="w", padx=(4, 8), pady=12)
     restore_draft_btn = tk.Button(
-        journal_top_actions,
+        top,
         text=tr("journal.restore_draft"),
         command=on_restore_draft_click,
         bg=_ut_bg,
@@ -13130,7 +13160,7 @@ def open_journal_window_editor(
         pady=6,
         cursor="hand2",
     )
-    restore_draft_btn.pack(side="left")
+    restore_draft_btn.grid(row=0, column=6, sticky="e", padx=(8, 12), pady=12)
     bind_button_hover_if_enabled(
         restore_draft_btn,
         lambda: th().toolbar_bind_rest(),
@@ -14395,7 +14425,6 @@ def open_journal_window_editor(
             pause_rec_button.config(text=tr("journal.rec.pause"))
         console_title.config(text=tr("console.title"))
         _show_console_hint_placeholder()
-        theme_toggle_btn.config(text=tr("theme.dark") if th().is_dark else tr("theme.light"))
         _ai_i18n = getattr(build_ai_recap_and_chatbot_pages, "_i18n", None)
         if callable(_ai_i18n):
             _ai_i18n()
@@ -14608,16 +14637,8 @@ def open_journal_window_editor(
             bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg
         )
         restore_draft_btn.config(bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg)
-        journal_top_actions.configure(bg=t.panel)
         for _b in (find_prev_btn, find_next_btn, find_close_btn):
             _b.config(bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg)
-        theme_toggle_btn.config(
-            text=t.toggle_label,
-            bg=t.btn_secondary,
-            fg=t.text,
-            activebackground=t.secondary_hover,
-            activeforeground=t.text,
-        )
         settings_theme_btn.config(
             text=t.toggle_label,
             bg=t.btn_secondary,
@@ -14758,34 +14779,6 @@ def open_journal_window_editor(
         save_preferences(prefs)
         theme_holder[0] = JOURNAL_THEME_DARK if nxt == "dark" else JOURNAL_THEME_LIGHT
         apply_journal_window_colors()
-
-    theme_toggle_btn = tk.Button(
-        top,
-        text=t_init.toggle_label,
-        command=toggle_journal_window_theme,
-        bg=_ut_bg,
-        fg=_ut_fg,
-        activebackground=_ut_abg,
-        activeforeground=_ut_afg,
-        relief="flat",
-        font=("Segoe UI", 9, "bold"),
-        padx=10,
-        pady=6,
-        cursor="hand2",
-    )
-    theme_toggle_btn.grid(row=0, column=6, sticky="e", padx=(8, 12), pady=12)
-    bind_button_hover_if_enabled(
-        theme_toggle_btn,
-        lambda: (
-            "normal",
-            th().btn_secondary,
-            th().text,
-            th().secondary_hover,
-            th().text,
-        ),
-        lambda: th().secondary_hover,
-        lambda: th().text,
-    )
 
     nav_specs: List[Tuple[str, str]] = [
         ("journal", "Journal"),
