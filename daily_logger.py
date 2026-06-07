@@ -120,7 +120,7 @@ WAVEFORM_MAX_DRAW_SAMPLES = 4000
 WAVEFORM_RMS_NORM = 6000.0
 # Smaller input blocks when metering so the canvas updates often enough to feel live.
 WAVEFORM_INPUT_BLOCK_SAMPLES = 512
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 APP_GITHUB_REPO = "Snowey1110/daily-logger"
 APP_RELEASE_API_URL = f"https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest"
 APP_RELEASE_PAGE_URL = f"https://github.com/{APP_GITHUB_REPO}/releases/latest"
@@ -3372,6 +3372,65 @@ def _cleanup_download_leftovers() -> int:
     return removed
 
 
+def _safe_to_schedule_app_folder_delete(app_folder: Path, exe_path: Path) -> Tuple[bool, str]:
+    folder = _resolve_path_for_compare(app_folder)
+    exe = _resolve_path_for_compare(exe_path)
+    if not _path_is_relative_to(exe, folder):
+        return False, "the app EXE is not inside the app folder"
+    if not exe.is_file():
+        return False, "the app EXE could not be found"
+    try:
+        if folder == Path(folder.anchor):
+            return False, "the app folder path is unsafe"
+    except OSError:
+        return False, "the app folder path is unsafe"
+    if str(folder).strip() in ("", "\\", "/"):
+        return False, "the app folder path is unsafe"
+    try:
+        if folder.parent == folder:
+            return False, "the app folder parent is unsafe"
+    except OSError:
+        return False, "the app folder parent is unsafe"
+    return True, ""
+
+
+def _schedule_windows_app_folder_delete(app_folder: Path, exe_path: Path) -> Tuple[bool, str]:
+    ok, reason = _safe_to_schedule_app_folder_delete(app_folder, exe_path)
+    if not ok:
+        return False, reason
+    script_path = Path(tempfile.gettempdir()) / f"daily_logger_uninstall_{int(time.time())}_{secrets.token_hex(3)}.cmd"
+    app_dir = str(_resolve_path_for_compare(app_folder))
+    pid = os.getpid()
+    script = (
+        "@echo off\n"
+        "setlocal\n"
+        f'set "APP_DIR={app_dir}"\n'
+        f"set \"APP_PID={pid}\"\n"
+        ":wait_for_daily_logger\n"
+        'tasklist /FI "PID eq %APP_PID%" 2>nul | find "%APP_PID%" >nul\n'
+        "if not errorlevel 1 (\n"
+        "  timeout /t 1 /nobreak >nul\n"
+        "  goto wait_for_daily_logger\n"
+        ")\n"
+        'cd /d "%TEMP%" >nul 2>&1\n'
+        'rmdir /s /q "%APP_DIR%" >nul 2>&1\n'
+        'del /f /q "%~f0" >nul 2>&1\n'
+    )
+    try:
+        script_path.write_text(script, encoding="utf-8")
+        subprocess.Popen(
+            ["cmd", "/c", str(script_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+
+
 def run_clean_uninstall() -> None:
     removed_items = 0
     if remove_startup_shortcut():
@@ -3395,11 +3454,26 @@ def run_clean_uninstall() -> None:
 
     _remove_empty_dir_quietly(USER_DATA_ROOT)
 
+    scheduled_app_delete = False
+    schedule_err = ""
+    if getattr(sys, "frozen", False):
+        scheduled_app_delete, schedule_err = _schedule_windows_app_folder_delete(
+            _current_app_folder(),
+            Path(sys.executable),
+        )
+
     print(
         "Uninstall cleanup complete. Removed Daily Logger user data, add-ons, models, "
         "downloads, and shortcuts."
     )
-    print(f"Current Daily Logger app files were kept: {_current_app_folder()}")
+    if getattr(sys, "frozen", False):
+        if scheduled_app_delete:
+            print(f"Current Daily Logger app folder will be removed after exit: {_current_app_folder()}")
+        else:
+            print(f"Could not schedule current app folder removal: {schedule_err}")
+            print(f"Current Daily Logger app files were kept: {_current_app_folder()}")
+    else:
+        print("Source/dev mode detected; repository files were kept.")
 
 
 def get_start_menu_programs_dir() -> Optional[Path]:
@@ -4178,6 +4252,14 @@ def _is_latin_letter(ch: str) -> bool:
     return "LATIN" in unicodedata.name(ch, "")
 
 
+def _cjk_count(text: str) -> int:
+    return sum(1 for ch in text or "" if _is_cjk_letter(ch))
+
+
+def _latin_count(text: str) -> int:
+    return sum(1 for ch in text or "" if _is_latin_letter(ch))
+
+
 def _unsupported_transcript_script_ratio(text: str) -> Tuple[int, float]:
     letters = 0
     unsupported = 0
@@ -4388,6 +4470,118 @@ def clean_whisper_transcript(text: str, language: Optional[str]) -> str:
 
 def _is_whisper_rejection_message(text: str) -> bool:
     return (text or "").strip().startswith("Whisper transcription rejected:")
+
+
+def _looks_like_repeat_noise(text: str) -> bool:
+    compact = " ".join((text or "").split()).strip()
+    if len(compact) < 16:
+        return False
+    letters_only = [ch.casefold() for ch in compact if unicodedata.category(ch).startswith("L")]
+    if len(letters_only) >= 8 and len(set(letters_only)) <= 2:
+        return True
+    words = re.findall(r"[A-Za-z\u3400-\u9fff]+", compact.casefold())
+    if len(words) >= 8:
+        return len(set(words)) <= max(2, len(words) // 5)
+    return False
+
+
+def _looks_like_possible_chinese_translation(text: str) -> bool:
+    cleaned = (text or "").strip().casefold()
+    if not cleaned or _cjk_count(cleaned) > 0:
+        return False
+    latin = _latin_count(cleaned)
+    if latin <= 0:
+        return True
+    if latin > 240:
+        return False
+    markers = (
+        "can you hear me",
+        "do you hear me",
+        "are you there",
+        "hello hello",
+        "hello, hello",
+        "testing",
+        "test test",
+        "i can hear",
+        "can hear you",
+        "what should",
+        "how should",
+        "what do we do",
+        "how do we",
+        "let me try",
+        "start recording",
+        "continue",
+    )
+    if any(marker in cleaned for marker in markers):
+        return True
+    short_words = re.findall(r"[a-z]+", cleaned)
+    if 0 < len(short_words) <= 5 and any(word in {"hello", "testing", "test"} for word in short_words):
+        return True
+    return False
+
+
+def _should_use_cloud_chinese_retry(first_text: str, fallback_text: str) -> bool:
+    first = normalize_journal_text_punctuation(first_text or "").strip()
+    fallback = normalize_journal_text_punctuation(fallback_text or "").strip()
+    if not _looks_like_possible_chinese_translation(first):
+        return False
+    cjk = _cjk_count(fallback)
+    if cjk < 2:
+        return False
+    if _looks_like_repeat_noise(fallback):
+        return False
+    fallback_latin = _latin_count(fallback)
+    first_latin = max(1, _latin_count(first))
+    if cjk >= 4 and fallback_latin <= max(24, cjk * 3):
+        return True
+    return cjk >= max(2, first_latin // 8)
+
+
+def _should_try_cloud_chinese_retry(language: Optional[str], first_text: str) -> bool:
+    return (
+        language is None
+        and not _is_likely_api_error_message_global(first_text)
+        and _looks_like_possible_chinese_translation(first_text)
+    )
+
+
+def _transcribe_audio_openai_single_with_retry(
+    file_path: Path,
+    language: Optional[str],
+    *,
+    model_name: Optional[str] = None,
+    prompt: Optional[str] = None,
+    temperature: float = 0.0,
+    content_type: Optional[str] = None,
+    progress: Optional[Callable[[int], None]] = None,
+) -> str:
+    result = _transcribe_audio_openai_single(
+        file_path,
+        language,
+        model_name=model_name,
+        prompt=prompt,
+        temperature=temperature,
+        content_type=content_type,
+        progress=progress,
+    )
+    if not _should_try_cloud_chinese_retry(language, result):
+        return result
+
+    retry_result = _transcribe_audio_openai_single(
+        file_path,
+        "zh",
+        model_name=model_name,
+        prompt=prompt,
+        temperature=temperature,
+        content_type=content_type,
+        progress=None,
+    )
+    if (
+        not _is_likely_api_error_message_global(retry_result)
+        and _should_use_cloud_chinese_retry(result, retry_result)
+    ):
+        return retry_result
+    return result
 
 
 
@@ -4603,7 +4797,7 @@ def _transcribe_audio_openai_chunked(
     _pg(12)
     mono, rate, read_err = _read_wav_mono_int16(file_path)
     if read_err is not None or mono is None:
-        return _transcribe_audio_openai_single(
+        return _transcribe_audio_openai_single_with_retry(
             file_path,
             language,
             model_name=model_name,
@@ -4614,7 +4808,7 @@ def _transcribe_audio_openai_chunked(
     chunk_sec = whisper_chunk_duration_sec(int(rate))
     chunk_samples = max(int(rate * chunk_sec), 1)
     if int(mono.shape[0]) <= chunk_samples:
-        return _transcribe_audio_openai_single(
+        return _transcribe_audio_openai_single_with_retry(
             file_path,
             language,
             model_name=model_name,
@@ -4640,7 +4834,7 @@ def _transcribe_audio_openai_chunked(
             werr = write_mono_int16_wav(tmp, part, rate)
             if werr is not None:
                 return f"Could not write chunked audio: {werr}"
-            chunk_result = _transcribe_audio_openai_single(
+            chunk_result = _transcribe_audio_openai_single_with_retry(
                 tmp,
                 language,
                 model_name=model_name,
@@ -4705,7 +4899,7 @@ def _transcribe_prepared_upload_openai(
             "That media file is too large for one transcription upload "
             f"({_media_size_mb(upl_sz)}). Use a shorter clip or compress it first."
         )
-    result = _transcribe_audio_openai_single(
+    result = _transcribe_audio_openai_single_with_retry(
         upload_path,
         language,
         model_name=model_name,
@@ -4879,9 +5073,12 @@ def transcribe_audio_with_model(
 
     _p(2)
     _status("Preparing audio for local transcription...")
-    upload_paths, prep_err, temp_upload = prepare_paths_for_transcription(file_path)
-    if prep_err is not None:
-        return prep_err
+    if file_path.suffix.lower() == ".wav":
+        upload_paths, temp_upload = [file_path], None
+    else:
+        upload_paths, prep_err, temp_upload = prepare_paths_for_transcription(file_path)
+        if prep_err is not None:
+            return prep_err
     if not upload_paths:
         return "Whisper returned empty text."
     _p(6)
@@ -5585,6 +5782,7 @@ def open_journal_window_editor(
 
     root = tk.Tk()
     journal_cleanup_callbacks: List[Callable[[], None]] = []
+    uninstall_shutdown_requested = {"v": False}
 
     def destroy_journal_window() -> None:
         while journal_cleanup_callbacks:
@@ -8684,8 +8882,6 @@ def open_journal_window_editor(
     def _finish_update_check(info: Optional[Dict[str, Any]], err_msg: str, *, manual: bool) -> None:
         _set_updates_buttons_busy(False)
         prefs = load_preferences()
-        prefs[UPDATE_LAST_CHECK_DATE_PREF_KEY] = today_update_check_key()
-        save_preferences(prefs)
         if err_msg:
             if manual:
                 text = tr("status.update_failed").format(error=err_msg)
@@ -8699,6 +8895,8 @@ def open_journal_window_editor(
             return
         if not info:
             return
+        prefs[UPDATE_LAST_CHECK_DATE_PREF_KEY] = today_update_check_key()
+        save_preferences(prefs)
         tag = str(info.get("tag") or "").strip()
         is_new = release_tag_is_newer(tag, APP_VERSION)
         if not is_new:
@@ -9652,17 +9850,41 @@ def open_journal_window_editor(
                 _set_iphone_status(tr("journal.iphone_waiting"))
             return
         paths = sorted(iphone_pending_paths, key=_transcription_file_sort_key)
-        if any_transcription_path_needs_media_tools(paths) and _find_ffmpeg_executable() is None:
+        media_waiting_paths: List[Path] = []
+        if _find_ffmpeg_executable() is None:
+            ready_paths: List[Path] = []
+            for path in paths:
+                if transcription_path_needs_media_tools(path):
+                    media_waiting_paths.append(path)
+                else:
+                    ready_paths.append(path)
+            if media_waiting_paths:
+                iphone_pending_paths.clear()
+                iphone_pending_paths.extend(media_waiting_paths)
+                iphone_pending_keys.clear()
+                iphone_pending_keys.update(_iphone_path_key(path) for path in media_waiting_paths)
+                first_waiting = media_waiting_paths[0]
+                _set_iphone_status(_iphone_pending_status_text())
+                _append_console_session_update(
+                    f"Pending iPhone file needs Media Tools: {first_waiting.name}",
+                    key="iphone:pending:media_tools",
+                )
+                if messagebox.askyesno(
+                    tr("download_manager.title"),
+                    tr("download_manager.media_required_prompt"),
+                ):
+                    _install_media_tools_addon()
+                if not ready_paths:
+                    return
+                paths = ready_paths
+            else:
+                iphone_pending_paths.clear()
+                iphone_pending_keys.clear()
+        else:
+            iphone_pending_paths.clear()
+            iphone_pending_keys.clear()
+        if not paths:
             _set_iphone_status(_iphone_pending_status_text())
-            _append_console_session_update(
-                f"Pending iPhone file needs Media Tools: {paths[0].name}",
-                key="iphone:pending:media_tools",
-            )
-            if messagebox.askyesno(
-                tr("download_manager.title"),
-                tr("download_manager.media_required_prompt"),
-            ):
-                _install_media_tools_addon()
             return
         pending_choice = normalize_transcription_model_choice(transcription_model_choice["value"])
         if transcription_model_is_cloud(pending_choice) and not get_openai_api_key():
@@ -9698,8 +9920,6 @@ def open_journal_window_editor(
                     )
                     _open_transcription_downloads_manager("transcription")
                     return
-        iphone_pending_paths.clear()
-        iphone_pending_keys.clear()
         _set_stt_saved_path_display(tr("journal.iphone_inbox"))
         _append_console_session_update(
             f"Starting iPhone transcription queue: {len(paths)} file(s).",
@@ -12272,6 +12492,24 @@ def open_journal_window_editor(
             messagebox.showinfo("Speech to text", f"That file is no longer on disk:\n{missing[0]}")
             update_transcribe_ui()
             return
+        pre_skipped_results: List[str] = []
+        if _find_ffmpeg_executable() is None:
+            ready_paths = [path for path in ordered_paths if not transcription_path_needs_media_tools(path)]
+            media_needed_paths = [path for path in ordered_paths if transcription_path_needs_media_tools(path)]
+            if media_needed_paths:
+                if messagebox.askyesno(
+                    tr("download_manager.title"),
+                    tr("download_manager.media_required_prompt"),
+                ):
+                    _install_media_tools_addon()
+                if not ready_paths:
+                    return
+                pre_skipped_results = [
+                    f"{path.name}: Media Tools add-on is required for this media type. "
+                    "Install Media Tools, then transcribe it again."
+                    for path in media_needed_paths
+                ]
+                ordered_paths = ready_paths
         if any_transcription_path_needs_media_tools(ordered_paths) and _find_ffmpeg_executable() is None:
             if messagebox.askyesno(
                 tr("download_manager.title"),
@@ -12408,7 +12646,7 @@ def open_journal_window_editor(
 
         def work() -> None:
             error_result = ""
-            skipped_results: List[str] = []
+            skipped_results: List[str] = list(pre_skipped_results)
             final_fallback_results: List[Tuple[Path, str]] = []
             try:
                 for file_index, use_path in enumerate(ordered_paths):
@@ -13544,7 +13782,24 @@ def open_journal_window_editor(
         except RuntimeError:
             pass
 
+    def close_after_uninstall() -> None:
+        uninstall_shutdown_requested["v"] = True
+        stop_active_recording_for_close()
+        if autosave_id["value"] is not None:
+            try:
+                root.after_cancel(autosave_id["value"])
+            except tk.TclError:
+                pass
+            autosave_id["value"] = None
+        try:
+            destroy_journal_window()
+        except tk.TclError:
+            pass
+
     def on_close(event=None) -> None:
+        if uninstall_shutdown_requested["v"]:
+            close_after_uninstall()
+            return
         stop_active_recording_for_close()
         has_content = any(
             [
@@ -13847,7 +14102,10 @@ def open_journal_window_editor(
         if output:
             console_append(output)
         if not keep_running:
-            on_close()
+            if cmd == "CONFIRM UNINSTALL":
+                close_after_uninstall()
+            else:
+                on_close()
 
     def _console_history_up(_evt: Optional[Any] = None) -> str:
         if not console_history:
@@ -15790,7 +16048,7 @@ def print_main_help() -> None:
     print("  BACKUP FALSE   - disable auto backup")
     print("  BACKUP LIMITED - keep at most 3 zip files; remove latest when adding")
     print("  UNINSTALL - request uninstall (requires CONFIRM UNINSTALL)")
-    print("  CONFIRM UNINSTALL - remove user data, add-ons, downloads, and shortcuts; keep current app files")
+    print("  CONFIRM UNINSTALL - remove user data, add-ons, downloads, shortcuts, and the current portable app folder")
     print("  WIFI WARN [name] - warn when connected to that Wi-Fi")
     print("  RESTORE - reopen latest unsaved journal window draft")
     print("  TOKEN ADD [token] - save API token")
@@ -15833,7 +16091,7 @@ def handle_choice(choice: str, app_name: str) -> Tuple[bool, str]:
         PENDING_UNINSTALL_CONFIRM = True
         print(
             'Uninstall requested. This cleans Daily Logger data, add-ons, downloads, '
-            'and shortcuts, but keeps the current app folder. Type "CONFIRM UNINSTALL" to continue.'
+            'shortcuts, and the current portable app folder. Type "CONFIRM UNINSTALL" to continue.'
         )
         return True, app_name
     if key == "CONFIRM UNINSTALL":
