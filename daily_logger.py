@@ -120,7 +120,7 @@ WAVEFORM_MAX_DRAW_SAMPLES = 4000
 WAVEFORM_RMS_NORM = 6000.0
 # Smaller input blocks when metering so the canvas updates often enough to feel live.
 WAVEFORM_INPUT_BLOCK_SAMPLES = 512
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 APP_GITHUB_REPO = "Snowey1110/daily-logger"
 APP_RELEASE_API_URL = f"https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest"
 APP_RELEASE_PAGE_URL = f"https://github.com/{APP_GITHUB_REPO}/releases/latest"
