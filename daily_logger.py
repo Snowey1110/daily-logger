@@ -313,6 +313,7 @@ IPHONE_IMPORT_CONTENT_TYPE_SUFFIXES = {
 TOOLTIP_WRAP_PX = 220
 TOOLTIP_WRAP_PX_MAX = 280
 JOURNAL_PREF_THEME_KEY = "journal_window_theme"
+JOURNAL_PREF_FULLSCREEN_KEY = "journal_window_fullscreen"
 JOURNAL_TEXT_FONT_FAMILY = "Microsoft YaHei UI"
 
 
@@ -533,7 +534,7 @@ class JournalWindowThemeSpec:
 
 JOURNAL_THEME_LIGHT = JournalWindowThemeSpec(
     id="light",
-    toggle_label="Dark mode",
+    toggle_label="Journal mode",
     surface="#F2F2F7",
     panel="#FFFFFF",
     field="#FFFFFF",
@@ -585,20 +586,81 @@ JOURNAL_THEME_DARK = JournalWindowThemeSpec(
     is_dark=True,
 )
 
+JOURNAL_THEME_BOOK = JournalWindowThemeSpec(
+    id="journal",
+    toggle_label="Dark mode",
+    surface="#E7D7BF",
+    panel="#F8F0E1",
+    field="#FDFAF2",
+    text="#241A12",
+    muted="#7C6147",
+    accent="#7A4B2A",
+    border="#C9B897",
+    waveform="#9B5C2E",
+    btn_secondary="#E8DCCB",
+    btn_disabled="#D8CCBB",
+    disabled_fg="#A18B70",
+    hover_primary="#8B5A34",
+    hover_save="#8B5A34",
+    secondary_hover="#DCCDB6",
+    pad_outer=14,
+    pad_top_y=(14, 10),
+    pad_center_y=10,
+    pad_button_y=14,
+    date_label_font=("Segoe UI", 10, "bold"),
+    section_label_font=("Segoe UI", 10, "bold"),
+    is_dark=False,
+)
+
 
 def normalize_journal_window_theme_key(raw: str) -> str:
     k = (raw or "").strip().lower()
-    return "dark" if k == "dark" else "light"
+    if k in {"journal", "book", "reader", "parchment"}:
+        return "journal"
+    if k == "light":
+        return "light"
+    return "dark"
+
+
+def journal_window_theme_spec_for_key(key: str) -> JournalWindowThemeSpec:
+    normalized = normalize_journal_window_theme_key(key)
+    if normalized == "light":
+        return JOURNAL_THEME_LIGHT
+    if normalized == "journal":
+        return JOURNAL_THEME_BOOK
+    return JOURNAL_THEME_DARK
+
+
+def next_journal_window_theme_key(current_key: str) -> str:
+    current = normalize_journal_window_theme_key(current_key)
+    if current == "dark":
+        return "light"
+    if current == "light":
+        return "journal"
+    return "dark"
+
+
+def journal_window_theme_action_label_key(current_key: str) -> str:
+    next_key = next_journal_window_theme_key(current_key)
+    if next_key == "light":
+        return "theme.light"
+    if next_key == "journal":
+        return "theme.journal"
+    return "theme.dark"
+
+
+def journal_window_theme_current_label_key(current_key: str) -> str:
+    current = normalize_journal_window_theme_key(current_key)
+    if current == "light":
+        return "theme.light"
+    if current == "journal":
+        return "theme.journal"
+    return "theme.dark"
 
 
 def load_journal_window_theme_spec() -> JournalWindowThemeSpec:
     prefs = load_preferences()
-    return (
-        JOURNAL_THEME_DARK
-        if normalize_journal_window_theme_key(prefs.get(JOURNAL_PREF_THEME_KEY, "dark"))
-        == "dark"
-        else JOURNAL_THEME_LIGHT
-    )
+    return journal_window_theme_spec_for_key(str(prefs.get(JOURNAL_PREF_THEME_KEY, "dark")))
 
 
 OPENAI_MODEL = "gpt-4o-mini"
@@ -5825,6 +5887,10 @@ def open_journal_window_editor(
         root.destroy()
 
     root_prefs = load_preferences()
+    fullscreen_state = {
+        "enabled": str(root_prefs.get(JOURNAL_PREF_FULLSCREEN_KEY, "false")).strip().lower()
+        == "true"
+    }
     ui_lang_holder: List[str] = [
         normalize_ui_language(str(root_prefs.get(UI_LANGUAGE_PREF_KEY, "en")))
     ]
@@ -5836,6 +5902,10 @@ def open_journal_window_editor(
     root.title(window_app_name)
     root.geometry("1360x720")
     root.minsize(1020, 620)
+    try:
+        root.attributes("-fullscreen", bool(fullscreen_state["enabled"]))
+    except tk.TclError:
+        fullscreen_state["enabled"] = False
     theme_holder: List[JournalWindowThemeSpec] = [load_journal_window_theme_spec()]
 
     def th() -> JournalWindowThemeSpec:
@@ -8234,6 +8304,10 @@ def open_journal_window_editor(
     settings_labels: List[Any] = []
     settings_label_keys: List[Tuple[Any, str]] = []
 
+    def _bind_settings_tooltip(widget: Any, label_key: str) -> None:
+        tip_key = f"tip.{label_key}"
+        bind_hover_tooltip(widget, lambda _tip_key=tip_key: tr(_tip_key))
+
     def _make_settings_row(label_key: str) -> Tuple[Any, Any]:
         row = tk.Frame(settings_wrap, bg=t_init.surface)
         row.pack(fill="x", pady=(0, 10))
@@ -8250,6 +8324,8 @@ def open_journal_window_editor(
         settings_rows.append(row)
         settings_labels.append(lbl)
         settings_label_keys.append((lbl, label_key))
+        _bind_settings_tooltip(row, label_key)
+        _bind_settings_tooltip(lbl, label_key)
         return row, lbl
 
     settings_prefs = load_preferences()
@@ -8358,6 +8434,7 @@ def open_journal_window_editor(
             tr("settings.lang.chinese"),
         )
         lang_ui_combo.pack(side="left", fill="x", expand=True, padx=(0, 8))
+    _bind_settings_tooltip(lang_ui_combo, "settings.language")
 
     def _on_ui_language_selected(_evt: object | None = None) -> None:
         raw = ui_lang_var.get().strip()
@@ -8398,6 +8475,8 @@ def open_journal_window_editor(
         cursor="hand2",
     )
     rename_btn.pack(side="left")
+    _bind_settings_tooltip(rename_entry, "settings.rename")
+    _bind_settings_tooltip(rename_btn, "settings.rename")
 
     startup_row, _ = _make_settings_row("settings.startup")
     startup_state = {"enabled": is_startup_enabled()}
@@ -8416,6 +8495,7 @@ def open_journal_window_editor(
         width=7,
     )
     startup_toggle_btn.pack(side="left")
+    _bind_settings_tooltip(startup_toggle_btn, "settings.startup")
 
     iphone_receive_row, _ = _make_settings_row("settings.iphone_receive")
     iphone_receive_state = {"enabled": iphone_passive_receive_enabled()}
@@ -8434,6 +8514,7 @@ def open_journal_window_editor(
         width=7,
     )
     iphone_receive_toggle_btn.pack(side="left")
+    _bind_settings_tooltip(iphone_receive_toggle_btn, "settings.iphone_receive")
 
     transcription_models_row, _ = _make_settings_row("settings.transcription_models")
     transcription_models_btn = tk.Button(
@@ -8451,6 +8532,7 @@ def open_journal_window_editor(
         width=9,
     )
     transcription_models_btn.pack(side="left")
+    _bind_settings_tooltip(transcription_models_btn, "settings.transcription_models")
 
     updates_row, _ = _make_settings_row("settings.updates")
     updates_state = {"enabled": update_check_enabled(), "busy": False}
@@ -8469,6 +8551,7 @@ def open_journal_window_editor(
         width=7,
     )
     updates_toggle_btn.pack(side="left", padx=(0, 8))
+    _bind_settings_tooltip(updates_toggle_btn, "settings.updates")
     updates_check_btn = tk.Button(
         updates_row,
         text=tr("settings.check_now"),
@@ -8484,6 +8567,7 @@ def open_journal_window_editor(
         width=12,
     )
     updates_check_btn.pack(side="left")
+    _bind_settings_tooltip(updates_check_btn, "settings.updates")
     updates_status_var = tk.StringVar(value="")
     updates_status_lbl = tk.Label(
         updates_row,
@@ -8509,7 +8593,7 @@ def open_journal_window_editor(
     theme_row, _ = _make_settings_row("settings.theme")
     settings_theme_btn = tk.Button(
         theme_row,
-        text=t_init.toggle_label,
+        text=tr(journal_window_theme_current_label_key(t_init.id)),
         command=lambda: toggle_journal_window_theme(),
         bg=t_init.btn_secondary,
         fg=t_init.text,
@@ -8522,6 +8606,35 @@ def open_journal_window_editor(
         cursor="hand2",
     )
     settings_theme_btn.pack(side="left")
+    _bind_settings_tooltip(settings_theme_btn, "settings.theme")
+
+    display_row, _ = _make_settings_row("settings.display")
+    display_fullscreen_btn = tk.Button(
+        display_row,
+        text=tr("settings.on") if fullscreen_state["enabled"] else tr("settings.off"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+        width=7,
+    )
+    display_fullscreen_btn.pack(side="left", padx=(0, 8))
+    _bind_settings_tooltip(display_fullscreen_btn, "settings.display")
+    display_f11_lbl = tk.Label(
+        display_row,
+        text=tr("settings.display_f11"),
+        bg=t_init.surface,
+        fg=t_init.muted,
+        font=("Segoe UI", 9),
+        anchor="w",
+    )
+    display_f11_lbl.pack(side="left", fill="x", expand=True)
+    _bind_settings_tooltip(display_f11_lbl, "settings.display")
 
     def _backup_mode_btn_label(mode_val: str) -> str:
         return tr(
@@ -8621,6 +8734,9 @@ def open_journal_window_editor(
         width=7,
     )
     token_copy_btn.pack(side="left")
+    _bind_settings_tooltip(token_entry, "settings.token")
+    _bind_settings_tooltip(token_save_btn, "settings.token")
+    _bind_settings_tooltip(token_copy_btn, "settings.token")
 
     start_menu_row, _ = _make_settings_row("settings.start_menu")
     start_menu_app_btn = tk.Button(
@@ -8985,6 +9101,40 @@ def open_journal_window_editor(
         _set_updates_status(status_text)
         _set_settings_status(status_text)
 
+    def _set_fullscreen_enabled(
+        should_enable: bool,
+        *,
+        persist: bool = True,
+        announce: bool = True,
+    ) -> bool:
+        enabled = bool(should_enable)
+        try:
+            root.attributes("-fullscreen", enabled)
+        except tk.TclError:
+            if announce:
+                _set_settings_status(tr("status.fullscreen_fail"))
+            return False
+        fullscreen_state["enabled"] = enabled
+        try:
+            display_fullscreen_btn.config(
+                text=tr("settings.on") if enabled else tr("settings.off")
+            )
+        except tk.TclError:
+            pass
+        if persist:
+            prefs = load_preferences()
+            prefs[JOURNAL_PREF_FULLSCREEN_KEY] = "true" if enabled else "false"
+            save_preferences(prefs)
+        if announce:
+            _set_settings_status(
+                tr("status.fullscreen_on") if enabled else tr("status.fullscreen_off")
+            )
+        return True
+
+    def _on_toggle_fullscreen(_evt: Optional[Any] = None) -> str:
+        _set_fullscreen_enabled(not fullscreen_state["enabled"])
+        return "break"
+
     def _persist_backup_mode(mode: str) -> None:
         prefs = load_preferences()
         if mode == "On":
@@ -9077,6 +9227,7 @@ def open_journal_window_editor(
     transcription_models_btn.config(command=_on_open_transcription_models)
     updates_toggle_btn.config(command=_on_toggle_updates)
     updates_check_btn.config(command=lambda: _check_updates_async(manual=True, force=True))
+    display_fullscreen_btn.config(command=_on_toggle_fullscreen)
     backup_mode_btn.config(command=_on_cycle_backup_mode)
     backup_manual_btn.config(command=_on_manual_backup)
     token_save_btn.config(command=_on_token_save)
@@ -9202,12 +9353,16 @@ def open_journal_window_editor(
     console_insertwidth_normal = int(console_entry.cget("insertwidth") or 1)
     console_entry_state: Dict[str, bool] = {"placeholder": False}
 
+    def _console_placeholder_fg(theme: Optional[JournalWindowThemeSpec] = None) -> str:
+        current_theme = theme or th()
+        return "#8A8FA8" if current_theme.is_dark else "#6F7480"
+
     def _set_console_placeholder() -> None:
         if console_entry.get():
             return
         console_entry_state["placeholder"] = True
         console_entry.config(
-            fg=t_init.muted,
+            fg=_console_placeholder_fg(t_init),
             font=("Consolas", 10, "italic"),
             insertwidth=0,
         )
@@ -9803,8 +9958,13 @@ def open_journal_window_editor(
         except OSError:
             return str(path).casefold()
 
-    def _set_iphone_status(text: str) -> None:
-        _publish_console_update(text, key="iphone_status")
+    def _set_iphone_status(
+        text: str,
+        *,
+        temp: bool = True,
+        log: Optional[bool] = None,
+    ) -> None:
+        _publish_console_update(text, key="iphone_status", temp=temp, log=log)
 
     iphone_upload_status_by_id: Dict[str, Tuple[float, str]] = {}
     iphone_upload_id_by_path: Dict[str, str] = {}
@@ -9879,7 +10039,10 @@ def open_journal_window_editor(
             return
         if not iphone_pending_paths:
             if bool(iphone_receiver_state.get("active")):
-                _set_iphone_status(tr("journal.iphone_waiting"))
+                _set_iphone_status(
+                    tr("journal.iphone_waiting"),
+                    temp=not bool(iphone_receiver_state.get("passive")),
+                )
             return
         paths = sorted(iphone_pending_paths, key=_transcription_file_sort_key)
         media_waiting_paths: List[Path] = []
@@ -10783,7 +10946,7 @@ def open_journal_window_editor(
             _set_stt_saved_path_display(tr("journal.iphone_inbox"))
             if url:
                 _publish_console_update(f"iPhone receiver URL ready: {url}", key="iphone:url")
-        _set_iphone_status(tr("journal.iphone_waiting"))
+        _set_iphone_status(tr("journal.iphone_waiting"), temp=bool(show_setup))
         _update_iphone_receive_button()
         if show_setup:
             show_iphone_setup_window(url, token)
@@ -14364,8 +14527,12 @@ def open_journal_window_editor(
         )
         updates_check_btn.config(text=tr("settings.check_now"))
         settings_theme_btn.config(
-            text=tr("theme.dark") if th().is_dark else tr("theme.light")
+            text=tr(journal_window_theme_current_label_key(th().id))
         )
+        display_fullscreen_btn.config(
+            text=tr("settings.on") if fullscreen_state["enabled"] else tr("settings.off")
+        )
+        display_f11_lbl.config(text=tr("settings.display_f11"))
         backup_mode_btn.config(text=_backup_mode_btn_label(backup_mode["value"]))
         backup_manual_btn.config(text=tr("settings.manual"))
         token_save_btn.config(text=tr("settings.save"))
@@ -14379,7 +14546,7 @@ def open_journal_window_editor(
         nav_buttons["console"].config(text=tr("nav.console"))
         _vr_nav = _virtual_reader_nav_btn_slot[0]
         if _vr_nav is not None:
-            _vr_nav.config(text=tr("nav.virtual_reader"))
+            _vr_nav.config(text=tr("nav.reader_short"))
         nav_settings_btn.config(text=tr("nav.settings"))
         date_lbl.config(text=tr("journal.date"))
         time_lbl.config(text=tr("journal.time"))
@@ -14447,6 +14614,7 @@ def open_journal_window_editor(
         shell.configure(bg=t.surface)
         nav_rail.configure(bg=t.panel)
         nav_title.configure(bg=t.panel, fg=t.muted)
+        nav_bottom_row.configure(bg=t.panel)
         nav_summon_btn.configure(
             bg=t.toolbar_btn_config()[0],
             fg=t.toolbar_btn_config()[1],
@@ -14478,6 +14646,7 @@ def open_journal_window_editor(
         settings_title.configure(bg=t.surface, fg=t.text)
         settings_status_lbl.configure(bg=t.surface, fg=t.muted)
         updates_status_lbl.configure(bg=t.surface, fg=t.muted)
+        display_f11_lbl.configure(bg=t.surface, fg=t.muted)
         for _w in settings_rows:
             _w.configure(bg=t.surface)
         for _w in settings_labels:
@@ -14504,6 +14673,7 @@ def open_journal_window_editor(
             updates_toggle_btn,
             updates_check_btn,
             settings_theme_btn,
+            display_fullscreen_btn,
             backup_mode_btn,
             backup_manual_btn,
             token_save_btn,
@@ -14603,7 +14773,7 @@ def open_journal_window_editor(
         console_prompt.configure(bg=t.surface, fg=t.muted)
         console_entry.config(
             bg=t.field,
-            fg=(t.muted if console_entry_state["placeholder"] else t.text),
+            fg=(_console_placeholder_fg(t) if console_entry_state["placeholder"] else t.text),
             insertbackground=t.text,
             insertwidth=(0 if console_entry_state["placeholder"] else console_insertwidth_normal),
             highlightbackground=t.border,
@@ -14640,7 +14810,7 @@ def open_journal_window_editor(
         for _b in (find_prev_btn, find_next_btn, find_close_btn):
             _b.config(bg=tbg, fg=tfg, activebackground=tabg, activeforeground=tafg)
         settings_theme_btn.config(
-            text=t.toggle_label,
+            text=tr(journal_window_theme_current_label_key(t.id)),
             bg=t.btn_secondary,
             fg=t.text,
             activebackground=t.secondary_hover,
@@ -14774,10 +14944,10 @@ def open_journal_window_editor(
     def toggle_journal_window_theme() -> None:
         prefs = load_preferences()
         cur = normalize_journal_window_theme_key(th().id)
-        nxt = "dark" if cur == "light" else "light"
+        nxt = next_journal_window_theme_key(cur)
         prefs[JOURNAL_PREF_THEME_KEY] = nxt
         save_preferences(prefs)
-        theme_holder[0] = JOURNAL_THEME_DARK if nxt == "dark" else JOURNAL_THEME_LIGHT
+        theme_holder[0] = journal_window_theme_spec_for_key(nxt)
         apply_journal_window_colors()
 
     nav_specs: List[Tuple[str, str]] = [
@@ -14819,9 +14989,14 @@ def open_journal_window_editor(
         if not ok and err:
             messagebox.showerror(tr("msg.virtual_reader_title"), err)
 
+    nav_bottom_row = tk.Frame(nav_rail, bg=t_init.panel)
+    nav_bottom_row.grid(row=101, column=0, sticky="ew", padx=10, pady=(0, 10))
+    nav_bottom_row.grid_columnconfigure(0, weight=1, uniform="nav_bottom")
+    nav_bottom_row.grid_columnconfigure(1, weight=1, uniform="nav_bottom")
+
     _vr_nav_btn = tk.Button(
-        nav_rail,
-        text=tr("nav.virtual_reader"),
+        nav_bottom_row,
+        text=tr("nav.reader_short"),
         command=on_virtual_reader_nav_clicked,
         bg=t_init.btn_secondary,
         fg=t_init.text,
@@ -14837,7 +15012,6 @@ def open_journal_window_editor(
         highlightthickness=0,
     )
     _virtual_reader_nav_btn_slot[0] = _vr_nav_btn
-    _vr_nav_btn.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 8))
     nav_extra_buttons.append(_vr_nav_btn)
     bind_button_hover_if_enabled(
         _vr_nav_btn,
@@ -14851,9 +15025,10 @@ def open_journal_window_editor(
         lambda: th().secondary_hover,
         lambda: th().text,
     )
+    _vr_nav_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
     nav_settings_btn = tk.Button(
-        nav_rail,
+        nav_bottom_row,
         text="Settings",
         command=lambda: show_page("settings"),
         bg=t_init.btn_secondary,
@@ -14868,7 +15043,7 @@ def open_journal_window_editor(
         bd=0,
         highlightthickness=0,
     )
-    nav_settings_btn.grid(row=101, column=0, sticky="e", padx=10, pady=(0, 10))
+    nav_settings_btn.grid(row=0, column=1, sticky="ew")
     nav_buttons["settings"] = nav_settings_btn
     bind_button_hover_if_enabled(
         nav_settings_btn,
@@ -14922,6 +15097,7 @@ def open_journal_window_editor(
             root.focus_set()
 
     root.bind_all("<Button-1>", _unfocus_console_on_button_click, add="+")
+    root.bind("<F11>", _on_toggle_fullscreen, add="+")
     _startup_step("splash.detail.finalize")
     show_page("journal")
 
