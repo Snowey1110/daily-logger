@@ -12,6 +12,7 @@ import importlib
 import importlib.util
 import atexit
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import queue
@@ -121,6 +122,10 @@ OPENAI_IMAGE_EDITS_URL = os.getenv(
 OPENAI_IMAGE_MODEL = (
     os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1-mini").strip()
     or "gpt-image-1-mini"
+)
+OPENAI_IMAGE_QUALITY = (
+    os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip().lower()
+    or "medium"
 )
 OPENAI_TRANSCRIPTION_URL = os.getenv(
     "OPENAI_TRANSCRIPTION_URL", "https://api.openai.com/v1/audio/transcriptions"
@@ -2042,43 +2047,89 @@ def _normalize_desktop_pet_image_bytes(raw: bytes) -> bytes:
         width, height = image.size
         if width <= 0 or height <= 0:
             return raw
-        alpha = image.getchannel("A")
-        if alpha.getextrema() == (255, 255):
-            pixels = image.load()
-            corner_points = [
+        pixels = image.load()
+        edge_points: List[Tuple[int, int]] = []
+        step = max(1, min(width, height) // 96)
+        for x in range(0, width, step):
+            edge_points.append((x, 0))
+            edge_points.append((x, height - 1))
+        for y in range(0, height, step):
+            edge_points.append((0, y))
+            edge_points.append((width - 1, y))
+        edge_points.extend(
+            [
                 (0, 0),
                 (max(0, width - 1), 0),
                 (0, max(0, height - 1)),
                 (max(0, width - 1), max(0, height - 1)),
             ]
-            corner_colors = [pixels[x, y][:3] for x, y in corner_points]
-            base_color = tuple(sum(color[i] for color in corner_colors) // len(corner_colors) for i in range(3))
+        )
+        edge_colors = [pixels[x, y][:3] for x, y in edge_points if pixels[x, y][3] > 18]
+        base_color: Optional[Tuple[int, int, int]] = None
+        if edge_colors:
+            ordered = list(zip(*edge_colors))
+            base_color = tuple(int(sorted(channel)[len(channel) // 2]) for channel in ordered)  # type: ignore[assignment]
 
-            def _near_background(rgb: Tuple[int, int, int]) -> bool:
-                return sum((int(rgb[i]) - int(base_color[i])) ** 2 for i in range(3)) <= 38 * 38
+        def _dist2(rgb: Tuple[int, int, int], ref: Tuple[int, int, int]) -> int:
+            return sum((int(rgb[i]) - int(ref[i])) ** 2 for i in range(3))
 
-            visited = set()
-            stack = list(corner_points)
-            while stack:
-                x, y = stack.pop()
-                if x < 0 or y < 0 or x >= width or y >= height or (x, y) in visited:
-                    continue
-                visited.add((x, y))
-                r, g, b, a = pixels[x, y]
-                if a <= 0 or not _near_background((r, g, b)):
-                    continue
+        def _near_background(rgb: Tuple[int, int, int], *, loose: bool = False) -> bool:
+            if base_color is None:
+                return False
+            threshold = 58 if loose else 44
+            return _dist2(rgb, base_color) <= threshold * threshold
+
+        # Remove any edge-connected generated background first. This catches the
+        # occasional colored square/halo even when the model ignored transparency.
+        visited: set[Tuple[int, int]] = set()
+        stack = list(edge_points)
+        while stack:
+            x, y = stack.pop()
+            if x < 0 or y < 0 or x >= width or y >= height or (x, y) in visited:
+                continue
+            visited.add((x, y))
+            r, g, b, a = pixels[x, y]
+            if a <= 20:
                 pixels[x, y] = (r, g, b, 0)
-                stack.extend(((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)))
+            elif not _near_background((r, g, b), loose=True):
+                continue
+            else:
+                pixels[x, y] = (r, g, b, 0)
+            stack.extend(((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)))
+
+        # Fade tiny leftover edge halos that sit directly against transparent
+        # pixels, without touching the solid character body.
+        transparent_neighbors: List[Tuple[int, int, int, int]] = []
+        for y in range(height):
+            for x in range(width):
+                r, g, b, a = pixels[x, y]
+                if a <= 0 or not _near_background((r, g, b), loose=True):
+                    continue
+                near_clear = False
+                for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                    if 0 <= nx < width and 0 <= ny < height and pixels[nx, ny][3] <= 8:
+                        near_clear = True
+                        break
+                if near_clear:
+                    transparent_neighbors.append((x, y, r, g, b))
+        for x, y, r, g, b in transparent_neighbors:
+            distance = _dist2((r, g, b), base_color) if base_color is not None else 999999
+            if distance <= 42 * 42:
+                pixels[x, y] = (r, g, b, 0)
+            else:
+                old = pixels[x, y]
+                pixels[x, y] = (old[0], old[1], old[2], min(old[3], 80))
+
         bbox = image.getchannel("A").getbbox()
         if bbox:
-            pad = 24
+            pad = max(18, min(width, height) // 36)
             left = max(0, bbox[0] - pad)
             top = max(0, bbox[1] - pad)
             right = min(width, bbox[2] + pad)
             bottom = min(height, bbox[3] + pad)
             image = image.crop((left, top, right, bottom))
         output = io.BytesIO()
-        image.save(output, format="PNG")
+        image.save(output, format="PNG", optimize=True)
         return output.getvalue()
     except Exception:
         return raw
@@ -2148,7 +2199,9 @@ def generate_desktop_pet_image(
         "with the option to softly borrow animal-like pet/dog/fantasy companion energy. "
         "Do not resemble any existing copyrighted character. Transparent background, "
         "full body, front three-quarter view, soft rounded shapes, clean outline, readable at "
-        "small desktop-icon size, no text, no logo, no UI frame, no black/solid background. "
+        "small desktop-icon size, high-resolution crisp details, antialiased edges, and at least "
+        "8 percent transparent padding around the body. No text, no logo, no UI frame, no colored "
+        "canvas border, no square background, no black/solid background, no shadow box. "
         f"It is level {pet_level}; higher level means slightly more confident, brighter, and magical, "
         "but still simple and friendly."
     )
@@ -2171,7 +2224,7 @@ def generate_desktop_pet_image(
                 "prompt": prompt,
                 "n": "1",
                 "size": "1024x1024",
-                "quality": "low",
+                "quality": OPENAI_IMAGE_QUALITY,
                 "background": "transparent",
                 "output_format": "png",
             },
@@ -2192,7 +2245,7 @@ def generate_desktop_pet_image(
             "prompt": prompt,
             "n": 1,
             "size": "1024x1024",
-            "quality": "low",
+            "quality": OPENAI_IMAGE_QUALITY,
             "background": "transparent",
             "output_format": "png",
         }
@@ -9041,7 +9094,26 @@ def open_journal_window_editor(
             seconds=8,
         )
 
-    def _load_pet_photo(cache_name: str, max_size: Tuple[int, int]) -> Optional[Any]:
+    def _pet_motion_values(tick: int, *, scale: float = 1.0) -> Dict[str, float]:
+        phase = (max(0, int(tick)) % 72) / 72.0 * (math.pi * 2.0)
+        secondary = (max(0, int(tick)) % 120) / 120.0 * (math.pi * 2.0)
+        bob = -math.sin(phase) * 4.0 * scale
+        stretch = math.sin(phase) * 0.026 * scale
+        return {
+            "bob": bob,
+            "angle": (math.sin(secondary) * 3.2 + math.sin(phase * 2.0) * 0.7) * scale,
+            "scale_x": max(0.88, 1.0 + stretch),
+            "scale_y": max(0.88, 1.0 - stretch * 0.82),
+            "shadow": max(0.78, min(1.16, 1.0 + stretch * 1.8)),
+        }
+
+    def _load_pet_photo(
+        cache_name: str,
+        max_size: Tuple[int, int],
+        *,
+        tick: int = 0,
+        animate: bool = True,
+    ) -> Optional[Any]:
         image_path = str(pet_state.get("image_path") or "").strip()
         if not image_path:
             return None
@@ -9052,24 +9124,52 @@ def open_journal_window_editor(
             return None
         try:
             mtime = path.stat().st_mtime
-            key = f"{cache_name}:{path}:{mtime}:{max_size[0]}x{max_size[1]}"
-            cached = pet_image_cache.get(key)
-            if cached is not None:
-                return cached
             from PIL import Image, ImageTk
 
-            normalized = _normalize_desktop_pet_image_bytes(path.read_bytes())
-            image = Image.open(io.BytesIO(normalized)).convert("RGBA")
             try:
                 resample = Image.Resampling.LANCZOS
             except AttributeError:
                 resample = Image.LANCZOS
+            frame = (int(tick) // 2) % 36 if animate else 0
+            key = f"{cache_name}:{path}:{mtime}:{max_size[0]}x{max_size[1]}:f{frame}"
+            cached = pet_image_cache.get(key)
+            if cached is not None:
+                return cached
+            source_key = f"source:{path}:{mtime}"
+            source = pet_image_cache.get(source_key)
+            if source is None:
+                normalized = _normalize_desktop_pet_image_bytes(path.read_bytes())
+                source = Image.open(io.BytesIO(normalized)).convert("RGBA")
+                for old_key in list(pet_image_cache):
+                    if old_key.startswith("source:") and old_key != source_key:
+                        pet_image_cache.pop(old_key, None)
+                pet_image_cache[source_key] = source.copy()
+            image = source.copy()
             image.thumbnail(max_size, resample)
+            if animate and image.width > 0 and image.height > 0:
+                motion = _pet_motion_values(tick)
+                new_w = max(1, int(image.width * motion["scale_x"]))
+                new_h = max(1, int(image.height * motion["scale_y"]))
+                if new_w != image.width or new_h != image.height:
+                    image = image.resize((new_w, new_h), resample)
+                angle = float(motion.get("angle", 0.0) or 0.0)
+                if abs(angle) >= 0.1:
+                    try:
+                        image = image.rotate(angle, resample=resample, expand=True, fillcolor=(0, 0, 0, 0))
+                    except TypeError:
+                        image = image.rotate(angle, resample=resample, expand=True)
             photo = ImageTk.PhotoImage(image)
-            stale = [k for k in pet_image_cache if k.startswith(f"{cache_name}:")]
+            stale = [
+                k
+                for k in pet_image_cache
+                if k.startswith(f"{cache_name}:") and f":{path}:{mtime}:" not in k
+            ]
             for old_key in stale:
                 pet_image_cache.pop(old_key, None)
             pet_image_cache[key] = photo
+            frame_keys = [k for k in pet_image_cache if k.startswith(f"{cache_name}:")]
+            while len(frame_keys) > 48:
+                pet_image_cache.pop(frame_keys.pop(0), None)
             return photo
         except Exception:
             return None
@@ -9102,16 +9202,25 @@ def open_journal_window_editor(
         level, current_xp, needed_xp = _desktop_pet_level()
         breath = 4 if (tick // 12) % 2 == 0 else 0
         blink = (tick % 80) in (0, 1, 2)
+        motion = _pet_motion_values(tick, scale=1.25)
         y = (
             max(20.0, min(float(height - 132), float(pet_stage_drag_state.get("y", 0.0) or 0.0)))
             if pet_stage_drag_state.get("dragging")
             else max(20.0, min(float(height - 132), float(int(pet_state.get("stage_y", 0) or 0) or (height - 132))))
         )
         pet_stage_drag_state["hitbox"] = (x - 28, y, x + 132, y + 132)
-        photo = _load_pet_photo("stage", (150 + breath, 150 - min(2, breath)))
+        photo = _load_pet_photo("stage", (154, 154), tick=tick, animate=not bool(pet_stage_drag_state.get("dragging")))
         if photo is not None:
-            pet_stage.create_oval(x - 28, y + 82, x + 132, y + 126, fill=t.panel, outline="")
-            pet_stage.create_image(x + 52, y + 68, image=photo)
+            shadow_scale = float(motion.get("shadow", 1.0) or 1.0)
+            pet_stage.create_oval(
+                x - (28 * shadow_scale),
+                y + 84,
+                x + 132 + (16 * (shadow_scale - 1.0)),
+                y + 126,
+                fill=t.panel,
+                outline="",
+            )
+            pet_stage.create_image(x + 52, y + 68 + float(motion.get("bob", 0.0) or 0.0), image=photo)
             bubble_text = _active_pet_bubble_text()
             if bubble_text:
                 bubble_x = max(18, min(width - 258, x + 124))
@@ -9170,7 +9279,7 @@ def open_journal_window_editor(
                 try:
                     x = max(0, int(restore_draft_btn.winfo_rootx() - journal_page.winfo_rootx()) - 112)
                     y = max(0, int(restore_draft_btn.winfo_rooty() - journal_page.winfo_rooty()) + 2)
-                except tk.TclError:
+                except (NameError, tk.TclError):
                     x = max(0, page_w - 230)
                     y = 22
             x = max(0, min(page_w - 108, x))
@@ -9204,10 +9313,24 @@ def open_journal_window_editor(
             breath = 2 if (tick // 12) % 2 == 0 else 0
             blink = (tick % 70) in (0, 1, 2)
             shadow = t.field
-            photo = _load_pet_photo("journal", (56 + breath, 56 - min(1, breath)))
+            motion = _pet_motion_values(tick, scale=0.58)
+            photo = _load_pet_photo(
+                "journal",
+                (59, 59),
+                tick=tick,
+                animate=not bool(journal_pet_state.get("dragging")),
+            )
             if photo is not None:
-                journal_pet_canvas.create_oval(24, 43, 82, 55, fill=shadow, outline="")
-                journal_pet_canvas.create_image(53, 28, image=photo)
+                shadow_scale = float(motion.get("shadow", 1.0) or 1.0)
+                journal_pet_canvas.create_oval(
+                    24 - (4 * shadow_scale),
+                    43,
+                    82 + (4 * shadow_scale),
+                    55,
+                    fill=shadow,
+                    outline="",
+                )
+                journal_pet_canvas.create_image(53, 28 + float(motion.get("bob", 0.0) or 0.0), image=photo)
                 hitbox = (18.0, 2.0, 88.0, 56.0)
             else:
                 body = "#8FE6D6" if level < 5 else "#B8A2FF"
@@ -9745,14 +9868,32 @@ def open_journal_window_editor(
                 return
             tick = int(pet_overlay_state.get("tick", 0) or 0)
             level, _current_xp, _needed_xp = _desktop_pet_level()
-            bounce = 4 if (tick // 9) % 2 == 0 else 0
+            motion = _pet_motion_values(tick, scale=1.05)
+            bounce = int(round(-float(motion.get("bob", 0.0) or 0.0)))
             bubble_text = _active_pet_bubble_text()
-            photo = _load_pet_photo("overlay", (94, 94) if bubble_text else (118, 118))
+            photo = _load_pet_photo(
+                "overlay",
+                (96, 96) if bubble_text else (122, 122),
+                tick=tick,
+                animate=not bool(pet_overlay_state.get("dragging")),
+            )
             if photo is not None:
-                canvas.create_oval(14, 96, 134, 132, fill="#2A2D44", outline="")
+                shadow_scale = float(motion.get("shadow", 1.0) or 1.0)
+                canvas.create_oval(
+                    14 - (8 * shadow_scale),
+                    96,
+                    134 + (8 * shadow_scale),
+                    132,
+                    fill="#2A2D44",
+                    outline="",
+                )
                 if bubble_text:
                     _draw_pet_bubble(canvas, 8, 4, bubble_text, width_chars=16)
-                canvas.create_image(74, (88 if bubble_text else 64) - bounce, image=photo)
+                canvas.create_image(
+                    74,
+                    (88 if bubble_text else 64) + float(motion.get("bob", 0.0) or 0.0),
+                    image=photo,
+                )
                 return
             body = "#8FE6D6" if level < 5 else "#B8A2FF"
             belly = "#F7F5FF"
