@@ -2184,6 +2184,150 @@ def _multipart_form_data(
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
+def _write_local_companion_idle_frames(source_path: Path, output_dir: Path, *, frame_count: int = 8) -> List[Path]:
+    try:
+        from PIL import Image
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        source = Image.open(source_path).convert("RGBA")
+        try:
+            resize_filter = Image.Resampling.LANCZOS
+            rotate_filter = Image.Resampling.BICUBIC
+        except AttributeError:
+            resize_filter = Image.LANCZOS
+            rotate_filter = Image.BICUBIC
+        written: List[Path] = []
+        for index in range(max(1, int(frame_count))):
+            phase = (index / max(1, frame_count)) * math.pi * 2.0
+            scale_x = 1.0 + math.sin(phase) * 0.018
+            scale_y = 1.0 - math.sin(phase) * 0.014
+            frame = source.copy()
+            if index == frame_count // 2:
+                frame = frame.resize(
+                    (
+                        max(1, int(frame.width * 1.006)),
+                        max(1, int(frame.height * 0.992)),
+                    ),
+                    resize_filter,
+                )
+            else:
+                frame = frame.resize(
+                    (
+                        max(1, int(frame.width * scale_x)),
+                        max(1, int(frame.height * scale_y)),
+                    ),
+                    resize_filter,
+                )
+            angle = math.sin(phase + 0.45) * 1.8
+            try:
+                frame = frame.rotate(angle, resample=rotate_filter, expand=True, fillcolor=(0, 0, 0, 0))
+            except TypeError:
+                frame = frame.rotate(angle, resample=rotate_filter, expand=True)
+            output = io.BytesIO()
+            frame.save(output, format="PNG", optimize=True)
+            frame_path = output_dir / f"idle_{index:02d}.png"
+            frame_path.write_bytes(_normalize_desktop_pet_image_bytes(output.getvalue()))
+            written.append(frame_path)
+        return written
+    except Exception:
+        return []
+
+
+def _extract_companion_idle_frames_from_sheet(sheet_bytes: bytes, output_dir: Path) -> List[Path]:
+    try:
+        from PIL import Image
+
+        sheet = Image.open(io.BytesIO(sheet_bytes)).convert("RGBA")
+        width, height = sheet.size
+        if width < 256 or height < 256:
+            return []
+        output_dir.mkdir(parents=True, exist_ok=True)
+        frames: List[Path] = []
+        cell_w = width // 2
+        cell_h = height // 2
+        for index, (col, row) in enumerate(((0, 0), (1, 0), (0, 1), (1, 1))):
+            crop = sheet.crop((col * cell_w, row * cell_h, (col + 1) * cell_w, (row + 1) * cell_h))
+            output = io.BytesIO()
+            crop.save(output, format="PNG", optimize=True)
+            cleaned = _normalize_desktop_pet_image_bytes(output.getvalue())
+            frame_path = output_dir / f"idle_{index:02d}.png"
+            frame_path.write_bytes(cleaned)
+            frames.append(frame_path)
+        return frames
+    except Exception:
+        return []
+
+
+def _generate_companion_idle_frames(
+    api_key: str,
+    companion_image_path: Path,
+    output_dir: Path,
+    *,
+    name: str,
+    level: int,
+    design_prompt: str = "",
+) -> List[Path]:
+    try:
+        if not companion_image_path.exists():
+            return []
+        image_file, ref_err = _prepare_pet_reference_image(companion_image_path)
+        if ref_err or image_file is None:
+            return []
+        safe_name = re.sub(r"[^A-Za-z0-9 _-]+", "", str(name or "Companion")).strip() or "Companion"
+        notes = re.sub(r"\s+", " ", str(design_prompt or "")).strip()
+        prompt = (
+            "Create a 2x2 transparent PNG sprite sheet for the exact same companion in the uploaded image. "
+            f"The companion is named {safe_name} and is level {max(1, int(level or 1))}. "
+            "Use four idle animation frames of the same character, same outfit, same colors, same face, "
+            "same accessories, same proportions, and same art style. Frame 1 neutral, frame 2 gentle breathing up, "
+            "frame 3 tiny blink or sway, frame 4 settle back down. Keep each frame centered in its own quadrant "
+            "with the same scale. Do not draw grid lines, borders, labels, text, UI, scene background, colored "
+            "canvas, shadow box, or frame numbers. The area behind the character must be transparent in every cell. "
+            "This sprite sheet will be split into animation frames, so consistency matters more than a dramatic pose."
+        )
+        if notes:
+            prompt += f" User editable design notes: {notes}"
+        fields = {
+            "model": OPENAI_REFERENCE_IMAGE_MODEL,
+            "prompt": prompt,
+            "n": "1",
+            "size": "1024x1024",
+            "quality": OPENAI_IMAGE_QUALITY,
+            "background": "transparent",
+            "output_format": "png",
+        }
+        if "mini" not in OPENAI_REFERENCE_IMAGE_MODEL.lower():
+            fields["input_fidelity"] = "high"
+        payload, content_type = _multipart_form_data(fields, {"image": image_file})
+        req = request.Request(
+            OPENAI_IMAGE_EDITS_URL,
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": content_type,
+            },
+        )
+        with request.urlopen(req, timeout=180) as response:
+            body = response.read().decode("utf-8")
+        parsed = json.loads(body)
+        first = (parsed.get("data") or [{}])[0]
+        if not isinstance(first, dict):
+            return []
+        b64 = str(first.get("b64_json") or "").strip()
+        if b64:
+            raw = base64.b64decode(b64)
+        else:
+            url = str(first.get("url") or "").strip()
+            if not url:
+                return []
+            with request.urlopen(url, timeout=90) as image_response:
+                raw = image_response.read()
+        return _extract_companion_idle_frames_from_sheet(raw, output_dir)
+    except Exception:
+        return []
+
+
 def generate_desktop_pet_image(
     level: int,
     name: str = "Companion",
@@ -2201,7 +2345,8 @@ def generate_desktop_pet_image(
         "Transparent background, full body, front three-quarter view, soft rounded shapes, clean outline, "
         "readable at small desktop-icon size, high-resolution crisp details, antialiased edges, and at least "
         "8 percent transparent padding around the body. No text, no logo, no UI frame, no colored canvas "
-        "border, no square background, no black/solid background, no shadow box. "
+        "border, no square background, no black/solid background, no scene, no room, no landscape, no "
+        "gradient backdrop, no shadow box. The pixels behind the character must be transparent. "
         f"It is level {pet_level}; higher level means slightly more confident, brighter, and magical, "
         "but still simple and friendly."
     )
@@ -2314,6 +2459,17 @@ def generate_desktop_pet_image(
         tmp_path = path.with_suffix(".tmp")
         tmp_path.write_bytes(raw)
         tmp_path.replace(path)
+        animation_dir = target_dir / f"{path.stem}_animation"
+        frames = _generate_companion_idle_frames(
+            api_key,
+            path,
+            animation_dir,
+            name=safe_name,
+            level=pet_level,
+            design_prompt=notes,
+        )
+        if not frames:
+            _write_local_companion_idle_frames(path, animation_dir)
         return path, None
     except Exception as exc:
         return None, f"Could not save generated pet image: {exc}"
@@ -9143,46 +9299,60 @@ def open_journal_window_editor(
             _save_desktop_pet_state()
             return None
         try:
-            mtime = path.stat().st_mtime
             from PIL import Image, ImageTk
 
             try:
-                resample = Image.Resampling.LANCZOS
+                resize_filter = Image.Resampling.LANCZOS
+                rotate_filter = Image.Resampling.BICUBIC
             except AttributeError:
-                resample = Image.LANCZOS
+                resize_filter = Image.LANCZOS
+                rotate_filter = Image.BICUBIC
             frame = (int(tick) // 2) % 36 if animate else 0
-            key = f"{cache_name}:{path}:{mtime}:{max_size[0]}x{max_size[1]}:f{frame}"
+            frame_path = path
+            generated_frame = False
+            if animate:
+                animation_dir = path.parent / "animation"
+                idle_frames = sorted(animation_dir.glob("idle_*.png")) if animation_dir.exists() else []
+                if idle_frames:
+                    frame_path = idle_frames[(int(tick) // 5) % len(idle_frames)]
+                    generated_frame = True
+            stat = frame_path.stat()
+            fingerprint = f"{stat.st_mtime_ns}:{stat.st_size}"
+            key = (
+                f"{cache_name}:{frame_path}:{fingerprint}:{max_size[0]}x{max_size[1]}:"
+                f"a{1 if animate and not generated_frame else 0}:f{frame}"
+            )
             cached = pet_image_cache.get(key)
             if cached is not None:
                 return cached
-            source_key = f"source:{path}:{mtime}"
+            source_key = f"source:{frame_path}:{fingerprint}"
             source = pet_image_cache.get(source_key)
             if source is None:
-                normalized = _normalize_desktop_pet_image_bytes(path.read_bytes())
+                normalized = _normalize_desktop_pet_image_bytes(frame_path.read_bytes())
                 source = Image.open(io.BytesIO(normalized)).convert("RGBA")
                 for old_key in list(pet_image_cache):
                     if old_key.startswith("source:") and old_key != source_key:
                         pet_image_cache.pop(old_key, None)
                 pet_image_cache[source_key] = source.copy()
             image = source.copy()
-            image.thumbnail(max_size, resample)
-            if animate and image.width > 0 and image.height > 0:
+            image.thumbnail(max_size, resize_filter)
+            if animate and not generated_frame and image.width > 0 and image.height > 0:
                 motion = _pet_motion_values(tick)
                 new_w = max(1, int(image.width * motion["scale_x"]))
                 new_h = max(1, int(image.height * motion["scale_y"]))
                 if new_w != image.width or new_h != image.height:
-                    image = image.resize((new_w, new_h), resample)
+                    image = image.resize((new_w, new_h), resize_filter)
                 angle = float(motion.get("angle", 0.0) or 0.0)
                 if abs(angle) >= 0.1:
                     try:
-                        image = image.rotate(angle, resample=resample, expand=True, fillcolor=(0, 0, 0, 0))
+                        image = image.rotate(angle, resample=rotate_filter, expand=True, fillcolor=(0, 0, 0, 0))
                     except TypeError:
-                        image = image.rotate(angle, resample=resample, expand=True)
+                        image = image.rotate(angle, resample=rotate_filter, expand=True)
             photo = ImageTk.PhotoImage(image)
             stale = [
                 k
                 for k in pet_image_cache
-                if k.startswith(f"{cache_name}:") and f":{path}:{mtime}:" not in k
+                if k.startswith(f"{cache_name}:") and f":{frame_path}:{fingerprint}:" not in k
             ]
             for old_key in stale:
                 pet_image_cache.pop(old_key, None)
@@ -9640,7 +9810,15 @@ def open_journal_window_editor(
                     shutil.rmtree(COMPANION_CURRENT_DIR)
                 COMPANION_CURRENT_DIR.mkdir(parents=True, exist_ok=True)
                 target_image = COMPANION_CURRENT_DIR / "companion.png"
+                source_animation_dir = path.parent / f"{path.stem}_animation"
+                target_animation_dir = COMPANION_CURRENT_DIR / "animation"
                 shutil.move(str(path), str(target_image))
+                if source_animation_dir.exists():
+                    if target_animation_dir.exists():
+                        shutil.rmtree(target_animation_dir)
+                    shutil.move(str(source_animation_dir), str(target_animation_dir))
+                if not any(target_animation_dir.glob("idle_*.png")):
+                    _write_local_companion_idle_frames(target_image, target_animation_dir)
             except Exception as exc:
                 pet_mood_lbl.config(text=tr("pet.generate_failed"))
                 messagebox.showerror(tr("pet.title"), tr("pet.profile_replace_failed").format(error=str(exc))[:4000])
