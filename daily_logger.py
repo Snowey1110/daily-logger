@@ -769,6 +769,9 @@ if tk is not None:
             return (top, bottom)
 
         def _redraw(self) -> None:
+            if self._hidden:
+                self.itemconfigure(self._thumb_id, state="hidden")
+                return
             width = max(1, int(self.winfo_width() or self._width))
             height = max(1, int(self.winfo_height()))
             self.coords(self._track_id, 0, 0, width, height)
@@ -7114,10 +7117,6 @@ def open_journal_window_editor(
     root.after_idle(_sync_journal_side_action_columns)
     root.after(250, _sync_journal_side_action_columns)
     root.after(1000, _sync_journal_side_action_columns)
-
-    placeholder_frames: List[Any] = []
-    placeholder_title_labels: List[Any] = []
-    placeholder_body_labels: List[Any] = []
 
     placeholder_frames: List[Any] = []
     placeholder_title_labels: List[Any] = []
