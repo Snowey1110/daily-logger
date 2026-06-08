@@ -25,6 +25,7 @@ import sys
 import webbrowser
 import tempfile
 import threading
+import textwrap
 import time
 import traceback
 import types
@@ -100,11 +101,27 @@ LOCAL_TRANSCRIPTION_ADDON_DIR = USER_DATA_ROOT / "addons" / "local_transcription
 MEDIA_TOOLS_ADDON_DIR = USER_DATA_ROOT / "addons" / "media_tools"
 LOCAL_TRANSCRIPTION_MODEL_DIR = USER_DATA_ROOT / "models" / "whisper"
 ADDON_DOWNLOAD_DIR = USER_DATA_ROOT / "downloads"
+COMPANION_ROOT_DIR = USER_DATA_ROOT / "Companion"
+COMPANION_CURRENT_DIR = COMPANION_ROOT_DIR / "Current"
+COMPANION_INCOMING_DIR = COMPANION_ROOT_DIR / "_incoming"
+LEGACY_DESKTOP_PET_ASSET_DIR = USER_DATA_ROOT / "desktop_pet"
+DESKTOP_PET_ASSET_DIR = COMPANION_ROOT_DIR
+DESKTOP_PET_MODULE_DIR = COMPANION_ROOT_DIR / "modules"
 LEGACY_DATA_DIR = BASE_DIR / "daily_logs"
 LEGACY_SETTINGS_DIR = BASE_DIR / "settings"
 MASTER_JOURNAL_SHEET = "Master Journal"
 JOURNAL_HEADERS_LEGACY = ["Date", "Time", "Journal"]
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_IMAGE_GENERATIONS_URL = os.getenv(
+    "OPENAI_IMAGE_GENERATIONS_URL", "https://api.openai.com/v1/images/generations"
+).strip()
+OPENAI_IMAGE_EDITS_URL = os.getenv(
+    "OPENAI_IMAGE_EDITS_URL", "https://api.openai.com/v1/images/edits"
+).strip()
+OPENAI_IMAGE_MODEL = (
+    os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1-mini").strip()
+    or "gpt-image-1-mini"
+)
 OPENAI_TRANSCRIPTION_URL = os.getenv(
     "OPENAI_TRANSCRIPTION_URL", "https://api.openai.com/v1/audio/transcriptions"
 ).strip()
@@ -120,7 +137,7 @@ WAVEFORM_MAX_DRAW_SAMPLES = 4000
 WAVEFORM_RMS_NORM = 6000.0
 # Smaller input blocks when metering so the canvas updates often enough to feel live.
 WAVEFORM_INPUT_BLOCK_SAMPLES = 512
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 APP_GITHUB_REPO = "Snowey1110/daily-logger"
 APP_RELEASE_API_URL = f"https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest"
 APP_RELEASE_PAGE_URL = f"https://github.com/{APP_GITHUB_REPO}/releases/latest"
@@ -316,7 +333,20 @@ TOOLTIP_WRAP_PX_MAX = 280
 JOURNAL_PREF_THEME_KEY = "journal_window_theme"
 JOURNAL_PREF_FULLSCREEN_KEY = "journal_window_fullscreen"
 SIDEBAR_MODULE_ORDER_PREF_KEY = "sidebar_module_order"
-SIDEBAR_DEFAULT_MODULE_ORDER = ("journal", "ai_recap", "chatbot", "console", "reader", "settings")
+SIDEBAR_DESKTOP_PET_MIGRATION_PREF_KEY = "sidebar_desktop_pet_migration_v2_done"
+DESKTOP_PET_STATE_PREF_KEY = "desktop_pet_state"
+DESKTOP_PET_MEMORY_UNLOCK_LEVEL = 2
+DESKTOP_PET_TTS_UNLOCK_LEVEL = 3
+DESKTOP_PET_CHAT_UNLOCK_LEVEL = 5
+SIDEBAR_DEFAULT_MODULE_ORDER = (
+    "journal",
+    "ai_recap",
+    "chatbot",
+    "desktop_pet",
+    "console",
+    "reader",
+    "settings",
+)
 SIDEBAR_TOP_SLOT_COUNT = 8
 SIDEBAR_BOTTOM_SLOT_COUNT = 2
 SIDEBAR_TOTAL_SLOT_COUNT = SIDEBAR_TOP_SLOT_COUNT + SIDEBAR_BOTTOM_SLOT_COUNT
@@ -2002,6 +2032,219 @@ def save_openai_api_key(api_key: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def _normalize_desktop_pet_image_bytes(raw: bytes) -> bytes:
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(raw)).convert("RGBA")
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return raw
+        alpha = image.getchannel("A")
+        if alpha.getextrema() == (255, 255):
+            pixels = image.load()
+            corner_points = [
+                (0, 0),
+                (max(0, width - 1), 0),
+                (0, max(0, height - 1)),
+                (max(0, width - 1), max(0, height - 1)),
+            ]
+            corner_colors = [pixels[x, y][:3] for x, y in corner_points]
+            base_color = tuple(sum(color[i] for color in corner_colors) // len(corner_colors) for i in range(3))
+
+            def _near_background(rgb: Tuple[int, int, int]) -> bool:
+                return sum((int(rgb[i]) - int(base_color[i])) ** 2 for i in range(3)) <= 38 * 38
+
+            visited = set()
+            stack = list(corner_points)
+            while stack:
+                x, y = stack.pop()
+                if x < 0 or y < 0 or x >= width or y >= height or (x, y) in visited:
+                    continue
+                visited.add((x, y))
+                r, g, b, a = pixels[x, y]
+                if a <= 0 or not _near_background((r, g, b)):
+                    continue
+                pixels[x, y] = (r, g, b, 0)
+                stack.extend(((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)))
+        bbox = image.getchannel("A").getbbox()
+        if bbox:
+            pad = 24
+            left = max(0, bbox[0] - pad)
+            top = max(0, bbox[1] - pad)
+            right = min(width, bbox[2] + pad)
+            bottom = min(height, bbox[3] + pad)
+            image = image.crop((left, top, right, bottom))
+        output = io.BytesIO()
+        image.save(output, format="PNG")
+        return output.getvalue()
+    except Exception:
+        return raw
+
+
+def _prepare_pet_reference_image(path: Path) -> Tuple[Optional[Tuple[str, bytes, str]], Optional[str]]:
+    try:
+        if not path.exists() or not path.is_file():
+            return None, "Reference image was not found."
+        if path.stat().st_size > 50 * 1024 * 1024:
+            return None, "Reference image is larger than 50 MB."
+        from PIL import Image
+
+        with Image.open(path) as image:
+            image.thumbnail((1536, 1536))
+            if image.mode not in ("RGB", "RGBA"):
+                image = image.convert("RGBA")
+            output = io.BytesIO()
+            image.save(output, format="PNG")
+        return ("reference.png", output.getvalue(), "image/png"), None
+    except Exception as exc:
+        return None, f"Could not read the reference image: {exc}"
+
+
+def _multipart_form_data(
+    fields: Dict[str, str],
+    files: Dict[str, Tuple[str, bytes, str]],
+) -> Tuple[bytes, str]:
+    boundary = f"----DailyLogger{secrets.token_hex(16)}"
+    chunks: List[bytes] = []
+    for name, value in fields.items():
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        chunks.append(str(value).encode("utf-8"))
+        chunks.append(b"\r\n")
+    for name, (filename, data, content_type) in files.items():
+        safe_name = Path(filename).name or "image.png"
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(
+            (
+                f'Content-Disposition: form-data; name="{name}"; filename="{safe_name}"\r\n'
+                f"Content-Type: {content_type or 'application/octet-stream'}\r\n\r\n"
+            ).encode("utf-8")
+        )
+        chunks.append(data)
+        chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def generate_desktop_pet_image(
+    level: int,
+    name: str = "Companion",
+    reference_image_path: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    design_prompt: str = "",
+) -> Tuple[Optional[Path], Optional[str]]:
+    api_key = get_openai_api_key()
+    if not api_key:
+        return None, "OPENAI_API_KEY is not set. Add your token first, then generate the companion look."
+
+    pet_level = max(1, int(level or 1))
+    safe_name = re.sub(r"[^A-Za-z0-9 _-]+", "", str(name or "Companion")).strip() or "Companion"
+    prompt = (
+        "Create one original cute Q-style chibi desktop companion sprite named "
+        f"{safe_name}. The default direction is a charming chibi anime boy or girl mascot, "
+        "with the option to softly borrow animal-like pet/dog/fantasy companion energy. "
+        "Do not resemble any existing copyrighted character. Transparent background, "
+        "full body, front three-quarter view, soft rounded shapes, clean outline, readable at "
+        "small desktop-icon size, no text, no logo, no UI frame, no black/solid background. "
+        f"It is level {pet_level}; higher level means slightly more confident, brighter, and magical, "
+        "but still simple and friendly."
+    )
+    notes = re.sub(r"\s+", " ", str(design_prompt or "")).strip()
+    if notes:
+        prompt += f" User editable design notes: {notes}"
+    if reference_image_path is not None:
+        reference_file, ref_err = _prepare_pet_reference_image(Path(reference_image_path))
+        if ref_err or reference_file is None:
+            return None, ref_err or "Could not prepare reference image."
+        prompt = (
+            prompt
+            + " Use the uploaded image only as loose visual inspiration for hairstyle, outfit palette, "
+            "pose language, or creature personality. Redesign it as an original cute chibi desktop "
+            "companion sprite, not a direct copy."
+        )
+        payload, content_type = _multipart_form_data(
+            {
+                "model": OPENAI_IMAGE_MODEL,
+                "prompt": prompt,
+                "n": "1",
+                "size": "1024x1024",
+                "quality": "low",
+                "background": "transparent",
+                "output_format": "png",
+            },
+            {"image": reference_file},
+        )
+        req = request.Request(
+            OPENAI_IMAGE_EDITS_URL,
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": content_type,
+            },
+        )
+    else:
+        payload_data: Dict[str, object] = {
+            "model": OPENAI_IMAGE_MODEL,
+            "prompt": prompt,
+            "n": 1,
+            "size": "1024x1024",
+            "quality": "low",
+            "background": "transparent",
+            "output_format": "png",
+        }
+        payload = json.dumps(payload_data).encode("utf-8")
+        req = request.Request(
+            OPENAI_IMAGE_GENERATIONS_URL,
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+    try:
+        with request.urlopen(req, timeout=180) as response:
+            body = response.read().decode("utf-8")
+    except error.HTTPError as exc:
+        try:
+            details = exc.read().decode("utf-8")
+        except Exception:
+            details = str(exc)
+        return None, f"Image generation API error ({exc.code}): {details}"
+    except Exception as exc:
+        return None, f"Could not contact image generation API: {exc}"
+
+    try:
+        parsed = json.loads(body)
+        first = (parsed.get("data") or [{}])[0]
+        if not isinstance(first, dict):
+            return None, "Image generation returned an unexpected response."
+        b64 = str(first.get("b64_json") or "").strip()
+        if b64:
+            raw = base64.b64decode(b64)
+        else:
+            url = str(first.get("url") or "").strip()
+            if not url:
+                return None, "Image generation did not return image data."
+            with request.urlopen(url, timeout=90) as image_response:
+                raw = image_response.read()
+        if not raw:
+            return None, "Image generation returned an empty image."
+        raw = _normalize_desktop_pet_image_bytes(raw)
+        target_dir = Path(output_dir) if output_dir is not None else DESKTOP_PET_ASSET_DIR
+        target_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = target_dir / f"companion_{timestamp}_{secrets.token_hex(3)}.png"
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_bytes(raw)
+        tmp_path.replace(path)
+        return path, None
+    except Exception as exc:
+        return None, f"Could not save generated pet image: {exc}"
 
 
 def delete_openai_api_key() -> bool:
@@ -6187,6 +6430,7 @@ def open_journal_window_editor(
     journal_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
     ai_recap_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
     chatbot_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
+    desktop_pet_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
     console_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
     settings_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
     module_library_page = tk.Frame(content_host, bg=t_init.surface, bd=0, highlightthickness=0)
@@ -6194,6 +6438,7 @@ def open_journal_window_editor(
         journal_page,
         ai_recap_page,
         chatbot_page,
+        desktop_pet_page,
         console_page,
         settings_page,
         module_library_page,
@@ -6240,10 +6485,18 @@ def open_journal_window_editor(
         left_margin = 20 + (reveal_width + 8 if nav_collapsed["value"] else 0)
         right_margin = 20
         if save_entry_btn_holder.get("btn") is not None and frame is journal_page:
-            save_x = save_entry_btn.winfo_x()
-            save_w = save_entry_btn.winfo_width()
-            if save_x > 0 and save_w > 0:
-                right_margin = max(right_margin, fw - save_x + 8)
+            save_entry_btn.update_idletasks()
+            save_w = max(save_entry_btn.winfo_width(), save_entry_btn.winfo_reqwidth())
+            right_margin = max(right_margin, save_w + 36)
+            button_row.place(
+                in_=frame,
+                relx=1.0,
+                rely=1.0,
+                x=-20,
+                y=-12,
+                anchor="se",
+            )
+            button_row.lift()
         row_w = max(280, fw - left_margin - right_margin)
         console_row = console_input_holder.get("row")
         if console_row is not None:
@@ -6256,12 +6509,15 @@ def open_journal_window_editor(
                 width=row_w,
             )
             console_row.lift()
+        if save_entry_btn_holder.get("btn") is not None and frame is journal_page:
+            button_row.lift()
 
     def show_page(page_key: str) -> None:
         page_map = {
             "journal": journal_page,
             "ai_recap": ai_recap_page,
             "chatbot": chatbot_page,
+            "desktop_pet": desktop_pet_page,
             "console": console_page,
             "settings": settings_page,
             "module_library": module_library_page,
@@ -6282,6 +6538,10 @@ def open_journal_window_editor(
             _layout_console_row(frame)
         try:
             _refresh_sidebar_module_styles()
+        except NameError:
+            pass
+        try:
+            _draw_journal_pet()
         except NameError:
             pass
 
@@ -6432,7 +6692,7 @@ def open_journal_window_editor(
 
     top = tk.Frame(journal_page, bg=t_init.panel, bd=0, highlightthickness=0)
     top.pack(fill="x", padx=t_init.pad_outer, pady=t_init.pad_top_y)
-    top.grid_columnconfigure(6, weight=1)
+    top.grid_columnconfigure(5, weight=1)
     _register_page_toggle(journal_page)
     date_lbl = tk.Label(
         top,
@@ -7088,6 +7348,2678 @@ def open_journal_window_editor(
     )
     gen_button.grid(row=0, column=0, columnspan=2, sticky="ew")
     report_box.insert("1.0", draft_report)
+
+    journal_pet_transparent = "#00ff7f"
+    journal_pet_window = tk.Toplevel(root)
+    journal_pet_window.overrideredirect(True)
+    journal_pet_window.transient(root)
+    try:
+        journal_pet_window.attributes("-transparentcolor", journal_pet_transparent)
+    except tk.TclError:
+        pass
+    journal_pet_window.withdraw()
+    journal_pet_canvas = tk.Canvas(
+        journal_pet_window,
+        width=104,
+        height=58,
+        bg=journal_pet_transparent,
+        bd=0,
+        highlightthickness=0,
+        cursor="hand2",
+    )
+    journal_pet_canvas.pack(fill="both", expand=True)
+
+    _register_page_toggle(desktop_pet_page)
+    desktop_pet_page.grid_rowconfigure(0, weight=1)
+    desktop_pet_page.grid_columnconfigure(0, weight=1)
+    pet_wrap = tk.Frame(desktop_pet_page, bg=t_init.surface)
+    pet_wrap.grid(row=0, column=0, sticky="nsew", padx=28, pady=28)
+    pet_wrap.grid_columnconfigure(0, weight=2)
+    pet_wrap.grid_columnconfigure(1, weight=1)
+    pet_wrap.grid_rowconfigure(2, weight=1)
+    pet_title_lbl = tk.Label(
+        pet_wrap,
+        text=tr("pet.title"),
+        bg=t_init.surface,
+        fg=t_init.text,
+        font=("Segoe UI", 18, "bold"),
+        anchor="w",
+    )
+    pet_title_lbl.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+    pet_body_lbl = tk.Label(
+        pet_wrap,
+        text=tr("pet.body"),
+        bg=t_init.surface,
+        fg=t_init.muted,
+        font=("Segoe UI", 10),
+        anchor="w",
+        justify="left",
+        wraplength=760,
+    )
+    pet_body_lbl.grid(row=1, column=0, columnspan=2, sticky="new", pady=(0, 16))
+    pet_stage = tk.Canvas(
+        pet_wrap,
+        height=360,
+        bg=t_init.field,
+        highlightthickness=1,
+        highlightbackground=t_init.border,
+        highlightcolor=t_init.accent,
+    )
+    pet_stage.grid(row=2, column=0, sticky="nsew", padx=(0, 16), pady=(0, 0))
+    pet_info_holder = tk.Frame(pet_wrap, bg=t_init.panel, highlightthickness=1, highlightbackground=t_init.border)
+    pet_info_holder.grid(row=2, column=1, sticky="nsew")
+    pet_info_holder.grid_rowconfigure(0, weight=1)
+    pet_info_holder.grid_columnconfigure(0, weight=1)
+    pet_info_canvas = tk.Canvas(
+        pet_info_holder,
+        bg=t_init.panel,
+        bd=0,
+        highlightthickness=0,
+        yscrollincrement=16,
+    )
+    pet_info_scroll = tk.Scrollbar(
+        pet_info_holder,
+        command=pet_info_canvas.yview,
+        bg=t_init.panel,
+        troughcolor=t_init.field,
+        activebackground=t_init.accent,
+        bd=0,
+        highlightthickness=0,
+        width=11,
+    )
+    pet_info_canvas.configure(yscrollcommand=pet_info_scroll.set)
+    pet_info_canvas.grid(row=0, column=0, sticky="nsew")
+    pet_info_scroll.grid(row=0, column=1, sticky="ns")
+    pet_info = tk.Frame(pet_info_canvas, bg=t_init.panel)
+    pet_info_window = pet_info_canvas.create_window((0, 0), window=pet_info, anchor="nw")
+    pet_info.grid_columnconfigure(0, weight=1)
+
+    def _sync_pet_info_scroll(_evt: Optional[Any] = None) -> None:
+        try:
+            pet_info_canvas.configure(scrollregion=pet_info_canvas.bbox("all"))
+            pet_info_canvas.itemconfigure(pet_info_window, width=pet_info_canvas.winfo_width())
+        except tk.TclError:
+            pass
+
+    def _pet_info_mousewheel(evt: Any) -> str:
+        try:
+            pet_info_canvas.yview_scroll(int(-1 * (evt.delta / 120)), "units")
+        except tk.TclError:
+            pass
+        return "break"
+
+    pet_info.bind("<Configure>", _sync_pet_info_scroll, add="+")
+    pet_info_canvas.bind("<Configure>", _sync_pet_info_scroll, add="+")
+    pet_info_canvas.bind("<MouseWheel>", _pet_info_mousewheel, add="+")
+    pet_info.bind("<MouseWheel>", _pet_info_mousewheel, add="+")
+    pet_level_lbl = tk.Label(
+        pet_info,
+        text="",
+        bg=t_init.panel,
+        fg=t_init.text,
+        font=("Segoe UI", 16, "bold"),
+        anchor="w",
+    )
+    pet_level_lbl.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 4))
+    pet_xp_lbl = tk.Label(
+        pet_info,
+        text="",
+        bg=t_init.panel,
+        fg=t_init.muted,
+        font=("Segoe UI", 10),
+        anchor="w",
+        justify="left",
+    )
+    pet_xp_lbl.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+    pet_mood_lbl = tk.Label(
+        pet_info,
+        text="",
+        bg=t_init.panel,
+        fg=t_init.muted,
+        font=("Segoe UI", 10),
+        anchor="w",
+        justify="left",
+        wraplength=260,
+    )
+    pet_mood_lbl.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
+    pet_name_frame = tk.Frame(pet_info, bg=t_init.panel, bd=0, highlightthickness=0)
+    pet_name_frame.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 10))
+    pet_name_frame.grid_columnconfigure(1, weight=1)
+    pet_name_lbl = tk.Label(
+        pet_name_frame,
+        text=tr("pet.name_label"),
+        bg=t_init.panel,
+        fg=t_init.muted,
+        font=("Segoe UI", 9, "bold"),
+        anchor="w",
+    )
+    pet_name_lbl.grid(row=0, column=0, sticky="w", padx=(0, 8))
+    pet_name_var = tk.StringVar(value="")
+    pet_name_entry = tk.Entry(
+        pet_name_frame,
+        textvariable=pet_name_var,
+        bg=t_init.field,
+        fg=t_init.text,
+        disabledbackground=t_init.btn_disabled,
+        disabledforeground=t_init.disabled_fg,
+        insertbackground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9),
+        highlightthickness=1,
+        highlightbackground=t_init.border,
+        highlightcolor=t_init.accent,
+    )
+    pet_name_entry.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+    pet_name_save_btn = tk.Button(
+        pet_name_frame,
+        text=tr("pet.name_save"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=4,
+        cursor="hand2",
+    )
+    pet_name_save_btn.grid(row=0, column=2, sticky="ns")
+    pet_feed_btn = tk.Button(
+        pet_info,
+        text=tr("pet.feed_now"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=8,
+        cursor="hand2",
+    )
+    pet_feed_btn.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
+    pet_art_btn = tk.Button(
+        pet_info,
+        text=tr("pet.generate_look"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=8,
+        cursor="hand2",
+    )
+    pet_art_btn.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 8))
+    pet_art_ref_btn = tk.Button(
+        pet_info,
+        text=tr("pet.generate_from_image"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=8,
+        cursor="hand2",
+    )
+    pet_art_ref_btn.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 8))
+    pet_desktop_btn = tk.Button(
+        pet_info,
+        text=tr("pet.desktop_mode"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=8,
+        cursor="hand2",
+    )
+    pet_desktop_btn.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 8))
+    pet_journal_btn = tk.Button(
+        pet_info,
+        text=tr("pet.journal_hide"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=8,
+        cursor="hand2",
+    )
+    pet_journal_btn.grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 16))
+    pet_profile_frame = tk.Frame(pet_info, bg=t_init.panel, bd=0, highlightthickness=0)
+    pet_profile_frame.grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 16))
+    pet_profile_frame.grid_columnconfigure(0, weight=1)
+    pet_profile_frame.grid_columnconfigure(1, weight=1)
+    pet_export_btn = tk.Button(
+        pet_profile_frame,
+        text=tr("pet.export_profile"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=8,
+        pady=6,
+        cursor="hand2",
+    )
+    pet_export_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 6))
+    pet_import_btn = tk.Button(
+        pet_profile_frame,
+        text=tr("pet.import_profile"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=8,
+        pady=6,
+        cursor="hand2",
+    )
+    pet_import_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=(0, 6))
+    pet_folder_btn = tk.Button(
+        pet_profile_frame,
+        text=tr("pet.open_folder"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=8,
+        pady=6,
+        cursor="hand2",
+    )
+    pet_folder_btn.grid(row=1, column=0, columnspan=2, sticky="ew")
+    pet_delete_btn = tk.Button(
+        pet_profile_frame,
+        text=tr("pet.delete_profile"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=8,
+        pady=6,
+        cursor="hand2",
+    )
+    pet_delete_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    pet_modules_lbl = tk.Label(
+        pet_info,
+        text=tr("pet.modules_title"),
+        bg=t_init.panel,
+        fg=t_init.text,
+        font=("Segoe UI", 11, "bold"),
+        anchor="w",
+    )
+    pet_modules_lbl.grid(row=10, column=0, sticky="ew", padx=16, pady=(0, 8))
+    pet_bubble_module = tk.Frame(
+        pet_info,
+        bg=t_init.field,
+        highlightthickness=1,
+        highlightbackground=t_init.border,
+    )
+    pet_bubble_module.grid(row=11, column=0, sticky="ew", padx=16, pady=(0, 16))
+    pet_bubble_module.grid_columnconfigure(0, weight=1)
+    pet_bubble_title_lbl = tk.Label(
+        pet_bubble_module,
+        text=tr("pet.module_bubble_title"),
+        bg=t_init.field,
+        fg=t_init.text,
+        font=("Segoe UI", 10, "bold"),
+        anchor="w",
+    )
+    pet_bubble_title_lbl.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 2))
+    pet_bubble_status_lbl = tk.Label(
+        pet_bubble_module,
+        text="",
+        bg=t_init.field,
+        fg=t_init.muted,
+        font=("Segoe UI", 9),
+        anchor="w",
+        justify="left",
+        wraplength=230,
+    )
+    pet_bubble_status_lbl.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+    pet_bubble_btn = tk.Button(
+        pet_bubble_module,
+        text="",
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=6,
+        cursor="hand2",
+    )
+    pet_bubble_btn.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+    pet_memory_module = tk.Frame(
+        pet_info,
+        bg=t_init.field,
+        highlightthickness=1,
+        highlightbackground=t_init.border,
+    )
+    pet_memory_module.grid(row=12, column=0, sticky="ew", padx=16, pady=(0, 16))
+    pet_memory_module.grid_columnconfigure(0, weight=1)
+    pet_memory_title_lbl = tk.Label(
+        pet_memory_module,
+        text=tr("pet.module_memory_title"),
+        bg=t_init.field,
+        fg=t_init.text,
+        font=("Segoe UI", 10, "bold"),
+        anchor="w",
+    )
+    pet_memory_title_lbl.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 2))
+    pet_memory_status_lbl = tk.Label(
+        pet_memory_module,
+        text="",
+        bg=t_init.field,
+        fg=t_init.muted,
+        font=("Segoe UI", 9),
+        anchor="w",
+        justify="left",
+        wraplength=230,
+    )
+    pet_memory_status_lbl.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+    pet_memory_btn = tk.Button(
+        pet_memory_module,
+        text="",
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=6,
+        cursor="hand2",
+    )
+    pet_memory_btn.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+    pet_tts_module = tk.Frame(
+        pet_info,
+        bg=t_init.field,
+        highlightthickness=1,
+        highlightbackground=t_init.border,
+    )
+    pet_tts_module.grid(row=13, column=0, sticky="ew", padx=16, pady=(0, 16))
+    pet_tts_module.grid_columnconfigure(0, weight=1)
+    pet_tts_title_lbl = tk.Label(
+        pet_tts_module,
+        text=tr("pet.module_tts_title"),
+        bg=t_init.field,
+        fg=t_init.text,
+        font=("Segoe UI", 10, "bold"),
+        anchor="w",
+    )
+    pet_tts_title_lbl.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 2))
+    pet_tts_status_lbl = tk.Label(
+        pet_tts_module,
+        text="",
+        bg=t_init.field,
+        fg=t_init.muted,
+        font=("Segoe UI", 9),
+        anchor="w",
+        justify="left",
+        wraplength=230,
+    )
+    pet_tts_status_lbl.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+    pet_tts_btn = tk.Button(
+        pet_tts_module,
+        text="",
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=6,
+        cursor="hand2",
+    )
+    pet_tts_btn.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+    pet_chat_module = tk.Frame(
+        pet_info,
+        bg=t_init.field,
+        highlightthickness=1,
+        highlightbackground=t_init.border,
+    )
+    pet_chat_module.grid(row=14, column=0, sticky="ew", padx=16, pady=(0, 16))
+    pet_chat_module.grid_columnconfigure(0, weight=1)
+    pet_chat_title_lbl = tk.Label(
+        pet_chat_module,
+        text=tr("pet.module_chat_title"),
+        bg=t_init.field,
+        fg=t_init.text,
+        font=("Segoe UI", 10, "bold"),
+        anchor="w",
+    )
+    pet_chat_title_lbl.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 2))
+    pet_chat_status_lbl = tk.Label(
+        pet_chat_module,
+        text="",
+        bg=t_init.field,
+        fg=t_init.muted,
+        font=("Segoe UI", 9),
+        anchor="w",
+        justify="left",
+        wraplength=230,
+    )
+    pet_chat_status_lbl.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+    pet_chat_btn = tk.Button(
+        pet_chat_module,
+        text="",
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=6,
+        cursor="hand2",
+    )
+    pet_chat_btn.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
+    pet_chat_entry_row = tk.Frame(pet_chat_module, bg=t_init.field)
+    pet_chat_entry_row.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
+    pet_chat_entry_row.grid_columnconfigure(0, weight=1)
+    pet_chat_entry = tk.Entry(
+        pet_chat_entry_row,
+        bg=t_init.panel,
+        fg=t_init.text,
+        insertbackground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9),
+        highlightthickness=1,
+        highlightbackground=t_init.border,
+        highlightcolor=t_init.accent,
+    )
+    pet_chat_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    pet_chat_ask_btn = tk.Button(
+        pet_chat_entry_row,
+        text=tr("pet.chat_ask"),
+        bg=t_init.btn_secondary,
+        fg=t_init.text,
+        activebackground=t_init.secondary_hover,
+        activeforeground=t_init.text,
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=10,
+        pady=4,
+        cursor="hand2",
+    )
+    pet_chat_ask_btn.grid(row=0, column=1, sticky="ns")
+
+    def _bind_pet_info_mousewheel_recursive(widget: Any) -> None:
+        try:
+            widget.bind("<MouseWheel>", _pet_info_mousewheel, add="+")
+            for child in widget.winfo_children():
+                _bind_pet_info_mousewheel_recursive(child)
+        except tk.TclError:
+            pass
+
+    root.after_idle(lambda: _bind_pet_info_mousewheel_recursive(pet_info_holder))
+
+    def _safe_companion_profile_name(name: str) -> str:
+        clean = re.sub(r"[^A-Za-z0-9 _.-]+", "", str(name or "Companion")).strip(" ._-")
+        return clean[:48] or "Companion"
+
+    def _default_companion_state(*, active: bool = False) -> Dict[str, Any]:
+        return {
+            "active": active,
+            "name": "Companion",
+            "profile_id": "",
+            "created_at": "",
+            "xp": 0,
+            "fed_units": 0,
+            "desktop_enabled": False,
+            "journal_visible": True,
+            "desktop_x": 0,
+            "desktop_y": 0,
+            "journal_x": 0,
+            "journal_y": 0,
+            "stage_x": 0,
+            "stage_y": 0,
+            "image_path": "",
+            "modules": {"bubble": False, "memory": False, "tts": False, "chat": False},
+            "downloads": {"bubble": False, "memory": False, "tts": False, "chat": False},
+            "memory": {},
+            "last_gain": 0,
+        }
+
+    def _read_json_file(path: Path) -> Dict[str, Any]:
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _normalize_companion_state(data: Dict[str, Any], *, active: bool = True) -> Dict[str, Any]:
+        state = _default_companion_state(active=active)
+        state["name"] = str(data.get("name") or "Companion").strip() or "Companion"
+        state["profile_id"] = str(data.get("profile_id") or "").strip()
+        state["created_at"] = str(data.get("created_at") or "").strip()
+        for key in ("xp", "fed_units", "desktop_x", "desktop_y", "journal_x", "journal_y", "stage_x", "stage_y"):
+            try:
+                state[key] = max(0, int(data.get(key, 0) or 0))
+            except (TypeError, ValueError):
+                state[key] = 0
+        state["desktop_enabled"] = bool(data.get("desktop_enabled", False))
+        state["journal_visible"] = bool(data.get("journal_visible", True))
+        image_path = str(data.get("image_path") or "").strip()
+        state["image_path"] = image_path if image_path and Path(image_path).exists() else ""
+        modules_raw = data.get("modules") if isinstance(data.get("modules"), dict) else {}
+        downloads_raw = data.get("downloads") if isinstance(data.get("downloads"), dict) else {}
+        modules: Dict[str, bool] = {}
+        downloads: Dict[str, bool] = {}
+        for module_id in ("bubble", "memory", "tts", "chat"):
+            modules[module_id] = bool(modules_raw.get(module_id, False)) if isinstance(modules_raw, dict) else False
+            downloads[module_id] = (
+                bool(downloads_raw.get(module_id, False) or modules[module_id])
+                if isinstance(downloads_raw, dict)
+                else modules[module_id]
+            )
+        state["modules"] = modules
+        state["downloads"] = downloads
+        memory_raw = data.get("memory") if isinstance(data.get("memory"), dict) else {}
+        memory: Dict[str, int] = {}
+        if isinstance(memory_raw, dict):
+            for key, value in memory_raw.items():
+                term = str(key or "").strip()[:32]
+                if not term:
+                    continue
+                try:
+                    count = max(1, int(value))
+                except (TypeError, ValueError):
+                    continue
+                memory[term] = min(999, count)
+        state["memory"] = memory
+        return state
+
+    def _profile_dir_has_companion(profile_dir: Path) -> bool:
+        if not profile_dir.exists() or not profile_dir.is_dir():
+            return False
+        if (profile_dir / "profile.json").exists():
+            return True
+        return any(profile_dir.glob("*.png"))
+
+    def _load_companion_state_from_dir(profile_dir: Path) -> Optional[Dict[str, Any]]:
+        if not _profile_dir_has_companion(profile_dir):
+            return None
+        profile = _read_json_file(profile_dir / "profile.json")
+        stats = _read_json_file(profile_dir / "stats.json")
+        memory = _read_json_file(profile_dir / "memory.json")
+        data: Dict[str, Any] = {}
+        data.update(stats)
+        data.update(profile)
+        data["memory"] = memory
+        image_file = str(profile.get("image_file") or "").strip()
+        image_path = profile_dir / image_file if image_file else Path()
+        if not image_file or not image_path.exists():
+            images = sorted(profile_dir.glob("*.png"))
+            image_path = images[0] if images else Path()
+        if image_path and image_path.exists():
+            data["image_path"] = str(image_path)
+        state = _normalize_companion_state(data, active=True)
+        state["profile_dir"] = str(profile_dir)
+        return state
+
+    def _write_companion_state_to_dir(profile_dir: Path, state: Dict[str, Any]) -> None:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        image_file = ""
+        image_path = Path(str(state.get("image_path") or ""))
+        if image_path.exists():
+            target = profile_dir / "companion.png"
+            try:
+                if image_path.resolve() != target.resolve():
+                    shutil.copy2(image_path, target)
+                image_file = target.name
+                state["image_path"] = str(target)
+            except Exception:
+                image_file = image_path.name
+        now = datetime.now().isoformat(timespec="seconds")
+        profile = {
+            "profile_version": 1,
+            "profile_id": str(state.get("profile_id") or secrets.token_hex(8)),
+            "name": str(state.get("name") or "Companion"),
+            "image_file": image_file,
+            "created_at": str(state.get("created_at") or now),
+            "updated_at": now,
+        }
+        stats = {
+            "xp": int(state.get("xp", 0) or 0),
+            "fed_units": int(state.get("fed_units", 0) or 0),
+            "desktop_enabled": bool(state.get("desktop_enabled", False)),
+            "journal_visible": bool(state.get("journal_visible", True)),
+            "desktop_x": int(state.get("desktop_x", 0) or 0),
+            "desktop_y": int(state.get("desktop_y", 0) or 0),
+            "journal_x": int(state.get("journal_x", 0) or 0),
+            "journal_y": int(state.get("journal_y", 0) or 0),
+            "stage_x": int(state.get("stage_x", 0) or 0),
+            "stage_y": int(state.get("stage_y", 0) or 0),
+            "modules": dict(state.get("modules") or {}),
+            "downloads": dict(state.get("downloads") or {}),
+        }
+        _write_json_atomic(profile_dir / "profile.json", profile)
+        _write_json_atomic(profile_dir / "stats.json", stats)
+        _write_json_atomic(profile_dir / "memory.json", dict(state.get("memory") or {}))
+        state["profile_id"] = profile["profile_id"]
+        state["created_at"] = profile["created_at"]
+        state["profile_dir"] = str(profile_dir)
+
+    def _load_legacy_companion_state_from_preferences() -> Optional[Dict[str, Any]]:
+        raw = load_preferences().get(DESKTOP_PET_STATE_PREF_KEY, "")
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(str(raw))
+            if not isinstance(parsed, dict):
+                return None
+        except Exception:
+            return None
+        state = _normalize_companion_state(parsed, active=True)
+        if not any(
+            [
+                state.get("image_path"),
+                int(state.get("xp", 0) or 0),
+                int(state.get("fed_units", 0) or 0),
+                bool(state.get("memory")),
+                any(dict(state.get("modules") or {}).values()),
+            ]
+        ):
+            return None
+        return state
+
+    def _load_desktop_pet_state() -> Dict[str, Any]:
+        COMPANION_ROOT_DIR.mkdir(parents=True, exist_ok=True)
+        current_state = _load_companion_state_from_dir(COMPANION_CURRENT_DIR)
+        if current_state is not None:
+            return current_state
+        legacy_state = _load_legacy_companion_state_from_preferences()
+        if legacy_state is not None:
+            _write_companion_state_to_dir(COMPANION_CURRENT_DIR, legacy_state)
+            return legacy_state
+        return _default_companion_state(active=False)
+
+    pet_state = _load_desktop_pet_state()
+    pet_anim_state = {"tick": 0, "x": 42.0, "direction": 1}
+    pet_art_busy = {"v": False}
+    pet_chat_busy = {"v": False}
+    pet_bubble_state = {"text": "", "until": 0.0, "last_auto": 0.0}
+    pet_tts_state: Dict[str, Any] = {"proc": None, "last": 0.0, "error": ""}
+    pet_image_cache: Dict[str, Any] = {}
+    journal_pet_state: Dict[str, Any] = {
+        "dragging": False,
+        "drag_dx": 0,
+        "drag_dy": 0,
+        "x": 0.58,
+        "y": 0.74,
+        "direction": 1,
+        "tick": 0,
+        "handoff": False,
+        "hitbox": (0.0, 0.0, 0.0, 0.0),
+    }
+    pet_stage_drag_state: Dict[str, Any] = {
+        "dragging": False,
+        "active": False,
+        "dx": 0,
+        "dy": 0,
+        "x": 42.0,
+        "y": 0.0,
+        "handoff": False,
+        "hitbox": (0.0, 0.0, 0.0, 0.0),
+    }
+    pet_overlay_state: Dict[str, Any] = {
+        "window": None,
+        "canvas": None,
+        "dragging": False,
+        "drag_dx": 0,
+        "drag_dy": 0,
+        "x": int(pet_state.get("desktop_x", 0) or 0),
+        "y": int(pet_state.get("desktop_y", 0) or 0),
+        "direction": 1,
+        "falling": False,
+        "vy": 0.0,
+        "tick": 0,
+    }
+
+    def _save_desktop_pet_state() -> None:
+        if not bool(pet_state.get("active", False)):
+            prefs = load_preferences()
+            prefs[DESKTOP_PET_STATE_PREF_KEY] = json.dumps({"active": False})
+            save_preferences(prefs)
+            return
+        _write_companion_state_to_dir(COMPANION_CURRENT_DIR, pet_state)
+        prefs = load_preferences()
+        prefs[DESKTOP_PET_STATE_PREF_KEY] = json.dumps(
+            {
+                "active": True,
+                "name": str(pet_state.get("name") or "Companion"),
+                "xp": int(pet_state.get("xp", 0) or 0),
+                "fed_units": int(pet_state.get("fed_units", 0) or 0),
+                "desktop_enabled": bool(pet_state.get("desktop_enabled", False)),
+                "journal_visible": bool(pet_state.get("journal_visible", True)),
+                "desktop_x": int(pet_state.get("desktop_x", 0) or 0),
+                "desktop_y": int(pet_state.get("desktop_y", 0) or 0),
+                "journal_x": int(pet_state.get("journal_x", 0) or 0),
+                "journal_y": int(pet_state.get("journal_y", 0) or 0),
+                "stage_x": int(pet_state.get("stage_x", 0) or 0),
+                "stage_y": int(pet_state.get("stage_y", 0) or 0),
+                "image_path": str(pet_state.get("image_path") or ""),
+                "modules": dict(pet_state.get("modules") or {}),
+                "downloads": dict(pet_state.get("downloads") or {}),
+                "memory": dict(pet_state.get("memory") or {}),
+            }
+        )
+        save_preferences(prefs)
+
+    def _archive_current_companion(*, copy_only: bool = False) -> Optional[Path]:
+        if not _profile_dir_has_companion(COMPANION_CURRENT_DIR):
+            return None
+        loaded = _load_companion_state_from_dir(COMPANION_CURRENT_DIR) or pet_state
+        base_name = _safe_companion_profile_name(str(loaded.get("name") or "Companion"))
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target = COMPANION_ROOT_DIR / base_name
+        if target.exists():
+            target = COMPANION_ROOT_DIR / f"{base_name}_{stamp}"
+        COMPANION_ROOT_DIR.mkdir(parents=True, exist_ok=True)
+        if copy_only:
+            shutil.copytree(COMPANION_CURRENT_DIR, target)
+        else:
+            shutil.move(str(COMPANION_CURRENT_DIR), str(target))
+        return target
+
+    def _set_no_current_companion() -> None:
+        pet_state.clear()
+        pet_state.update(_default_companion_state(active=False))
+        pet_image_cache.clear()
+        _save_desktop_pet_state()
+        _refresh_desktop_pet_ui()
+
+    def _replace_current_companion_from_dir(source_dir: Path) -> Tuple[bool, str]:
+        source_dir = Path(source_dir)
+        if not _profile_dir_has_companion(source_dir):
+            return False, tr("pet.import_invalid")
+        if source_dir.resolve() == COMPANION_CURRENT_DIR.resolve():
+            return True, tr("pet.import_already_current")
+        try:
+            _archive_current_companion(copy_only=False)
+            if COMPANION_CURRENT_DIR.exists():
+                shutil.rmtree(COMPANION_CURRENT_DIR)
+            shutil.copytree(source_dir, COMPANION_CURRENT_DIR)
+            loaded = _load_companion_state_from_dir(COMPANION_CURRENT_DIR)
+            if loaded is None:
+                return False, tr("pet.import_invalid")
+            pet_state.clear()
+            pet_state.update(loaded)
+            pet_image_cache.clear()
+            _save_desktop_pet_state()
+            _refresh_desktop_pet_ui()
+            return True, tr("pet.imported")
+        except Exception as exc:
+            return False, tr("pet.import_failed").format(error=str(exc))
+
+    def _export_current_companion_profile() -> None:
+        if not bool(pet_state.get("active", False)):
+            messagebox.showinfo(tr("pet.title"), tr("pet.no_current"))
+            return
+        try:
+            _save_desktop_pet_state()
+            target = _archive_current_companion(copy_only=True)
+            if target is None:
+                messagebox.showinfo(tr("pet.title"), tr("pet.no_current"))
+                return
+            messagebox.showinfo(tr("pet.title"), tr("pet.exported").format(path=str(target)))
+            _append_console_session_update(f"Companion exported: {target}", key=f"companion:export:{int(time.time())}")
+        except Exception as exc:
+            messagebox.showerror(tr("pet.title"), tr("pet.export_failed").format(error=str(exc))[:4000])
+
+    def _import_companion_profile() -> None:
+        if filedialog is None:
+            messagebox.showerror(tr("pet.title"), tr("pet.import_unavailable"))
+            return
+        COMPANION_ROOT_DIR.mkdir(parents=True, exist_ok=True)
+        selected = filedialog.askdirectory(
+            title=tr("pet.import_picker_title"),
+            initialdir=str(COMPANION_ROOT_DIR),
+            mustexist=True,
+        )
+        if not selected:
+            return
+        ok, msg = _replace_current_companion_from_dir(Path(selected))
+        if ok:
+            messagebox.showinfo(tr("pet.title"), msg)
+            _append_console_session_update(
+                f"Companion imported: {selected}",
+                key=f"companion:import:{int(time.time())}",
+            )
+        else:
+            messagebox.showerror(tr("pet.title"), msg[:4000])
+
+    def _open_companion_folder() -> None:
+        try:
+            COMPANION_ROOT_DIR.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                os.startfile(str(COMPANION_ROOT_DIR))  # type: ignore[attr-defined]
+            else:
+                webbrowser.open(COMPANION_ROOT_DIR.as_uri())
+        except Exception as exc:
+            messagebox.showerror(tr("pet.title"), tr("pet.folder_open_failed").format(error=str(exc))[:4000])
+
+    def _companion_is_fresh_default() -> bool:
+        return (
+            bool(pet_state.get("active", False))
+            and str(pet_state.get("name") or "Companion").strip() == "Companion"
+            and int(pet_state.get("xp", 0) or 0) <= 0
+            and int(pet_state.get("fed_units", 0) or 0) <= 0
+        )
+
+    def _save_companion_name() -> None:
+        if not bool(pet_state.get("active", False)):
+            messagebox.showinfo(tr("pet.title"), tr("pet.no_current"))
+            return
+        name = re.sub(r"\s+", " ", pet_name_var.get()).strip() or "Companion"
+        pet_state["name"] = name[:48]
+        _save_desktop_pet_state()
+        _refresh_desktop_pet_ui()
+        pet_mood_lbl.config(text=tr("pet.name_saved"))
+        _append_console_session_update(f"Companion renamed: {pet_state['name']}", key=f"companion:rename:{int(time.time())}")
+
+    def _delete_current_companion() -> None:
+        try:
+            _destroy_pet_overlay()
+            try:
+                journal_pet_window.withdraw()
+            except tk.TclError:
+                pass
+            if COMPANION_CURRENT_DIR.exists():
+                shutil.rmtree(COMPANION_CURRENT_DIR)
+            _set_no_current_companion()
+            _append_console_session_update("Current companion deleted.", key=f"companion:delete:{int(time.time())}")
+        except Exception as exc:
+            messagebox.showerror(tr("pet.title"), tr("pet.delete_failed").format(error=str(exc))[:4000])
+
+    def _desktop_pet_level() -> Tuple[int, int, int]:
+        xp = max(0, int(pet_state.get("xp", 0) or 0))
+        level = (xp // 100) + 1
+        return level, xp % 100, 100
+
+    def _pet_modules() -> Dict[str, bool]:
+        modules = pet_state.get("modules")
+        if not isinstance(modules, dict):
+            modules = {}
+            pet_state["modules"] = modules
+        return modules  # type: ignore[return-value]
+
+    def _pet_downloads() -> Dict[str, bool]:
+        downloads = pet_state.get("downloads")
+        if not isinstance(downloads, dict):
+            downloads = {}
+            pet_state["downloads"] = downloads
+        return downloads  # type: ignore[return-value]
+
+    def _pet_bubble_installed() -> bool:
+        return bool(_pet_modules().get("bubble", False)) and _pet_module_downloaded("bubble")
+
+    def _pet_memory_unlocked() -> bool:
+        level, _, _ = _desktop_pet_level()
+        return level >= DESKTOP_PET_MEMORY_UNLOCK_LEVEL
+
+    def _pet_memory_installed() -> bool:
+        return bool(_pet_modules().get("memory", False)) and _pet_memory_unlocked() and _pet_module_downloaded("memory")
+
+    def _pet_tts_unlocked() -> bool:
+        level, _, _ = _desktop_pet_level()
+        return level >= DESKTOP_PET_TTS_UNLOCK_LEVEL
+
+    def _pet_tts_installed() -> bool:
+        return bool(_pet_modules().get("tts", False)) and _pet_tts_unlocked() and _pet_module_downloaded("tts")
+
+    def _pet_chat_unlocked() -> bool:
+        level, _, _ = _desktop_pet_level()
+        return level >= DESKTOP_PET_CHAT_UNLOCK_LEVEL
+
+    def _pet_chat_installed() -> bool:
+        return bool(_pet_modules().get("chat", False)) and _pet_chat_unlocked() and _pet_module_downloaded("chat")
+
+    def _pet_reactions_enabled() -> bool:
+        return _pet_bubble_installed() or _pet_tts_installed() or _pet_chat_installed()
+
+    def _pet_module_unlocked(module_id: str) -> bool:
+        if module_id == "bubble":
+            return True
+        if module_id == "memory":
+            return _pet_memory_unlocked()
+        if module_id == "tts":
+            return _pet_tts_unlocked()
+        if module_id == "chat":
+            return _pet_chat_unlocked()
+        return False
+
+    def _pet_module_downloaded(module_id: str) -> bool:
+        modules = _pet_modules()
+        downloads = _pet_downloads()
+        if bool(modules.get(module_id, False)):
+            downloads[module_id] = True
+            return True
+        manifest = DESKTOP_PET_MODULE_DIR / module_id / "module.json"
+        if manifest.exists():
+            downloads[module_id] = True
+            return True
+        return bool(downloads.get(module_id, False))
+
+    def _pet_module_title(module_id: str) -> str:
+        if module_id == "bubble":
+            return tr("pet.module_bubble_title")
+        if module_id == "memory":
+            return tr("pet.module_memory_title")
+        if module_id == "tts":
+            return tr("pet.module_tts_title")
+        if module_id == "chat":
+            return tr("pet.module_chat_title")
+        return module_id
+
+    def _download_pet_module(module_id: str) -> None:
+        if module_id not in {"bubble", "memory", "tts", "chat"}:
+            return
+        if not _pet_module_unlocked(module_id):
+            if module_id == "tts":
+                msg = tr("pet.module_tts_locked").format(level=DESKTOP_PET_TTS_UNLOCK_LEVEL)
+            elif module_id == "chat":
+                msg = tr("pet.module_chat_locked").format(level=DESKTOP_PET_CHAT_UNLOCK_LEVEL)
+            elif module_id == "memory":
+                msg = tr("pet.module_memory_locked").format(level=DESKTOP_PET_MEMORY_UNLOCK_LEVEL)
+            else:
+                msg = tr("pet.module_locked")
+            _set_pet_bubble(msg, seconds=7, force=True)
+            return
+        try:
+            module_dir = DESKTOP_PET_MODULE_DIR / module_id
+            module_dir.mkdir(parents=True, exist_ok=True)
+            manifest = {
+                "id": module_id,
+                "title": _pet_module_title(module_id),
+                "version": 1,
+                "downloaded_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            manifest_path = module_dir / "module.json"
+            tmp_path = module_dir / "module.tmp"
+            tmp_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_path.replace(manifest_path)
+            _pet_downloads()[module_id] = True
+            _save_desktop_pet_state()
+            _append_console_session_update(
+                f"Companion module downloaded: {module_id}",
+                key=f"pet:module:{module_id}:downloaded",
+            )
+            _refresh_pet_module_ui()
+            _set_pet_bubble(
+                tr("pet.module_downloaded_say").format(module=_pet_module_title(module_id)),
+                seconds=6,
+                force=True,
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                tr("pet.title"),
+                tr("pet.module_download_failed").format(error=str(exc))[:4000],
+            )
+
+    def _speak_pet_text(text: str, *, force: bool = False) -> Optional[str]:
+        if not force and not _pet_tts_installed():
+            return None
+        if os.name != "nt":
+            return tr("pet.tts_windows_only")
+        clean = re.sub(r"\s+", " ", text or "").strip()
+        if not clean:
+            return None
+        now_ts = time.time()
+        if not force and now_ts - float(pet_tts_state.get("last", 0.0) or 0.0) < 3.0:
+            return None
+        pet_tts_state["last"] = now_ts
+        clean = clean[:220]
+        try:
+            old_proc = pet_tts_state.get("proc")
+            if isinstance(old_proc, subprocess.Popen) and old_proc.poll() is None:
+                old_proc.terminate()
+        except Exception:
+            pass
+        try:
+            text_b64 = base64.b64encode(clean.encode("utf-8")).decode("ascii")
+            script = (
+                "Add-Type -AssemblyName System.Speech;"
+                "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+                "$s.Volume = 70;"
+                "$s.Rate = 1;"
+                f"$text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{text_b64}'));"
+                "$s.Speak($text);"
+                "$s.Dispose();"
+            )
+            encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+            kwargs: Dict[str, Any] = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            }
+            if os.name == "nt":
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            pet_tts_state["proc"] = subprocess.Popen(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    encoded,
+                ],
+                **kwargs,
+            )
+            pet_tts_state["error"] = ""
+            return None
+        except Exception as exc:
+            err = tr("pet.tts_failed").format(error=str(exc))
+            pet_tts_state["error"] = err
+            return err
+
+    def _active_pet_bubble_text() -> str:
+        if not _pet_reactions_enabled():
+            return ""
+        if time.time() > float(pet_bubble_state.get("until", 0.0) or 0.0):
+            return ""
+        return str(pet_bubble_state.get("text") or "").strip()
+
+    def _set_pet_bubble(text: str, *, seconds: float = 6.0, force: bool = False) -> None:
+        if not force and not _pet_reactions_enabled():
+            return
+        clean = re.sub(r"\s+", " ", text or "").strip()
+        if not clean:
+            return
+        pet_bubble_state["text"] = clean[:120]
+        pet_bubble_state["until"] = time.time() + max(1.0, float(seconds))
+        tts_err = _speak_pet_text(clean)
+        if tts_err:
+            _append_console_session_update(tts_err, key=f"pet:tts:error:{int(time.time())}")
+        try:
+            _draw_desktop_pet()
+            _draw_journal_pet()
+            _draw_pet_overlay()
+        except Exception:
+            pass
+
+    def _top_pet_memory_terms(limit: int = 3) -> List[str]:
+        memory = pet_state.get("memory")
+        if not isinstance(memory, dict):
+            return []
+        ranked = sorted(
+            ((str(k), int(v)) for k, v in memory.items() if str(k).strip()),
+            key=lambda item: (-item[1], item[0].lower()),
+        )
+        return [term for term, _count in ranked[: max(0, int(limit))]]
+
+    def _update_pet_memory_from_entry(*parts: str) -> None:
+        combined = " ".join(str(part or "") for part in parts)
+        if not combined.strip():
+            return
+        common_words = {
+            "about",
+            "after",
+            "again",
+            "also",
+            "because",
+            "before",
+            "could",
+            "daily",
+            "entry",
+            "from",
+            "have",
+            "journal",
+            "just",
+            "like",
+            "more",
+            "need",
+            "notes",
+            "that",
+            "then",
+            "there",
+            "they",
+            "this",
+            "today",
+            "want",
+            "when",
+            "with",
+            "would",
+            "you",
+        }
+        found: Dict[str, int] = {}
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_+-]{3,}|[\u4e00-\u9fff]{2,8}", combined):
+            term = token.strip()
+            if not term:
+                continue
+            key = term.lower() if term.isascii() else term
+            if key in common_words:
+                continue
+            found[key] = found.get(key, 0) + 1
+        if not found:
+            return
+        memory = pet_state.get("memory")
+        if not isinstance(memory, dict):
+            memory = {}
+            pet_state["memory"] = memory
+        for term, count in found.items():
+            try:
+                memory[term] = min(999, int(memory.get(term, 0) or 0) + count)
+            except Exception:
+                memory[term] = count
+        trimmed = sorted(
+            ((str(k), int(v)) for k, v in memory.items() if str(k).strip()),
+            key=lambda item: (-item[1], item[0].lower()),
+        )[:18]
+        pet_state["memory"] = {term: count for term, count in trimmed}
+        _save_desktop_pet_state()
+
+    def _pet_memory_hint() -> str:
+        if not _pet_memory_installed():
+            return ""
+        terms = _top_pet_memory_terms(2)
+        if not terms:
+            return ""
+        return tr("pet.memory_hint").format(top=", ".join(terms))
+
+    def _pet_growth_profile(level: Optional[int] = None) -> Dict[str, str]:
+        if level is None:
+            level, _, _ = _desktop_pet_level()
+        pet_level = max(1, int(level or 1))
+        if pet_level >= 10:
+            return {
+                "key": "wise",
+                "label": tr("pet.stage_wise"),
+                "chat": (
+                    "You are now a wise journal companion. You may synthesize patterns from memory "
+                    "and offer one gentle, practical next step when helpful."
+                ),
+                "reaction": tr("pet.stage_wise_reaction"),
+            }
+        if pet_level >= 7:
+            return {
+                "key": "insightful",
+                "label": tr("pet.stage_insightful"),
+                "chat": (
+                    "You are becoming insightful. Connect the user's question to current context or "
+                    "memory when it is genuinely relevant, and keep the tone warm."
+                ),
+                "reaction": tr("pet.stage_insightful_reaction"),
+            }
+        if pet_level >= 4:
+            return {
+                "key": "curious",
+                "label": tr("pet.stage_curious"),
+                "chat": (
+                    "You are curious and supportive. Ask at most one small clarifying question only "
+                    "when it would help the user think."
+                ),
+                "reaction": tr("pet.stage_curious_reaction"),
+            }
+        if pet_level >= 2:
+            return {
+                "key": "learning",
+                "label": tr("pet.stage_learning"),
+                "chat": (
+                    "You are still learning. Keep replies simple, cheerful, and concrete. "
+                    "Do not over-analyze."
+                ),
+                "reaction": tr("pet.stage_learning_reaction"),
+            }
+        return {
+            "key": "hatchling",
+            "label": tr("pet.stage_hatchling"),
+            "chat": (
+                "You are a tiny new companion. Reply very simply and cutely, like a supportive pet "
+                "that is just learning the user's world."
+            ),
+            "reaction": tr("pet.stage_hatchling_reaction"),
+        }
+
+    def _pet_chat_context() -> str:
+        def _clip(label: str, value: str, limit: int) -> str:
+            clean = re.sub(r"\s+", " ", value or "").strip()
+            if not clean:
+                return ""
+            if len(clean) > limit:
+                clean = clean[:limit].rstrip() + "..."
+            return f"{label}: {clean}"
+
+        level, _, _ = _desktop_pet_level()
+        profile = _pet_growth_profile(level)
+        memory_terms = _top_pet_memory_terms(8) if _pet_memory_installed() else []
+        parts = [
+            f"Pet level: {level}, XP: {current_xp}/{needed_xp}",
+            f"Pet intelligence stage: {profile['label']}",
+            (
+                f"Local memory topics: {', '.join(memory_terms) if memory_terms else '(none yet)'}"
+                if _pet_memory_installed()
+                else "Local memory topics: (Memory module not installed)"
+            ),
+        ]
+        for label, widget, limit in (
+            ("Current journal draft", text_box, 900),
+            ("Current speech-to-text draft", stt_box, 650),
+            ("Current AI report draft", report_box, 650),
+        ):
+            try:
+                item = _clip(label, widget.get("1.0", "end-1c"), limit)
+            except tk.TclError:
+                item = ""
+            if item:
+                parts.append(item)
+        return "\n".join(parts)
+
+    def _refresh_pet_chat_controls() -> None:
+        t = th()
+        ready = bool(pet_state.get("active", False)) and _pet_chat_installed() and not bool(pet_chat_busy.get("v", False))
+        state = "normal" if ready else "disabled"
+        pet_chat_entry.config(
+            state=state,
+            bg=t.panel if ready else t.btn_disabled,
+            fg=t.text if ready else t.disabled_fg,
+            disabledforeground=t.disabled_fg,
+            insertbackground=t.text,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        pet_chat_ask_btn.config(
+            text=tr("pet.chat_thinking") if pet_chat_busy.get("v") else tr("pet.chat_ask"),
+            state=state,
+            bg=t.btn_secondary if ready else t.btn_disabled,
+            fg=t.text if ready else t.disabled_fg,
+            disabledforeground=t.disabled_fg,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            cursor="hand2" if ready else "arrow",
+        )
+
+    def _ask_pet_chat() -> None:
+        if bool(pet_chat_busy.get("v", False)):
+            return
+        if not _pet_chat_installed():
+            if not _pet_chat_unlocked():
+                _set_pet_bubble(
+                    tr("pet.module_chat_locked").format(level=DESKTOP_PET_CHAT_UNLOCK_LEVEL),
+                    seconds=7,
+                    force=True,
+                )
+            return
+        question = re.sub(r"\s+", " ", pet_chat_entry.get()).strip()
+        if not question:
+            messagebox.showinfo(tr("pet.title"), tr("pet.chat_empty"))
+            return
+        if not get_openai_api_key():
+            messagebox.showerror(tr("pet.title"), tr("pet.chat_no_api_key"))
+            return
+
+        pet_chat_busy["v"] = True
+        _refresh_pet_module_ui()
+        _append_console_session_update("Companion chat started.", key=f"pet:chat:start:{int(time.time())}")
+
+        context = _pet_chat_context()
+        ui_language = "Chinese" if ui_lang_holder[0] == "zh" else "English"
+        profile = _pet_growth_profile()
+        messages: List[Dict[str, object]] = [
+            {
+                "role": "system",
+                "content": (
+                    "You are the user's small Q-style companion inside Daily Logger. "
+                    "Answer warmly in no more than two short sentences. "
+                    "Use the user's language when possible. Do not invent private facts. "
+                    "Local memory topics and current draft text are hints, not complete truth. "
+                    f"Current intelligence stage: {profile['label']}. {profile['chat']}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Daily Logger UI language: {ui_language}\n"
+                    f"{context}\n\n"
+                    f"User asks their companion: {question}"
+                ),
+            },
+        ]
+
+        def _work() -> None:
+            try:
+                answer = chat_completion(messages, model=OPENAI_MODEL, timeout_sec=45, attempts=2)
+            except Exception as exc:
+                answer = f"ERROR: {exc}"
+            root.after(0, lambda result=answer: _done(result))
+
+        def _done(result: str) -> None:
+            pet_chat_busy["v"] = False
+            _refresh_pet_module_ui()
+            if _is_likely_api_error_message_global(result) or result.startswith("ERROR:"):
+                error_text = result[6:].strip() if result.startswith("ERROR:") else result
+                msg = tr("pet.chat_failed").format(error=error_text)
+                pet_mood_lbl.config(text=msg[:240])
+                _append_console_session_update(
+                    f"Companion chat failed: {error_text}",
+                    key=f"pet:chat:fail:{int(time.time())}",
+                )
+                messagebox.showerror(tr("pet.title"), msg[:4000])
+                return
+            clean = re.sub(r"\s+", " ", result or "").strip()
+            if len(clean) > 240:
+                clean = clean[:240].rstrip() + "..."
+            pet_chat_entry.delete(0, "end")
+            _set_pet_bubble(clean, seconds=10, force=True)
+            pet_mood_lbl.config(text=clean)
+            _append_console_session_update(
+                "Companion chat answered.",
+                key=f"pet:chat:done:{int(time.time())}",
+            )
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _draw_pet_bubble(canvas: Any, x: float, y: float, text: str, *, width_chars: int = 24) -> None:
+        clean = re.sub(r"\s+", " ", text or "").strip()
+        if not clean:
+            return
+        lines = textwrap.wrap(clean, width=max(8, int(width_chars)))[:4]
+        if not lines:
+            return
+        max_line = max(len(line) for line in lines)
+        box_w = max(86, min(240, max_line * 7 + 22))
+        box_h = 18 + (len(lines) * 16)
+        x1 = float(x)
+        y1 = float(y)
+        x2 = x1 + box_w
+        y2 = y1 + box_h
+        canvas.create_rectangle(x1, y1, x2, y2, fill="#fff8d6", outline="#f2c94c", width=2)
+        canvas.create_polygon(
+            x1 + 20,
+            y2,
+            x1 + 34,
+            y2,
+            x1 + 24,
+            y2 + 12,
+            fill="#fff8d6",
+            outline="#f2c94c",
+        )
+        for idx, line in enumerate(lines):
+            canvas.create_text(
+                x1 + 11,
+                y1 + 12 + (idx * 16),
+                text=line,
+                fill="#2b2730",
+                font=("Segoe UI", 8, "bold"),
+                anchor="w",
+            )
+
+    def _refresh_pet_module_ui() -> None:
+        t = th()
+
+        def _button_style(btn: Any, enabled: bool) -> None:
+            btn.config(
+                state=("normal" if enabled else "disabled"),
+                bg=(t.btn_secondary if enabled else t.btn_disabled),
+                fg=(t.text if enabled else t.disabled_fg),
+                disabledforeground=t.disabled_fg,
+                activebackground=t.secondary_hover,
+                activeforeground=t.text,
+                cursor=("hand2" if enabled else "arrow"),
+            )
+
+        if not bool(pet_state.get("active", False)):
+            pet_bubble_title_lbl.config(text=tr("pet.module_bubble_title"))
+            pet_memory_title_lbl.config(text=tr("pet.module_memory_title"))
+            pet_tts_title_lbl.config(text=tr("pet.module_tts_title"))
+            pet_chat_title_lbl.config(text=tr("pet.module_chat_title"))
+            for status_lbl in (
+                pet_bubble_status_lbl,
+                pet_memory_status_lbl,
+                pet_tts_status_lbl,
+                pet_chat_status_lbl,
+            ):
+                status_lbl.config(text=tr("pet.no_current"))
+            for btn in (pet_bubble_btn, pet_memory_btn, pet_tts_btn, pet_chat_btn):
+                btn.config(text=tr("pet.module_download"))
+                _button_style(btn, False)
+            _refresh_pet_chat_controls()
+            return
+
+        bubble_installed = _pet_bubble_installed()
+        bubble_downloaded = _pet_module_downloaded("bubble")
+        pet_bubble_title_lbl.config(text=tr("pet.module_bubble_title"))
+        if bubble_installed:
+            pet_bubble_status_lbl.config(text=tr("pet.module_bubble_installed"))
+            pet_bubble_btn.config(text=tr("pet.module_disable"))
+        elif bubble_downloaded:
+            pet_bubble_status_lbl.config(text=tr("pet.module_downloaded"))
+            pet_bubble_btn.config(text=tr("pet.module_install"))
+        else:
+            pet_bubble_status_lbl.config(text=tr("pet.module_bubble_available"))
+            pet_bubble_btn.config(text=tr("pet.module_download"))
+        _button_style(pet_bubble_btn, True)
+
+        memory_unlocked = _pet_memory_unlocked()
+        memory_downloaded = _pet_module_downloaded("memory")
+        memory_enabled = _pet_memory_installed()
+        pet_memory_title_lbl.config(text=tr("pet.module_memory_title"))
+        if memory_enabled:
+            pet_memory_status_lbl.config(text=tr("pet.module_memory_installed"))
+            pet_memory_btn.config(text=tr("pet.module_disable"))
+        elif not memory_unlocked:
+            pet_memory_status_lbl.config(
+                text=tr("pet.module_memory_locked").format(level=DESKTOP_PET_MEMORY_UNLOCK_LEVEL)
+            )
+            pet_memory_btn.config(text=tr("pet.module_download"))
+        elif memory_downloaded:
+            pet_memory_status_lbl.config(text=tr("pet.module_downloaded"))
+            pet_memory_btn.config(text=tr("pet.module_install"))
+        else:
+            pet_memory_status_lbl.config(text=tr("pet.module_memory_available"))
+            pet_memory_btn.config(text=tr("pet.module_download"))
+        _button_style(pet_memory_btn, memory_unlocked)
+
+        tts_unlocked = _pet_tts_unlocked()
+        tts_downloaded = _pet_module_downloaded("tts")
+        tts_enabled = _pet_tts_installed()
+        pet_tts_title_lbl.config(text=tr("pet.module_tts_title"))
+        if tts_enabled:
+            pet_tts_status_lbl.config(text=tr("pet.module_tts_installed"))
+            pet_tts_btn.config(text=tr("pet.module_disable"))
+        elif not tts_unlocked:
+            pet_tts_status_lbl.config(
+                text=tr("pet.module_tts_locked").format(level=DESKTOP_PET_TTS_UNLOCK_LEVEL)
+            )
+            pet_tts_btn.config(text=tr("pet.module_download"))
+        elif tts_downloaded:
+            pet_tts_status_lbl.config(text=tr("pet.module_downloaded"))
+            pet_tts_btn.config(text=tr("pet.module_install"))
+        else:
+            pet_tts_status_lbl.config(text=tr("pet.module_tts_available"))
+            pet_tts_btn.config(text=tr("pet.module_download"))
+        _button_style(pet_tts_btn, tts_unlocked)
+
+        chat_unlocked = _pet_chat_unlocked()
+        chat_downloaded = _pet_module_downloaded("chat")
+        chat_enabled = _pet_chat_installed()
+        pet_chat_title_lbl.config(text=tr("pet.module_chat_title"))
+        if chat_enabled:
+            pet_chat_status_lbl.config(
+                text=tr("pet.chat_thinking")
+                if pet_chat_busy.get("v")
+                else tr("pet.module_chat_installed")
+            )
+            pet_chat_btn.config(text=tr("pet.module_disable"))
+        elif not chat_unlocked:
+            pet_chat_status_lbl.config(
+                text=tr("pet.module_chat_locked").format(level=DESKTOP_PET_CHAT_UNLOCK_LEVEL)
+            )
+            pet_chat_btn.config(text=tr("pet.module_download"))
+        elif chat_downloaded:
+            pet_chat_status_lbl.config(text=tr("pet.module_downloaded"))
+            pet_chat_btn.config(text=tr("pet.module_install"))
+        else:
+            pet_chat_status_lbl.config(text=tr("pet.module_chat_available"))
+            pet_chat_btn.config(text=tr("pet.module_download"))
+        _button_style(pet_chat_btn, chat_unlocked and not bool(pet_chat_busy.get("v", False)))
+        _refresh_pet_chat_controls()
+
+    def _toggle_pet_bubble_module() -> None:
+        if not _pet_module_downloaded("bubble"):
+            _download_pet_module("bubble")
+            return
+        modules = _pet_modules()
+        now_installed = not bool(modules.get("bubble", False))
+        modules["bubble"] = now_installed
+        _save_desktop_pet_state()
+        _refresh_pet_module_ui()
+        if now_installed:
+            _set_pet_bubble(tr("pet.bubble_installed_say"), seconds=7, force=True)
+        else:
+            pet_bubble_state["until"] = 0.0
+            _draw_desktop_pet()
+            _draw_pet_overlay()
+
+    def _toggle_pet_memory_module() -> None:
+        if not _pet_memory_unlocked():
+            _set_pet_bubble(
+                tr("pet.module_memory_locked").format(level=DESKTOP_PET_MEMORY_UNLOCK_LEVEL),
+                seconds=7,
+                force=True,
+            )
+            return
+        if not _pet_module_downloaded("memory"):
+            _download_pet_module("memory")
+            return
+        modules = _pet_modules()
+        now_installed = not bool(modules.get("memory", False))
+        modules["memory"] = now_installed
+        _save_desktop_pet_state()
+        _refresh_pet_module_ui()
+        if now_installed:
+            _update_pet_memory_from_entry(
+                text_box.get("1.0", "end-1c"),
+                stt_box.get("1.0", "end-1c"),
+                report_box.get("1.0", "end-1c"),
+            )
+            phrase = _pet_memory_hint() or tr("pet.memory_installed_say")
+            _set_pet_bubble(phrase, seconds=8, force=True)
+
+    def _toggle_pet_tts_module() -> None:
+        if not _pet_tts_unlocked():
+            _set_pet_bubble(
+                tr("pet.module_tts_locked").format(level=DESKTOP_PET_TTS_UNLOCK_LEVEL),
+                seconds=7,
+                force=True,
+            )
+            return
+        if not _pet_module_downloaded("tts"):
+            _download_pet_module("tts")
+            return
+        modules = _pet_modules()
+        now_installed = not bool(modules.get("tts", False))
+        modules["tts"] = now_installed
+        _save_desktop_pet_state()
+        _refresh_pet_module_ui()
+        if now_installed:
+            phrase = tr("pet.tts_installed_say")
+            _set_pet_bubble(phrase, seconds=7, force=True)
+        else:
+            try:
+                old_proc = pet_tts_state.get("proc")
+                if isinstance(old_proc, subprocess.Popen) and old_proc.poll() is None:
+                    old_proc.terminate()
+            except Exception:
+                pass
+
+    def _toggle_pet_chat_module() -> None:
+        if bool(pet_chat_busy.get("v", False)):
+            return
+        if not _pet_chat_unlocked():
+            _set_pet_bubble(
+                tr("pet.module_chat_locked").format(level=DESKTOP_PET_CHAT_UNLOCK_LEVEL),
+                seconds=7,
+                force=True,
+            )
+            return
+        if not _pet_module_downloaded("chat"):
+            _download_pet_module("chat")
+            return
+        modules = _pet_modules()
+        now_installed = not bool(modules.get("chat", False))
+        modules["chat"] = now_installed
+        _save_desktop_pet_state()
+        _refresh_pet_module_ui()
+        if now_installed:
+            _set_pet_bubble(tr("pet.chat_installed_say"), seconds=8, force=True)
+
+    def _current_pet_feed_units() -> int:
+        text = " ".join(
+            (
+                text_box.get("1.0", "end-1c"),
+                stt_box.get("1.0", "end-1c"),
+                report_box.get("1.0", "end-1c"),
+            )
+        )
+        compact = re.sub(r"\s+", "", text)
+        return len(compact)
+
+    pet_session_seen_units = {"v": _current_pet_feed_units()}
+
+    def _add_desktop_pet_xp(amount: int, *, save: bool = True) -> None:
+        gain = max(0, int(amount))
+        if gain <= 0:
+            return
+        old_level, _, _ = _desktop_pet_level()
+        pet_state["xp"] = max(0, int(pet_state.get("xp", 0) or 0)) + gain
+        pet_state["last_gain"] = gain
+        if save:
+            _save_desktop_pet_state()
+        new_level, _, _ = _desktop_pet_level()
+        if new_level > old_level:
+            profile = _pet_growth_profile(new_level)
+            _append_console_session_update(
+                f"Companion reached level {new_level}: {profile['label']}.",
+                key=f"pet:level:{new_level}",
+            )
+            _set_pet_bubble(
+                tr("pet.bubble_level").format(level=new_level, stage=profile["label"]),
+                seconds=8,
+            )
+        _refresh_desktop_pet_ui()
+
+    def _feed_desktop_pet_from_current_entry(*, force: bool = False) -> None:
+        if not bool(pet_state.get("active", False)):
+            return
+        units = _current_pet_feed_units()
+        delta = units - int(pet_session_seen_units.get("v", 0) or 0)
+        if force:
+            delta = max(delta, min(300, max(0, units // 3)))
+        if delta < 60 and not force:
+            return
+        if delta <= 0:
+            return
+        pet_session_seen_units["v"] = max(units, int(pet_session_seen_units.get("v", 0) or 0))
+        pet_state["fed_units"] = int(pet_state.get("fed_units", 0) or 0) + delta
+        _add_desktop_pet_xp(max(1, delta // 18))
+        if _pet_reactions_enabled() and time.time() - float(pet_bubble_state.get("last_auto", 0.0) or 0.0) > 18:
+            pet_bubble_state["last_auto"] = time.time()
+            _set_pet_bubble(tr("pet.bubble_writing"), seconds=5)
+
+    def _feed_desktop_pet_on_save(journal_text: str, speech_text: str, report_text: str) -> None:
+        if not bool(pet_state.get("active", False)):
+            return
+        total_units = len(re.sub(r"\s+", "", f"{journal_text} {speech_text} {report_text}"))
+        if total_units <= 0:
+            return
+        remaining_units = max(0, total_units - int(pet_session_seen_units.get("v", 0) or 0))
+        if remaining_units:
+            pet_session_seen_units["v"] = total_units
+            pet_state["fed_units"] = int(pet_state.get("fed_units", 0) or 0) + remaining_units
+        bonus = min(80, 8 + (total_units // 120) + (remaining_units // 24))
+        _add_desktop_pet_xp(bonus)
+        if _pet_memory_installed():
+            _update_pet_memory_from_entry(journal_text, speech_text, report_text)
+        memory_hint = _pet_memory_hint()
+        _set_pet_bubble(
+            memory_hint if memory_hint else tr("pet.bubble_saved"),
+            seconds=8,
+        )
+
+    def _load_pet_photo(cache_name: str, max_size: Tuple[int, int]) -> Optional[Any]:
+        image_path = str(pet_state.get("image_path") or "").strip()
+        if not image_path:
+            return None
+        path = Path(image_path)
+        if not path.exists():
+            pet_state["image_path"] = ""
+            _save_desktop_pet_state()
+            return None
+        try:
+            mtime = path.stat().st_mtime
+            key = f"{cache_name}:{path}:{mtime}:{max_size[0]}x{max_size[1]}"
+            cached = pet_image_cache.get(key)
+            if cached is not None:
+                return cached
+            from PIL import Image, ImageTk
+
+            normalized = _normalize_desktop_pet_image_bytes(path.read_bytes())
+            image = Image.open(io.BytesIO(normalized)).convert("RGBA")
+            try:
+                resample = Image.Resampling.LANCZOS
+            except AttributeError:
+                resample = Image.LANCZOS
+            image.thumbnail(max_size, resample)
+            photo = ImageTk.PhotoImage(image)
+            stale = [k for k in pet_image_cache if k.startswith(f"{cache_name}:")]
+            for old_key in stale:
+                pet_image_cache.pop(old_key, None)
+            pet_image_cache[key] = photo
+            return photo
+        except Exception:
+            return None
+
+    def _draw_desktop_pet() -> None:
+        t = th()
+        pet_stage.delete("all")
+        width = max(280, int(pet_stage.winfo_width() or 520))
+        height = max(260, int(pet_stage.winfo_height() or 360))
+        pet_stage.configure(bg=t.field, highlightbackground=t.border, highlightcolor=t.accent)
+        if not bool(pet_state.get("active", False)):
+            pet_stage.create_text(
+                width / 2,
+                height / 2,
+                text=tr("pet.no_current_stage"),
+                fill=t.muted,
+                font=("Segoe UI", 12, "bold"),
+                justify="center",
+                width=max(220, width - 80),
+            )
+            pet_stage_drag_state["hitbox"] = (0.0, 0.0, 0.0, 0.0)
+            return
+        tick = int(pet_anim_state.get("tick", 0) or 0)
+        if pet_stage_drag_state.get("dragging"):
+            x = max(20.0, min(float(width - 120), float(pet_stage_drag_state.get("x", 42.0) or 42.0)))
+        else:
+            saved_x = int(pet_state.get("stage_x", 0) or 0)
+            x = max(44.0, min(float(width - 118), float(saved_x or (width / 2 - 52))))
+        pet_anim_state.update({"tick": tick + 1, "x": x, "direction": 1})
+        level, current_xp, needed_xp = _desktop_pet_level()
+        breath = 4 if (tick // 12) % 2 == 0 else 0
+        blink = (tick % 80) in (0, 1, 2)
+        y = (
+            max(20.0, min(float(height - 132), float(pet_stage_drag_state.get("y", 0.0) or 0.0)))
+            if pet_stage_drag_state.get("dragging")
+            else max(20.0, min(float(height - 132), float(int(pet_state.get("stage_y", 0) or 0) or (height - 132))))
+        )
+        pet_stage_drag_state["hitbox"] = (x - 28, y, x + 132, y + 132)
+        photo = _load_pet_photo("stage", (150 + breath, 150 - min(2, breath)))
+        if photo is not None:
+            pet_stage.create_oval(x - 28, y + 82, x + 132, y + 126, fill=t.panel, outline="")
+            pet_stage.create_image(x + 52, y + 68, image=photo)
+            bubble_text = _active_pet_bubble_text()
+            if bubble_text:
+                bubble_x = max(18, min(width - 258, x + 124))
+                _draw_pet_bubble(pet_stage, bubble_x, max(54, y - 20), bubble_text, width_chars=28)
+            return
+        body = "#8FE6D6" if level < 5 else "#B8A2FF"
+        belly = "#F7F5FF"
+        accent = "#FFB86B" if level < 8 else "#FFE066"
+        outline = t.accent
+        pet_stage.create_oval(x - 28, y + 34, x + 112, y + 104, fill=t.panel, outline="")
+        pet_stage.create_oval(x + 4 - breath, y + 28, x + 104 + breath, y + 124, fill=body, outline=outline, width=2)
+        pet_stage.create_oval(x + 26, y + 60, x + 82, y + 112, fill=belly, outline="")
+        pet_stage.create_oval(x + 6, y + 8, x + 100, y + 88, fill=body, outline=outline, width=2)
+        pet_stage.create_oval(x + 2, y + 2, x + 34, y + 42, fill=body, outline=outline, width=2)
+        pet_stage.create_oval(x + 72, y + 2, x + 104, y + 42, fill=body, outline=outline, width=2)
+        if blink:
+            pet_stage.create_line(x + 29, y + 44, x + 39, y + 44, fill="#10131C", width=2)
+            pet_stage.create_line(x + 66, y + 44, x + 76, y + 44, fill="#10131C", width=2)
+        else:
+            pet_stage.create_oval(x + 29, y + 38, x + 39, y + 50, fill="#10131C", outline="")
+            pet_stage.create_oval(x + 66, y + 38, x + 76, y + 50, fill="#10131C", outline="")
+            pet_stage.create_oval(x + 32, y + 40, x + 35, y + 43, fill="white", outline="")
+            pet_stage.create_oval(x + 69, y + 40, x + 72, y + 43, fill="white", outline="")
+        pet_stage.create_arc(x + 42, y + 49, x + 64, y + 66, start=200, extent=140, style="arc", outline="#10131C", width=2)
+        pet_stage.create_oval(x + 16, y + 52, x + 30, y + 64, fill="#FF8FB3", outline="")
+        pet_stage.create_oval(x + 74, y + 52, x + 88, y + 64, fill="#FF8FB3", outline="")
+        pet_stage.create_line(x + 88, y + 74, x + 126, y + 54 + (4 if (tick // 8) % 2 else -2), fill=accent, width=8, smooth=True)
+        bubble_text = _active_pet_bubble_text()
+        if bubble_text:
+            bubble_x = max(18, min(width - 258, x + 126))
+            _draw_pet_bubble(pet_stage, bubble_x, max(54, y - 20), bubble_text, width_chars=28)
+
+    def _journal_pet_visible_now() -> bool:
+        try:
+            if root.state() in ("withdrawn", "iconic"):
+                return False
+        except tk.TclError:
+            return False
+        return active_page["key"] == "journal" and bool(pet_state.get("active", False)) and bool(pet_state.get("journal_visible", True)) and not bool(
+            pet_state.get("desktop_enabled", False)
+        )
+
+    def _position_journal_pet_canvas(*, animate: bool = True) -> None:
+        if not _journal_pet_visible_now():
+            try:
+                journal_pet_window.withdraw()
+            except tk.TclError:
+                pass
+            return
+        try:
+            page_w = max(160, int(journal_page.winfo_width() or root.winfo_width() or 800))
+            page_h = max(120, int(journal_page.winfo_height() or root.winfo_height() or 600))
+            x = int(pet_state.get("journal_x", 0) or 0)
+            y = int(pet_state.get("journal_y", 0) or 0)
+            if x <= 0 and y <= 0:
+                try:
+                    x = max(0, int(restore_draft_btn.winfo_rootx() - journal_page.winfo_rootx()) - 112)
+                    y = max(0, int(restore_draft_btn.winfo_rooty() - journal_page.winfo_rooty()) + 2)
+                except tk.TclError:
+                    x = max(0, page_w - 230)
+                    y = 22
+            x = max(0, min(page_w - 108, x))
+            y = max(0, min(page_h - 62, y))
+            pet_state["journal_x"] = x
+            pet_state["journal_y"] = y
+            screen_x = int(journal_page.winfo_rootx()) + x
+            screen_y = int(journal_page.winfo_rooty()) + y
+            journal_pet_window.geometry(f"104x58+{screen_x}+{screen_y}")
+            journal_pet_window.deiconify()
+            journal_pet_window.lift(root)
+        except tk.TclError:
+            return
+
+    def _draw_journal_pet() -> None:
+        if not _journal_pet_visible_now():
+            try:
+                journal_pet_canvas.delete("all")
+                journal_pet_window.withdraw()
+            except tk.TclError:
+                pass
+            return
+        try:
+            t = th()
+            _position_journal_pet_canvas(animate=not bool(journal_pet_state.get("dragging")))
+            journal_pet_canvas.configure(bg=journal_pet_transparent)
+            journal_pet_canvas.delete("all")
+            tick = int(journal_pet_state.get("tick", 0) or 0)
+            journal_pet_state["tick"] = tick + 1
+            level, _current_xp, _needed_xp = _desktop_pet_level()
+            breath = 2 if (tick // 12) % 2 == 0 else 0
+            blink = (tick % 70) in (0, 1, 2)
+            shadow = t.field
+            photo = _load_pet_photo("journal", (56 + breath, 56 - min(1, breath)))
+            if photo is not None:
+                journal_pet_canvas.create_oval(24, 43, 82, 55, fill=shadow, outline="")
+                journal_pet_canvas.create_image(53, 28, image=photo)
+                hitbox = (18.0, 2.0, 88.0, 56.0)
+            else:
+                body = "#8FE6D6" if level < 5 else "#B8A2FF"
+                belly = "#F7F5FF"
+                accent = "#FFB86B" if level < 8 else "#FFE066"
+                outline = t.accent
+                x = 24
+                y = 2
+                journal_pet_canvas.create_oval(x - 1, y + 42, x + 62, y + 56, fill=shadow, outline="")
+                journal_pet_canvas.create_oval(x + 10 - breath, y + 30, x + 50 + breath, y + 56, fill=body, outline=outline, width=2)
+                journal_pet_canvas.create_oval(x + 21, y + 39, x + 39, y + 55, fill=belly, outline="")
+                journal_pet_canvas.create_oval(x + 8, y + 9, x + 52, y + 43, fill=body, outline=outline, width=2)
+                journal_pet_canvas.create_oval(x + 3, y + 4, x + 18, y + 22, fill=body, outline=outline, width=2)
+                journal_pet_canvas.create_oval(x + 42, y + 4, x + 57, y + 22, fill=body, outline=outline, width=2)
+                if blink:
+                    journal_pet_canvas.create_line(x + 22, y + 24, x + 28, y + 24, fill="#10131C", width=2)
+                    journal_pet_canvas.create_line(x + 36, y + 24, x + 42, y + 24, fill="#10131C", width=2)
+                else:
+                    journal_pet_canvas.create_oval(x + 22, y + 21, x + 27, y + 27, fill="#10131C", outline="")
+                    journal_pet_canvas.create_oval(x + 37, y + 21, x + 42, y + 27, fill="#10131C", outline="")
+                    journal_pet_canvas.create_oval(x + 24, y + 22, x + 25, y + 23, fill="white", outline="")
+                    journal_pet_canvas.create_oval(x + 39, y + 22, x + 40, y + 23, fill="white", outline="")
+                journal_pet_canvas.create_arc(x + 29, y + 28, x + 36, y + 35, start=200, extent=140, style="arc", outline="#10131C", width=1)
+                journal_pet_canvas.create_line(x + 48, y + 38, x + 67, y + 29 + (2 if (tick // 8) % 2 else -1), fill=accent, width=4, smooth=True)
+                hitbox = (18.0, 1.0, 92.0, 58.0)
+            journal_pet_state["hitbox"] = hitbox
+        except tk.TclError:
+            pass
+
+    def _refresh_journal_pet_button() -> None:
+        try:
+            pet_journal_btn.config(
+                text=tr("pet.journal_hide")
+                if bool(pet_state.get("journal_visible", True))
+                else tr("pet.journal_show")
+            )
+        except tk.TclError:
+            pass
+
+    def _refresh_desktop_pet_ui() -> None:
+        active = bool(pet_state.get("active", False))
+        if active and not _profile_dir_has_companion(COMPANION_CURRENT_DIR):
+            pet_state.clear()
+            pet_state.update(_default_companion_state(active=False))
+            pet_image_cache.clear()
+            _save_desktop_pet_state()
+            active = False
+        level, current_xp, needed_xp = _desktop_pet_level()
+        profile = _pet_growth_profile(level)
+        if active:
+            pet_level_lbl.config(text=tr("pet.level").format(level=level))
+            try:
+                if root.focus_get() is not pet_name_entry and pet_name_var.get() != str(pet_state.get("name") or "Companion"):
+                    pet_name_var.set(str(pet_state.get("name") or "Companion"))
+            except tk.TclError:
+                pass
+            pet_xp_lbl.config(
+                text=tr("pet.xp").format(
+                    current=current_xp,
+                    needed=needed_xp,
+                    total=int(pet_state.get("fed_units", 0) or 0),
+                    stage=profile["label"],
+                )
+            )
+            last_gain = int(pet_state.get("last_gain", 0) or 0)
+            pet_mood_lbl.config(
+                text=(
+                    tr("pet.mood_gain").format(xp=last_gain)
+                    if last_gain > 0
+                    else (_pet_memory_hint() or profile["reaction"] or tr("pet.mood_idle"))
+                )
+            )
+        else:
+            pet_level_lbl.config(text=tr("pet.title"))
+            try:
+                if root.focus_get() is not pet_name_entry:
+                    pet_name_var.set("")
+            except tk.TclError:
+                pass
+            pet_xp_lbl.config(text=tr("pet.no_current"))
+            pet_mood_lbl.config(text=tr("pet.no_current"))
+        t = th()
+        for btn in (pet_feed_btn, pet_desktop_btn, pet_journal_btn, pet_export_btn, pet_delete_btn, pet_name_save_btn):
+            btn.config(
+                state=("normal" if active else "disabled"),
+                bg=("#8B2F3A" if btn is pet_delete_btn and active else (t.btn_secondary if active else t.btn_disabled)),
+                fg=("white" if btn is pet_delete_btn and active else (t.text if active else t.disabled_fg)),
+                disabledforeground=t.disabled_fg,
+                activebackground=("#A43B48" if btn is pet_delete_btn and active else t.secondary_hover),
+                activeforeground=("white" if btn is pet_delete_btn and active else t.text),
+                cursor=("hand2" if active else "arrow"),
+            )
+        pet_name_entry.config(
+            state=("normal" if active else "disabled"),
+            bg=(t.field if active else t.btn_disabled),
+            fg=(t.text if active else t.disabled_fg),
+            disabledbackground=t.btn_disabled,
+            disabledforeground=t.disabled_fg,
+            insertbackground=t.text,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        pet_desktop_btn.config(
+            text=tr("pet.desktop_disable")
+            if active and bool(pet_state.get("desktop_enabled", False))
+            else tr("pet.desktop_enable")
+        )
+        _refresh_pet_module_ui()
+        _refresh_journal_pet_button()
+        _draw_desktop_pet()
+        _draw_journal_pet()
+
+    def _refresh_pet_art_button() -> None:
+        t = th()
+        if bool(pet_art_busy.get("v", False)):
+            for btn in (pet_art_btn, pet_art_ref_btn):
+                btn.config(
+                    text=tr("pet.generating") if btn is pet_art_btn else tr("pet.generate_from_image"),
+                    state="disabled",
+                    bg=t.btn_disabled,
+                    fg=t.disabled_fg,
+                    disabledforeground=t.disabled_fg,
+                    cursor="arrow",
+                )
+        else:
+            for btn, label in (
+                (pet_art_btn, tr("pet.generate_look")),
+                (pet_art_ref_btn, tr("pet.generate_from_image")),
+            ):
+                btn.config(
+                    text=label,
+                    state="normal",
+                    bg=t.btn_secondary,
+                    fg=t.text,
+                    activebackground=t.secondary_hover,
+                    activeforeground=t.text,
+                    cursor="hand2",
+                )
+
+    def _ask_companion_design_prompt() -> Optional[str]:
+        t = th()
+        result: Dict[str, Optional[str]] = {"value": None}
+        prompt_win = tk.Toplevel(root)
+        prompt_win.title(tr("pet.prompt_title"))
+        prompt_win.configure(bg=t.surface)
+        prompt_win.transient(root)
+        prompt_win.grab_set()
+        prompt_win.geometry("560x360")
+        prompt_win.minsize(420, 280)
+        prompt_win.grid_columnconfigure(0, weight=1)
+        prompt_win.grid_rowconfigure(1, weight=1)
+        tk.Label(
+            prompt_win,
+            text=tr("pet.prompt_body"),
+            bg=t.surface,
+            fg=t.muted,
+            font=("Segoe UI", 10),
+            anchor="w",
+            justify="left",
+            wraplength=500,
+        ).grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 10))
+        prompt_text = tk.Text(
+            prompt_win,
+            bg=t.field,
+            fg=t.text,
+            insertbackground=t.text,
+            relief="flat",
+            font=("Segoe UI", 10),
+            wrap="word",
+            undo=True,
+            highlightthickness=1,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        prompt_text.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        prompt_text.insert("1.0", tr("pet.prompt_default"))
+        button_bar = tk.Frame(prompt_win, bg=t.surface)
+        button_bar.grid(row=2, column=0, sticky="e", padx=18, pady=(0, 18))
+
+        def _close_with_value(value: Optional[str]) -> None:
+            result["value"] = value
+            try:
+                prompt_win.grab_release()
+            except tk.TclError:
+                pass
+            prompt_win.destroy()
+
+        cancel_btn = tk.Button(
+            button_bar,
+            text=tr("common.cancel"),
+            command=lambda: _close_with_value(None),
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=14,
+            pady=6,
+            cursor="hand2",
+        )
+        cancel_btn.pack(side="left", padx=(0, 8))
+        generate_btn = tk.Button(
+            button_bar,
+            text=tr("pet.prompt_generate"),
+            command=lambda: _close_with_value(prompt_text.get("1.0", "end-1c").strip()),
+            bg=t.accent,
+            fg="white",
+            activebackground=t.hover_primary,
+            activeforeground="white",
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=14,
+            pady=6,
+            cursor="hand2",
+        )
+        generate_btn.pack(side="left")
+        prompt_win.protocol("WM_DELETE_WINDOW", lambda: _close_with_value(None))
+        try:
+            root.update_idletasks()
+            x = root.winfo_rootx() + max(40, (root.winfo_width() - 560) // 2)
+            y = root.winfo_rooty() + max(40, (root.winfo_height() - 360) // 2)
+            prompt_win.geometry(f"560x360+{x}+{y}")
+        except tk.TclError:
+            pass
+        prompt_text.focus_set()
+        root.wait_window(prompt_win)
+        return result["value"]
+
+    def _generate_desktop_pet_look(reference_image: Optional[Path] = None) -> None:
+        if bool(pet_art_busy.get("v", False)):
+            return
+        if not get_openai_api_key():
+            messagebox.showerror(tr("pet.title"), tr("pet.no_api_key"))
+            return
+        design_prompt = ""
+        if reference_image is None:
+            chosen_prompt = _ask_companion_design_prompt()
+            if chosen_prompt is None:
+                return
+            design_prompt = chosen_prompt
+        elif not messagebox.askyesno(tr("pet.generate_confirm_title"), tr("pet.generate_confirm")):
+            return
+        level, _, _ = _desktop_pet_level()
+        pet_art_busy["v"] = True
+        _refresh_pet_art_button()
+        pet_mood_lbl.config(text=tr("pet.generating"))
+        _append_console_session_update("Generating companion look...", key=f"pet:generate:{int(time.time())}")
+
+        def _work() -> None:
+            try:
+                if COMPANION_INCOMING_DIR.exists():
+                    shutil.rmtree(COMPANION_INCOMING_DIR)
+                COMPANION_INCOMING_DIR.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            path, err = generate_desktop_pet_image(
+                level,
+                str(pet_state.get("name") or "Companion"),
+                reference_image_path=reference_image,
+                output_dir=COMPANION_INCOMING_DIR,
+                design_prompt=design_prompt,
+            )
+            root.after(0, lambda p=path, e=err: _done(p, e))
+
+        def _done(path: Optional[Path], err: Optional[str]) -> None:
+            pet_art_busy["v"] = False
+            _refresh_pet_art_button()
+            if err or path is None:
+                pet_mood_lbl.config(text=tr("pet.generate_failed"))
+                _append_console_session_update(
+                    f"Companion look generation failed: {err or 'No image returned.'}",
+                    key=f"pet:generate:fail:{int(time.time())}",
+                )
+                messagebox.showerror(tr("pet.title"), (err or tr("pet.generate_failed"))[:4000])
+                return
+            try:
+                if _companion_is_fresh_default():
+                    if COMPANION_CURRENT_DIR.exists():
+                        shutil.rmtree(COMPANION_CURRENT_DIR)
+                else:
+                    _archive_current_companion(copy_only=False)
+                if COMPANION_CURRENT_DIR.exists():
+                    shutil.rmtree(COMPANION_CURRENT_DIR)
+                COMPANION_CURRENT_DIR.mkdir(parents=True, exist_ok=True)
+                target_image = COMPANION_CURRENT_DIR / "companion.png"
+                shutil.move(str(path), str(target_image))
+            except Exception as exc:
+                pet_mood_lbl.config(text=tr("pet.generate_failed"))
+                messagebox.showerror(tr("pet.title"), tr("pet.profile_replace_failed").format(error=str(exc))[:4000])
+                return
+            pet_state.clear()
+            pet_state.update(_default_companion_state(active=True))
+            pet_state["name"] = "Companion"
+            pet_state["image_path"] = str(target_image)
+            pet_state["created_at"] = datetime.now().isoformat(timespec="seconds")
+            pet_image_cache.clear()
+            _save_desktop_pet_state()
+            _append_console_session_update(
+                f"Companion generated: {target_image.name}",
+                key=f"companion:generate:done:{int(time.time())}",
+            )
+            _refresh_desktop_pet_ui()
+            pet_mood_lbl.config(text=tr("pet.generated"))
+            _draw_pet_overlay()
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _generate_desktop_pet_look_from_image() -> None:
+        if filedialog is None:
+            messagebox.showerror(tr("pet.title"), tr("pet.reference_picker_unavailable"))
+            return
+        selected = filedialog.askopenfilename(
+            title=tr("pet.reference_picker_title"),
+            filetypes=[
+                (tr("pet.reference_filetype_images"), "*.png *.jpg *.jpeg *.webp *.bmp"),
+                (tr("pet.reference_filetype_all"), "*.*"),
+            ],
+        )
+        if not selected:
+            return
+        _generate_desktop_pet_look(Path(selected))
+
+    def _screen_bottom_y() -> int:
+        try:
+            return max(0, int(root.winfo_screenheight()) - 152)
+        except tk.TclError:
+            return 0
+
+    def _clamp_overlay_position(x: int, y: int) -> Tuple[int, int]:
+        try:
+            sw = max(180, int(root.winfo_screenwidth()))
+            sh = max(180, int(root.winfo_screenheight()))
+        except tk.TclError:
+            sw, sh = 1280, 720
+        return (max(0, min(sw - 156, int(x))), max(0, min(sh - 148, int(y))))
+
+    def _stage_pet_pointer_inside(event: Any) -> bool:
+        try:
+            width = int(pet_stage.winfo_width())
+            height = int(pet_stage.winfo_height())
+        except tk.TclError:
+            return False
+        x = int(getattr(event, "x", 0) or 0)
+        y = int(getattr(event, "y", 0) or 0)
+        return -24 <= x <= width + 24 and -24 <= y <= height + 24
+
+    def _handoff_stage_pet_to_desktop(event: Any) -> None:
+        if pet_stage_drag_state.get("handoff"):
+            return
+        pet_stage_drag_state["handoff"] = True
+        try:
+            root_x = int(getattr(event, "x_root", 0) or 0)
+            root_y = int(getattr(event, "y_root", 0) or 0)
+        except Exception:
+            root_x, root_y = 40, _screen_bottom_y()
+        x, y = _clamp_overlay_position(root_x - 74, root_y - 72)
+        pet_overlay_state["x"] = x
+        pet_overlay_state["y"] = y
+        pet_overlay_state["falling"] = False
+        pet_overlay_state["vy"] = 0.0
+        pet_state["desktop_enabled"] = True
+        pet_state["desktop_x"] = x
+        pet_state["desktop_y"] = y
+        _save_desktop_pet_state()
+        _show_pet_overlay(drop=False)
+        _set_pet_bubble(tr("pet.drag_desktop_say"), seconds=5, force=True)
+        pet_stage_drag_state.update({"dragging": False, "active": False})
+        pet_stage.configure(cursor="")
+        _append_console_session_update(
+            "Companion dragged out to desktop idle.",
+            key=f"pet:dragout:{int(time.time())}",
+        )
+        _refresh_desktop_pet_ui()
+
+    def _journal_pet_pointer_inside_page(event: Any) -> bool:
+        try:
+            root_x = int(getattr(event, "x_root", 0) or 0)
+            root_y = int(getattr(event, "y_root", 0) or 0)
+            page_x = int(journal_page.winfo_rootx())
+            page_y = int(journal_page.winfo_rooty())
+            page_w = int(journal_page.winfo_width())
+            page_h = int(journal_page.winfo_height())
+        except tk.TclError:
+            return False
+        return page_x - 24 <= root_x <= page_x + page_w + 24 and page_y - 24 <= root_y <= page_y + page_h + 24
+
+    def _handoff_journal_pet_to_desktop(event: Any) -> None:
+        if journal_pet_state.get("handoff"):
+            return
+        journal_pet_state["handoff"] = True
+        try:
+            root_x = int(getattr(event, "x_root", 0) or 0)
+            root_y = int(getattr(event, "y_root", 0) or 0)
+        except Exception:
+            root_x, root_y = 40, _screen_bottom_y()
+        x, y = _clamp_overlay_position(root_x - 74, root_y - 72)
+        pet_overlay_state["x"] = x
+        pet_overlay_state["y"] = y
+        pet_overlay_state["falling"] = False
+        pet_overlay_state["vy"] = 0.0
+        pet_state["desktop_enabled"] = True
+        pet_state["desktop_x"] = x
+        pet_state["desktop_y"] = y
+        _save_desktop_pet_state()
+        _show_pet_overlay(drop=False)
+        _set_pet_bubble(tr("pet.drag_desktop_say"), seconds=5, force=True)
+        journal_pet_state.update({"dragging": False, "handoff": False})
+        try:
+            journal_pet_window.withdraw()
+            journal_pet_canvas.configure(cursor="hand2")
+        except tk.TclError:
+            pass
+        _append_console_session_update(
+            "Companion dragged from journal to desktop idle.",
+            key=f"pet:journal-dragout:{int(time.time())}",
+        )
+        _refresh_desktop_pet_ui()
+
+    def _toggle_journal_pet_visible() -> None:
+        if not bool(pet_state.get("active", False)):
+            messagebox.showinfo(tr("pet.title"), tr("pet.no_current"))
+            return
+        pet_state["journal_visible"] = not bool(pet_state.get("journal_visible", True))
+        _save_desktop_pet_state()
+        if bool(pet_state.get("journal_visible", True)):
+            _set_pet_bubble(tr("pet.journal_show_say"), seconds=4, force=True)
+        else:
+            try:
+                journal_pet_window.withdraw()
+            except tk.TclError:
+                pass
+        _refresh_desktop_pet_ui()
+
+    def _on_journal_pet_press(event: Any) -> str:
+        if not _journal_pet_visible_now():
+            return ""
+        x = float(getattr(event, "x", 0) or 0)
+        y = float(getattr(event, "y", 0) or 0)
+        x1, y1, x2, y2 = journal_pet_state.get("hitbox", (0.0, 0.0, 0.0, 0.0))
+        if not (x1 <= x <= x2 and y1 <= y <= y2):
+            return ""
+        journal_pet_state["dragging"] = True
+        journal_pet_state["handoff"] = False
+        journal_pet_state["drag_dx"] = int(x)
+        journal_pet_state["drag_dy"] = int(y)
+        try:
+            journal_pet_canvas.configure(cursor="fleur")
+        except tk.TclError:
+            pass
+        _draw_journal_pet()
+        return "break"
+
+    def _on_journal_pet_motion(event: Any) -> str:
+        if not journal_pet_state.get("dragging"):
+            return ""
+        try:
+            page_x = int(journal_page.winfo_rootx())
+            page_y = int(journal_page.winfo_rooty())
+            page_w = max(120, int(journal_page.winfo_width()))
+            page_h = max(90, int(journal_page.winfo_height()))
+            new_x = int(getattr(event, "x_root", 0) or 0) - page_x - int(journal_pet_state.get("drag_dx", 0) or 0)
+            new_y = int(getattr(event, "y_root", 0) or 0) - page_y - int(journal_pet_state.get("drag_dy", 0) or 0)
+            pet_state["journal_x"] = max(0, min(page_w - 108, new_x))
+            pet_state["journal_y"] = max(0, min(page_h - 62, new_y))
+            _position_journal_pet_canvas()
+        except tk.TclError:
+            pass
+        _draw_journal_pet()
+        return "break"
+
+    def _on_journal_pet_release(_event: Optional[Any] = None) -> str:
+        if not journal_pet_state.get("dragging"):
+            return ""
+        journal_pet_state.update({"dragging": False, "handoff": False})
+        try:
+            journal_pet_canvas.configure(cursor="hand2")
+        except tk.TclError:
+            pass
+        _save_desktop_pet_state()
+        _draw_journal_pet()
+        return "break"
+
+    def _on_pet_stage_press(event: Any) -> str:
+        x = float(getattr(event, "x", 0) or 0)
+        y = float(getattr(event, "y", 0) or 0)
+        x1, y1, x2, y2 = pet_stage_drag_state.get("hitbox", (0.0, 0.0, 0.0, 0.0))
+        if not (x1 <= x <= x2 and y1 <= y <= y2):
+            return ""
+        pet_stage_drag_state["dragging"] = True
+        pet_stage_drag_state["active"] = True
+        pet_stage_drag_state["handoff"] = False
+        pet_stage_drag_state["x"] = float(pet_anim_state.get("x", 42.0) or 42.0)
+        pet_stage_drag_state["y"] = max(0.0, y1)
+        pet_stage_drag_state["dx"] = int(x - float(pet_stage_drag_state["x"]))
+        pet_stage_drag_state["dy"] = int(y - float(pet_stage_drag_state["y"]))
+        pet_stage.configure(cursor="hand2")
+        _draw_desktop_pet()
+        return "break"
+
+    def _on_pet_stage_motion(event: Any) -> str:
+        if not pet_stage_drag_state.get("dragging"):
+            return ""
+        if not _stage_pet_pointer_inside(event):
+            _handoff_stage_pet_to_desktop(event)
+            return "break"
+        pet_stage_drag_state["x"] = float(getattr(event, "x", 0) or 0) - int(pet_stage_drag_state.get("dx", 0) or 0)
+        pet_stage_drag_state["y"] = float(getattr(event, "y", 0) or 0) - int(pet_stage_drag_state.get("dy", 0) or 0)
+        _draw_desktop_pet()
+        return "break"
+
+    def _on_pet_stage_release(event: Any) -> str:
+        if not pet_stage_drag_state.get("dragging"):
+            return ""
+        if not pet_stage_drag_state.get("handoff"):
+            x = max(42.0, float(pet_stage_drag_state.get("x", 42.0) or 42.0))
+            y = max(20.0, float(pet_stage_drag_state.get("y", 0.0) or 0.0))
+            pet_anim_state["x"] = x
+            pet_state["stage_x"] = int(x)
+            pet_state["stage_y"] = int(y)
+            _save_desktop_pet_state()
+        pet_stage_drag_state.update({"dragging": False, "active": False, "handoff": False})
+        pet_stage.configure(cursor="")
+        _draw_desktop_pet()
+        return "break"
+
+    def _draw_pet_overlay() -> None:
+        canvas = pet_overlay_state.get("canvas")
+        if canvas is None:
+            return
+        try:
+            t = th()
+            canvas.delete("all")
+            if not bool(pet_state.get("active", False)):
+                return
+            tick = int(pet_overlay_state.get("tick", 0) or 0)
+            level, _current_xp, _needed_xp = _desktop_pet_level()
+            bounce = 4 if (tick // 9) % 2 == 0 else 0
+            bubble_text = _active_pet_bubble_text()
+            photo = _load_pet_photo("overlay", (94, 94) if bubble_text else (118, 118))
+            if photo is not None:
+                canvas.create_oval(14, 96, 134, 132, fill="#2A2D44", outline="")
+                if bubble_text:
+                    _draw_pet_bubble(canvas, 8, 4, bubble_text, width_chars=16)
+                canvas.create_image(74, (88 if bubble_text else 64) - bounce, image=photo)
+                return
+            body = "#8FE6D6" if level < 5 else "#B8A2FF"
+            belly = "#F7F5FF"
+            accent = "#FFB86B" if level < 8 else "#FFE066"
+            outline = t.accent
+            x = 26
+            y = (32 if bubble_text else 12) - bounce
+            if bubble_text:
+                _draw_pet_bubble(canvas, 8, 4, bubble_text, width_chars=16)
+            canvas.create_oval(x - 10, y + 58, x + 110, y + 118, fill="#2A2D44", outline="")
+            canvas.create_oval(x + 8, y + 42, x + 92, y + 124, fill=body, outline=outline, width=2)
+            canvas.create_oval(x + 30, y + 72, x + 72, y + 116, fill=belly, outline="")
+            canvas.create_oval(x + 8, y + 18, x + 92, y + 88, fill=body, outline=outline, width=2)
+            canvas.create_oval(x + 4, y + 10, x + 32, y + 46, fill=body, outline=outline, width=2)
+            canvas.create_oval(x + 68, y + 10, x + 96, y + 46, fill=body, outline=outline, width=2)
+            canvas.create_oval(x + 30, y + 48, x + 39, y + 58, fill="#10131C", outline="")
+            canvas.create_oval(x + 62, y + 48, x + 71, y + 58, fill="#10131C", outline="")
+            canvas.create_oval(x + 33, y + 50, x + 36, y + 53, fill="white", outline="")
+            canvas.create_oval(x + 65, y + 50, x + 68, y + 53, fill="white", outline="")
+            canvas.create_arc(x + 43, y + 58, x + 59, y + 72, start=200, extent=140, style="arc", outline="#10131C", width=2)
+            canvas.create_oval(x + 18, y + 61, x + 30, y + 72, fill="#FF8FB3", outline="")
+            canvas.create_oval(x + 72, y + 61, x + 84, y + 72, fill="#FF8FB3", outline="")
+            canvas.create_line(x + 80, y + 82, x + 118, y + 64 - bounce, fill=accent, width=7, smooth=True)
+        except tk.TclError:
+            pass
+
+    def _save_overlay_position() -> None:
+        x, y = _clamp_overlay_position(
+            int(pet_overlay_state.get("x", 0) or 0),
+            int(pet_overlay_state.get("y", 0) or 0),
+        )
+        pet_overlay_state["x"] = x
+        pet_overlay_state["y"] = y
+        pet_state["desktop_x"] = x
+        pet_state["desktop_y"] = y
+        _save_desktop_pet_state()
+
+    def _restore_journal_from_pet(_event: Optional[Any] = None) -> str:
+        try:
+            root.deiconify()
+            root.lift()
+            root.focus_force()
+            show_page("journal")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _destroy_pet_overlay() -> None:
+        win = pet_overlay_state.get("window")
+        pet_overlay_state.update({"window": None, "canvas": None, "dragging": False, "falling": False})
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+    def _destroy_journal_pet_window() -> None:
+        try:
+            journal_pet_window.destroy()
+        except tk.TclError:
+            pass
+
+    def _create_pet_overlay() -> None:
+        if not bool(pet_state.get("active", False)):
+            return
+        win = pet_overlay_state.get("window")
+        try:
+            if win is not None and bool(win.winfo_exists()):
+                return
+        except tk.TclError:
+            pet_overlay_state["window"] = None
+        transparent = "#00ff7f"
+        win = tk.Toplevel(root)
+        win.overrideredirect(True)
+        try:
+            win.attributes("-topmost", True)
+            win.attributes("-transparentcolor", transparent)
+        except tk.TclError:
+            pass
+        canvas = tk.Canvas(win, width=148, height=144, bg=transparent, bd=0, highlightthickness=0, cursor="hand2")
+        canvas.pack(fill="both", expand=True)
+        pet_overlay_state["window"] = win
+        pet_overlay_state["canvas"] = canvas
+
+        def _press(event: Any) -> str:
+            pet_overlay_state["dragging"] = True
+            pet_overlay_state["falling"] = False
+            pet_overlay_state["drag_dx"] = int(getattr(event, "x", 0) or 0)
+            pet_overlay_state["drag_dy"] = int(getattr(event, "y", 0) or 0)
+            return "break"
+
+        def _motion(event: Any) -> str:
+            if not pet_overlay_state.get("dragging"):
+                return "break"
+            x = int(getattr(event, "x_root", 0) or 0) - int(pet_overlay_state.get("drag_dx", 0) or 0)
+            y = int(getattr(event, "y_root", 0) or 0) - int(pet_overlay_state.get("drag_dy", 0) or 0)
+            x, y = _clamp_overlay_position(x, y)
+            pet_overlay_state["x"] = x
+            pet_overlay_state["y"] = y
+            try:
+                win.geometry(f"148x144+{x}+{y}")
+            except tk.TclError:
+                pass
+            return "break"
+
+        def _release(_event: Optional[Any] = None) -> str:
+            pet_overlay_state["dragging"] = False
+            _save_overlay_position()
+            return "break"
+
+        def _right_click(_event: Optional[Any] = None) -> str:
+            _set_desktop_pet_enabled(False)
+            return "break"
+
+        canvas.bind("<ButtonPress-1>", _press, add="+")
+        canvas.bind("<B1-Motion>", _motion, add="+")
+        canvas.bind("<ButtonRelease-1>", _release, add="+")
+        canvas.bind("<Double-Button-1>", _restore_journal_from_pet, add="+")
+        canvas.bind("<Button-3>", _right_click, add="+")
+        _draw_pet_overlay()
+
+    def _show_pet_overlay(*, drop: bool = False) -> None:
+        if not bool(pet_state.get("active", False)):
+            _destroy_pet_overlay()
+            return
+        _create_pet_overlay()
+        win = pet_overlay_state.get("window")
+        if win is None:
+            return
+        x = int(pet_overlay_state.get("x", 0) or 0)
+        y = int(pet_overlay_state.get("y", 0) or 0)
+        if x <= 0 and y <= 0:
+            try:
+                x = int(root.winfo_rootx() + root.winfo_width() - 190)
+                y = _screen_bottom_y()
+            except tk.TclError:
+                x, y = 40, _screen_bottom_y()
+        if drop:
+            try:
+                y = int(root.winfo_rooty() + root.winfo_height() - 110)
+            except tk.TclError:
+                y = max(0, _screen_bottom_y() - 160)
+            pet_overlay_state["falling"] = True
+            pet_overlay_state["vy"] = 0.0
+        x, y = _clamp_overlay_position(x, y)
+        pet_overlay_state["x"] = x
+        pet_overlay_state["y"] = y
+        try:
+            win.geometry(f"148x144+{x}+{y}")
+            win.deiconify()
+            win.lift()
+        except tk.TclError:
+            pass
+
+    def _tick_pet_overlay() -> None:
+        try:
+            win = pet_overlay_state.get("window")
+            if win is not None and bool(win.winfo_exists()):
+                pet_overlay_state["tick"] = int(pet_overlay_state.get("tick", 0) or 0) + 1
+                x = int(pet_overlay_state.get("x", 0) or 0)
+                y = int(pet_overlay_state.get("y", 0) or 0)
+                if not pet_overlay_state.get("dragging"):
+                    if pet_overlay_state.get("falling"):
+                        target_y = _screen_bottom_y()
+                        vy = float(pet_overlay_state.get("vy", 0.0) or 0.0) + 1.8
+                        y = min(target_y, int(y + vy))
+                        pet_overlay_state["vy"] = vy
+                        if y >= target_y:
+                            pet_overlay_state["falling"] = False
+                            _save_overlay_position()
+                    x, y = _clamp_overlay_position(x, y)
+                    pet_overlay_state["x"] = x
+                    pet_overlay_state["y"] = y
+                    win.geometry(f"148x144+{x}+{y}")
+                _draw_pet_overlay()
+            root.after(90, _tick_pet_overlay)
+        except tk.TclError:
+            return
+
+    def _set_desktop_pet_enabled(enabled: bool, *, drop: bool = False) -> None:
+        if enabled and not bool(pet_state.get("active", False)):
+            messagebox.showinfo(tr("pet.title"), tr("pet.no_current"))
+            _destroy_pet_overlay()
+            return
+        was_backgrounded = False
+        try:
+            was_backgrounded = root.state() == "withdrawn"
+        except tk.TclError:
+            pass
+        pet_state["desktop_enabled"] = bool(enabled)
+        if enabled:
+            _show_pet_overlay(drop=drop)
+        else:
+            _destroy_pet_overlay()
+        _save_desktop_pet_state()
+        if not enabled and was_backgrounded:
+            try:
+                destroy_journal_window()
+            except tk.TclError:
+                pass
+            return
+        _refresh_desktop_pet_ui()
+
+    def _toggle_desktop_pet_mode() -> None:
+        if not bool(pet_state.get("active", False)):
+            messagebox.showinfo(tr("pet.title"), tr("pet.no_current"))
+            return
+        _set_desktop_pet_enabled(not bool(pet_state.get("desktop_enabled", False)), drop=True)
+
+    def _background_journal_with_pet() -> None:
+        if not bool(pet_state.get("active", False)):
+            destroy_journal_window()
+            return
+        _set_desktop_pet_enabled(True, drop=True)
+        try:
+            root.withdraw()
+        except tk.TclError:
+            pass
+
+    def _finish_or_background_journal_window() -> None:
+        if bool(pet_state.get("desktop_enabled", False)):
+            _background_journal_with_pet()
+            return
+        destroy_journal_window()
+
+    def _tick_desktop_pet() -> None:
+        try:
+            _draw_desktop_pet()
+            _draw_journal_pet()
+            root.after(90, _tick_desktop_pet)
+        except tk.TclError:
+            return
+
+    pet_feed_btn.config(command=lambda: _feed_desktop_pet_from_current_entry(force=True))
+    pet_art_btn.config(command=_generate_desktop_pet_look)
+    pet_art_ref_btn.config(command=_generate_desktop_pet_look_from_image)
+    pet_name_save_btn.config(command=_save_companion_name)
+    pet_name_entry.bind("<Return>", lambda _event: (_save_companion_name(), "break")[1])
+    pet_desktop_btn.config(command=_toggle_desktop_pet_mode, state="normal", cursor="hand2")
+    pet_journal_btn.config(command=_toggle_journal_pet_visible, state="normal", cursor="hand2")
+    pet_export_btn.config(command=_export_current_companion_profile, state="normal", cursor="hand2")
+    pet_import_btn.config(command=_import_companion_profile, state="normal", cursor="hand2")
+    pet_folder_btn.config(command=_open_companion_folder, state="normal", cursor="hand2")
+    pet_delete_btn.config(command=_delete_current_companion, state="normal", cursor="hand2")
+    pet_bubble_btn.config(command=_toggle_pet_bubble_module)
+    pet_memory_btn.config(command=_toggle_pet_memory_module)
+    pet_tts_btn.config(command=_toggle_pet_tts_module)
+    pet_chat_btn.config(command=_toggle_pet_chat_module)
+    pet_chat_ask_btn.config(command=_ask_pet_chat)
+    pet_chat_entry.bind("<Return>", lambda _event: (_ask_pet_chat(), "break")[1])
+    pet_stage.bind("<ButtonPress-1>", _on_pet_stage_press, add="+")
+    pet_stage.bind("<B1-Motion>", _on_pet_stage_motion, add="+")
+    pet_stage.bind("<ButtonRelease-1>", _on_pet_stage_release, add="+")
+    journal_pet_canvas.bind("<ButtonPress-1>", _on_journal_pet_press, add="+")
+    journal_pet_canvas.bind("<B1-Motion>", _on_journal_pet_motion, add="+")
+    journal_pet_canvas.bind("<ButtonRelease-1>", _on_journal_pet_release, add="+")
+    journal_pet_canvas.bind("<Button-3>", lambda _event: (_toggle_journal_pet_visible(), "break")[1], add="+")
+    journal_page.bind("<Configure>", lambda _event: root.after_idle(_draw_journal_pet), add="+")
+    _refresh_desktop_pet_ui()
+    _refresh_pet_art_button()
+    _refresh_pet_module_ui()
+    root.after(120, _tick_desktop_pet)
+    root.after(120, _tick_pet_overlay)
+    journal_cleanup_callbacks.append(_destroy_pet_overlay)
+    journal_cleanup_callbacks.append(_destroy_journal_pet_window)
+    if bool(pet_state.get("desktop_enabled", False)):
+        root.after(500, lambda: _show_pet_overlay(drop=False))
 
     def _sync_journal_side_action_columns() -> None:
         try:
@@ -13524,7 +16456,7 @@ def open_journal_window_editor(
         pady=6,
         cursor="hand2",
     )
-    restore_draft_btn.grid(row=0, column=6, sticky="e", padx=(8, 0), pady=12)
+    restore_draft_btn.grid(row=0, column=7, sticky="e", padx=(8, 0), pady=12)
     bind_button_hover_if_enabled(
         restore_draft_btn,
         lambda: th().toolbar_bind_rest(),
@@ -14133,12 +17065,13 @@ def open_journal_window_editor(
             saved["value"] = True
             if autosave_id["value"] is not None:
                 root.after_cancel(autosave_id["value"])
-            destroy_journal_window()
+            _finish_or_background_journal_window()
             return
         if not text_value:
             text_value = "(no details entered)"
         speech_value = normalize_journal_text_punctuation(stt_box.get("1.0", "end-1c")).strip()
         report_value = normalize_journal_text_punctuation(report_box.get("1.0", "end-1c")).strip()
+        _feed_desktop_pet_on_save(text_value, speech_value, report_value)
         row_payload = [date_value, normalized_time, text_value, speech_value, report_value]
         if edit_target_sheet and edit_target_row > 0:
             saved_ok = update_journal_entry_at(
@@ -14158,7 +17091,7 @@ def open_journal_window_editor(
         saved["value"] = True
         if autosave_id["value"] is not None:
             root.after_cancel(autosave_id["value"])
-        destroy_journal_window()
+        _finish_or_background_journal_window()
 
     def stop_active_recording_for_close() -> None:
         th = record_thread_holder.get("thread")
@@ -14206,7 +17139,7 @@ def open_journal_window_editor(
             clear_journal_window_draft()
             if autosave_id["value"] is not None:
                 root.after_cancel(autosave_id["value"])
-            destroy_journal_window()
+            _finish_or_background_journal_window()
             return
         save_choice = messagebox.askyesnocancel(
             "Close Journal Window",
@@ -14226,7 +17159,7 @@ def open_journal_window_editor(
         save_draft()
         if autosave_id["value"] is not None:
             root.after_cancel(autosave_id["value"])
-        destroy_journal_window()
+        _finish_or_background_journal_window()
 
     console_history: List[str] = []
     console_hist_index = {"value": 0}
@@ -14459,6 +17392,10 @@ def open_journal_window_editor(
             show_page("chatbot")
             console_append("Switched to Chatbot page.")
             return
+        if cmd in {"PET", "DESKTOP PET", "桌宠"}:
+            show_page("desktop_pet")
+            console_append("Switched to Companion page.")
+            return
         if cmd == "CONSOLE":
             if sys.platform != "win32":
                 console_append("Native console show is supported on Windows only.")
@@ -14565,12 +17502,7 @@ def open_journal_window_editor(
             console_entry.icursor("end")
         return "break"
 
-    button_row = tk.Frame(journal_page, bg=t_init.surface)
-    button_row.pack(
-        fill="x",
-        padx=t_init.pad_outer,
-        pady=(0, t_init.pad_button_y),
-    )
+    button_row = tk.Frame(journal_page, bg=t_init.surface, bd=0, highlightthickness=0)
     save_entry_btn = tk.Button(
         button_row,
         text="Save Entry",
@@ -14589,6 +17521,7 @@ def open_journal_window_editor(
     )
     save_entry_btn.pack(side="right")
     save_entry_btn_holder["btn"] = save_entry_btn
+    root.after_idle(lambda: _layout_console_row(active_page_frame.get("frame") or journal_page))
 
     def save_rest_style() -> Tuple[str, str, str, str, str]:
         t = th()
@@ -14605,6 +17538,7 @@ def open_journal_window_editor(
 
     def _on_journal_text_changed(_evt: Optional[Any] = None) -> None:
         refresh_save_entry_state()
+        _feed_desktop_pet_from_current_entry()
 
     def _journal_delete_prev_word(_evt: Optional[Any] = None) -> str:
         w = root.focus_get()
@@ -14758,6 +17692,24 @@ def open_journal_window_editor(
         journal_title_lbl.config(text=tr("journal.section.journal"))
         stt_title_lbl.config(text=tr("journal.section.stt"))
         report_title_lbl.config(text=tr("journal.section.report"))
+        pet_title_lbl.config(text=tr("pet.title"))
+        pet_body_lbl.config(text=tr("pet.body"))
+        pet_name_lbl.config(text=tr("pet.name_label"))
+        pet_name_save_btn.config(text=tr("pet.name_save"))
+        pet_feed_btn.config(text=tr("pet.feed_now"))
+        _refresh_pet_art_button()
+        pet_desktop_btn.config(text=tr("pet.desktop_mode"))
+        pet_export_btn.config(text=tr("pet.export_profile"))
+        pet_import_btn.config(text=tr("pet.import_profile"))
+        pet_folder_btn.config(text=tr("pet.open_folder"))
+        pet_delete_btn.config(text=tr("pet.delete_profile"))
+        pet_modules_lbl.config(text=tr("pet.modules_title"))
+        pet_memory_title_lbl.config(text=tr("pet.module_memory_title"))
+        pet_tts_title_lbl.config(text=tr("pet.module_tts_title"))
+        pet_chat_title_lbl.config(text=tr("pet.module_chat_title"))
+        pet_chat_ask_btn.config(text=tr("pet.chat_ask"))
+        _refresh_pet_module_ui()
+        _refresh_desktop_pet_ui()
         open_recording_btn.config(text=tr("journal.open"))
         stt_lang_lbl.config(text=tr("journal.lang_label"))
         transcribe_btn.config(text=tr("journal.transcribe"))
@@ -14824,6 +17776,7 @@ def open_journal_window_editor(
         journal_page.configure(bg=t.surface)
         ai_recap_page.configure(bg=t.surface)
         chatbot_page.configure(bg=t.surface)
+        desktop_pet_page.configure(bg=t.surface)
         console_page.configure(bg=t.surface)
         settings_page.configure(bg=t.surface)
         module_library_page.configure(bg=t.surface)
@@ -15057,6 +18010,132 @@ def open_journal_window_editor(
             highlightcolor=t.accent,
         )
         report_scroll.configure_theme(t)
+        pet_wrap.configure(bg=t.surface)
+        pet_title_lbl.configure(bg=t.surface, fg=t.text)
+        pet_body_lbl.configure(bg=t.surface, fg=t.muted)
+        pet_info_holder.configure(bg=t.panel, highlightbackground=t.border)
+        pet_info_canvas.configure(bg=t.panel)
+        pet_info_scroll.configure(
+            bg=t.panel,
+            troughcolor=t.field,
+            activebackground=t.accent,
+        )
+        pet_info.configure(bg=t.panel, highlightbackground=t.border)
+        pet_level_lbl.configure(bg=t.panel, fg=t.text)
+        pet_xp_lbl.configure(bg=t.panel, fg=t.muted)
+        pet_mood_lbl.configure(bg=t.panel, fg=t.muted)
+        pet_name_frame.configure(bg=t.panel)
+        pet_name_lbl.configure(bg=t.panel, fg=t.muted)
+        pet_name_entry.configure(
+            bg=t.field,
+            fg=t.text,
+            disabledbackground=t.btn_disabled,
+            disabledforeground=t.disabled_fg,
+            insertbackground=t.text,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        pet_profile_frame.configure(bg=t.panel)
+        pet_modules_lbl.configure(bg=t.panel, fg=t.text)
+        pet_bubble_module.configure(bg=t.field, highlightbackground=t.border)
+        pet_bubble_title_lbl.configure(bg=t.field, fg=t.text)
+        pet_bubble_status_lbl.configure(bg=t.field, fg=t.muted)
+        pet_memory_module.configure(bg=t.field, highlightbackground=t.border)
+        pet_memory_title_lbl.configure(bg=t.field, fg=t.text)
+        pet_memory_status_lbl.configure(bg=t.field, fg=t.muted)
+        pet_tts_module.configure(bg=t.field, highlightbackground=t.border)
+        pet_tts_title_lbl.configure(bg=t.field, fg=t.text)
+        pet_tts_status_lbl.configure(bg=t.field, fg=t.muted)
+        pet_chat_module.configure(bg=t.field, highlightbackground=t.border)
+        pet_chat_title_lbl.configure(bg=t.field, fg=t.text)
+        pet_chat_status_lbl.configure(bg=t.field, fg=t.muted)
+        pet_chat_entry_row.configure(bg=t.field)
+        pet_chat_entry.configure(
+            bg=t.panel,
+            fg=t.text,
+            insertbackground=t.text,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        pet_feed_btn.configure(
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+        )
+        pet_art_ref_btn.configure(
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+        )
+        pet_desktop_btn.configure(
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            cursor="hand2",
+        )
+        pet_journal_btn.configure(
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            cursor="hand2",
+        )
+        for _btn in (pet_name_save_btn, pet_export_btn, pet_import_btn, pet_folder_btn):
+            _btn.configure(
+                bg=t.btn_secondary,
+                fg=t.text,
+                activebackground=t.secondary_hover,
+                activeforeground=t.text,
+                cursor="hand2",
+            )
+        pet_delete_btn.configure(
+            bg="#8B2F3A",
+            fg="white",
+            activebackground="#A43B48",
+            activeforeground="white",
+            cursor="hand2",
+        )
+        pet_bubble_btn.configure(
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            cursor="hand2",
+        )
+        pet_memory_btn.configure(
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            cursor="hand2",
+        )
+        pet_tts_btn.configure(
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            cursor="hand2",
+        )
+        pet_chat_btn.configure(
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            cursor="hand2",
+        )
+        pet_chat_ask_btn.configure(
+            bg=t.btn_secondary,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            cursor="hand2",
+        )
+        _refresh_pet_art_button()
+        _refresh_desktop_pet_ui()
+        journal_pet_canvas.configure(bg=journal_pet_transparent)
         root.after_idle(_sync_journal_side_action_columns)
         stt_lang_lbl.configure(bg=t.panel, fg=t.muted)
         if ttk is not None and _jw_style is not None:
@@ -15112,7 +18191,7 @@ def open_journal_window_editor(
             else:
                 _journal_rec_btn_set(_b, str(_b.cget("state")) == "normal")
         button_row.configure(bg=t.surface)
-        button_row.pack_configure(padx=t.pad_outer, pady=(0, t.pad_button_y))
+        _layout_console_row(active_page_frame.get("frame") or journal_page)
         refresh_save_entry_state()
         redraw_waveform_canvas()
         apply_journal_window_i18n()
@@ -15136,16 +18215,21 @@ def open_journal_window_editor(
             messagebox.showerror(tr("msg.virtual_reader_title"), err)
 
     sidebar_module_defs: Dict[str, Dict[str, Any]] = {
-        "journal": {"label_key": "nav.journal", "page": "journal"},
-        "ai_recap": {"label_key": "nav.ai_recap", "page": "ai_recap"},
-        "chatbot": {"label_key": "nav.chatbot", "page": "chatbot"},
-        "console": {"label_key": "nav.console", "page": "console"},
+        "journal": {"label_key": "nav.journal", "fallback_en": "Journal", "fallback_zh": "日记", "page": "journal"},
+        "ai_recap": {"label_key": "nav.ai_recap", "fallback_en": "AI Recap", "fallback_zh": "AI 回顾", "page": "ai_recap"},
+        "chatbot": {"label_key": "nav.chatbot", "fallback_en": "Chatbot", "fallback_zh": "聊天助手", "page": "chatbot"},
+        "desktop_pet": {"label_key": "nav.desktop_pet", "fallback_en": "Companion", "fallback_zh": "桌宠", "page": "desktop_pet"},
+        "console": {"label_key": "nav.console", "fallback_en": "Console", "fallback_zh": "控制台", "page": "console"},
         "reader": {
             "label_key": "nav.virtual_reader",
             "short_label_key": "nav.reader_short",
+            "fallback_en": "Virtual Reader",
+            "fallback_zh": "阅读器",
+            "short_fallback_en": "Reader",
+            "short_fallback_zh": "阅读器",
             "action": on_virtual_reader_nav_clicked,
         },
-        "settings": {"label_key": "nav.settings", "page": "settings"},
+        "settings": {"label_key": "nav.settings", "fallback_en": "Settings", "fallback_zh": "设置", "page": "settings"},
     }
     sidebar_all_module_ids = tuple(
         mid for mid in SIDEBAR_DEFAULT_MODULE_ORDER if mid in sidebar_module_defs
@@ -15154,11 +18238,16 @@ def open_journal_window_editor(
     def _sidebar_module_label(module_id: str, *, short: bool = False) -> str:
         info = sidebar_module_defs.get(module_id, {})
         key = str(info.get("short_label_key" if short else "label_key") or info.get("label_key") or module_id)
-        return tr(key)
+        label = tr(key)
+        if label == key or label.startswith("nav."):
+            lang_suffix = "zh" if ui_lang_holder[0] == "zh" else "en"
+            fallback_key = f"{'short_' if short else ''}fallback_{lang_suffix}"
+            label = str(info.get(fallback_key) or info.get(f"fallback_{lang_suffix}") or module_id)
+        return label
 
     def _default_sidebar_slots() -> List[str]:
         slots = [""] * SIDEBAR_TOTAL_SLOT_COUNT
-        for index, module_id in enumerate(("journal", "ai_recap", "chatbot", "console")):
+        for index, module_id in enumerate(("journal", "ai_recap", "chatbot", "desktop_pet", "console")):
             if index < SIDEBAR_TOP_SLOT_COUNT:
                 slots[index] = module_id
         slots[SIDEBAR_TOP_SLOT_COUNT] = "reader"
@@ -15192,6 +18281,26 @@ def open_journal_window_editor(
                 break
             slots[index] = module_id
         return slots
+
+    def _insert_sidebar_module_once(slots: List[str], module_id: str, *, after: str = "") -> bool:
+        if module_id in slots or module_id not in sidebar_module_defs:
+            return False
+        target_index: Optional[int] = None
+        if after and after in slots:
+            after_index = slots.index(after)
+            for index in range(after_index + 1, SIDEBAR_TOP_SLOT_COUNT):
+                if not slots[index]:
+                    target_index = index
+                    break
+        if target_index is None:
+            for index in range(SIDEBAR_TOP_SLOT_COUNT):
+                if not slots[index]:
+                    target_index = index
+                    break
+        if target_index is None:
+            return False
+        slots[target_index] = module_id
+        return True
 
     def _top_sidebar_module_ids() -> List[str]:
         return list(nav_module_order_state["ids"][:SIDEBAR_TOP_SLOT_COUNT])
@@ -15231,7 +18340,13 @@ def open_journal_window_editor(
             elif module_id in sidebar_module_defs and module_id not in used:
                 order.append(module_id)
                 used.add(module_id)
-        return _normalize_sidebar_module_order(order)
+        normalized = _normalize_sidebar_module_order(order)
+        if not bool(prefs.get(SIDEBAR_DESKTOP_PET_MIGRATION_PREF_KEY, False)):
+            if _insert_sidebar_module_once(normalized, "desktop_pet", after="chatbot"):
+                prefs[SIDEBAR_MODULE_ORDER_PREF_KEY] = json.dumps(normalized)
+            prefs[SIDEBAR_DESKTOP_PET_MIGRATION_PREF_KEY] = True
+            save_preferences(prefs)
+        return normalized
 
     def _save_sidebar_module_order() -> None:
         prefs = load_preferences()
