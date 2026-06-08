@@ -123,6 +123,10 @@ OPENAI_IMAGE_MODEL = (
     os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1-mini").strip()
     or "gpt-image-1-mini"
 )
+OPENAI_REFERENCE_IMAGE_MODEL = (
+    os.getenv("OPENAI_REFERENCE_IMAGE_MODEL", "gpt-image-1").strip()
+    or "gpt-image-1"
+)
 OPENAI_IMAGE_QUALITY = (
     os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip().lower()
     or "medium"
@@ -2193,17 +2197,20 @@ def generate_desktop_pet_image(
 
     pet_level = max(1, int(level or 1))
     safe_name = re.sub(r"[^A-Za-z0-9 _-]+", "", str(name or "Companion")).strip() or "Companion"
+    sprite_rules = (
+        "Transparent background, full body, front three-quarter view, soft rounded shapes, clean outline, "
+        "readable at small desktop-icon size, high-resolution crisp details, antialiased edges, and at least "
+        "8 percent transparent padding around the body. No text, no logo, no UI frame, no colored canvas "
+        "border, no square background, no black/solid background, no shadow box. "
+        f"It is level {pet_level}; higher level means slightly more confident, brighter, and magical, "
+        "but still simple and friendly."
+    )
     prompt = (
         "Create one original cute Q-style chibi desktop companion sprite named "
         f"{safe_name}. The default direction is a charming chibi anime boy or girl mascot, "
         "with the option to softly borrow animal-like pet/dog/fantasy companion energy. "
-        "Do not resemble any existing copyrighted character. Transparent background, "
-        "full body, front three-quarter view, soft rounded shapes, clean outline, readable at "
-        "small desktop-icon size, high-resolution crisp details, antialiased edges, and at least "
-        "8 percent transparent padding around the body. No text, no logo, no UI frame, no colored "
-        "canvas border, no square background, no black/solid background, no shadow box. "
-        f"It is level {pet_level}; higher level means slightly more confident, brighter, and magical, "
-        "but still simple and friendly."
+        "Do not resemble any existing copyrighted character. "
+        + sprite_rules
     )
     notes = re.sub(r"\s+", " ", str(design_prompt or "")).strip()
     if notes:
@@ -2213,21 +2220,33 @@ def generate_desktop_pet_image(
         if ref_err or reference_file is None:
             return None, ref_err or "Could not prepare reference image."
         prompt = (
-            prompt
-            + " Use the uploaded image only as loose visual inspiration for hairstyle, outfit palette, "
-            "pose language, or creature personality. Redesign it as an original cute chibi desktop "
-            "companion sprite, not a direct copy."
+            "Use the uploaded image as the primary design reference for the companion. "
+            "The result must clearly resemble the main visible subject from that image after conversion "
+            "to a cute Q-style chibi desktop sprite. Preserve the subject type, silhouette, dominant "
+            "colors, face/head shape, hair or ears, outfit/accessories, pose language, and personality "
+            "as much as possible. Do not replace the reference with a generic mascot, generic animal, "
+            "or default cute blob. If the uploaded image is a person, make a chibi version of that person. "
+            "If it is an animal, object, robot, or fantasy creature, make a chibi version of that exact "
+            "subject. Keep it original and non-infringing, but reference resemblance is more important "
+            "than the default mascot direction. "
+            + sprite_rules
         )
+        if notes:
+            prompt += f" User editable design notes: {notes}"
+        edit_model = OPENAI_REFERENCE_IMAGE_MODEL
+        fields = {
+            "model": edit_model,
+            "prompt": prompt,
+            "n": "1",
+            "size": "1024x1024",
+            "quality": OPENAI_IMAGE_QUALITY,
+            "background": "transparent",
+            "output_format": "png",
+        }
+        if "mini" not in edit_model.lower():
+            fields["input_fidelity"] = "high"
         payload, content_type = _multipart_form_data(
-            {
-                "model": OPENAI_IMAGE_MODEL,
-                "prompt": prompt,
-                "n": "1",
-                "size": "1024x1024",
-                "quality": OPENAI_IMAGE_QUALITY,
-                "background": "transparent",
-                "output_format": "png",
-            },
+            fields,
             {"image": reference_file},
         )
         req = request.Request(
