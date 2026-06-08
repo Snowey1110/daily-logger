@@ -8118,6 +8118,7 @@ def open_journal_window_editor(
     pet_bubble_state = {"text": "", "until": 0.0, "last_auto": 0.0}
     pet_tts_state: Dict[str, Any] = {"proc": None, "last": 0.0, "error": ""}
     pet_image_cache: Dict[str, Any] = {}
+    journal_widget_refs: Dict[str, Any] = {"restore_draft_btn": None}
     journal_pet_state: Dict[str, Any] = {
         "dragging": False,
         "drag_dx": 0,
@@ -9276,10 +9277,13 @@ def open_journal_window_editor(
             x = int(pet_state.get("journal_x", 0) or 0)
             y = int(pet_state.get("journal_y", 0) or 0)
             if x <= 0 and y <= 0:
+                restore_btn = journal_widget_refs.get("restore_draft_btn")
                 try:
-                    x = max(0, int(restore_draft_btn.winfo_rootx() - journal_page.winfo_rootx()) - 112)
-                    y = max(0, int(restore_draft_btn.winfo_rooty() - journal_page.winfo_rooty()) + 2)
-                except (NameError, tk.TclError):
+                    if restore_btn is None or not bool(restore_btn.winfo_exists()):
+                        raise tk.TclError("restore draft button is not ready")
+                    x = max(0, int(restore_btn.winfo_rootx() - journal_page.winfo_rootx()) - 112)
+                    y = max(0, int(restore_btn.winfo_rooty() - journal_page.winfo_rooty()) + 2)
+                except tk.TclError:
                     x = max(0, page_w - 230)
                     y = 22
             x = max(0, min(page_w - 108, x))
@@ -16598,6 +16602,7 @@ def open_journal_window_editor(
         cursor="hand2",
     )
     restore_draft_btn.grid(row=0, column=7, sticky="e", padx=(8, 0), pady=12)
+    journal_widget_refs["restore_draft_btn"] = restore_draft_btn
     bind_button_hover_if_enabled(
         restore_draft_btn,
         lambda: th().toolbar_bind_rest(),
