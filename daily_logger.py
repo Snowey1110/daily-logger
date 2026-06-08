@@ -131,7 +131,8 @@ UPDATE_LAST_SEEN_RELEASE_PREF_KEY = "last_seen_release_tag"
 UPDATE_DISMISSED_RELEASE_PREF_KEY = "dismissed_release_tag"
 # Journal STT / AI report: same button width (text units) and grid min width so text areas align.
 JOURNAL_SIDE_ACTION_BTN_WIDTH_CH = 16
-JOURNAL_SIDE_ACTION_GRID_MINSIZE = 130
+JOURNAL_SIDE_ACTION_GRID_MINSIZE = 190
+JOURNAL_TEXT_SCROLLBAR_WIDTH = 11
 # Whisper list price per audio minute (USD); verify at https://openai.com/pricing
 WHISPER_USD_PER_MIN = 0.006
 # Pre-send WAV cleanup (RMS on int16-scale, same ballpark as WAVEFORM_RMS_NOISE_FLOOR).
@@ -666,6 +667,148 @@ def journal_window_theme_current_label_key(current_key: str) -> str:
 def load_journal_window_theme_spec() -> JournalWindowThemeSpec:
     prefs = load_preferences()
     return journal_window_theme_spec_for_key(str(prefs.get(JOURNAL_PREF_THEME_KEY, "dark")))
+
+
+if tk is not None:
+
+    class JournalSlimScrollbar(tk.Canvas):
+        """Small themed scrollbar for the main journal editor panes."""
+
+        def __init__(
+            self,
+            parent: Any,
+            command: Callable[..., Any],
+            theme: JournalWindowThemeSpec,
+            width: int = JOURNAL_TEXT_SCROLLBAR_WIDTH,
+        ) -> None:
+            super().__init__(
+                parent,
+                width=width,
+                bd=0,
+                highlightthickness=0,
+                relief="flat",
+                takefocus=0,
+                bg=theme.field,
+            )
+            self._command = command
+            self._theme = theme
+            self._first = 0.0
+            self._last = 1.0
+            self._drag_offset = 0
+            self._width = width
+            self._hidden = False
+            self._hidden_column: Optional[int] = None
+            self._track_id = self.create_rectangle(0, 0, width, 1, width=0)
+            self._thumb_id = self.create_rectangle(2, 2, width - 2, 24, width=0)
+            self.configure_theme(theme)
+            self.bind("<Configure>", lambda _event: self._redraw())
+            self.bind("<Button-1>", self._on_press)
+            self.bind("<B1-Motion>", self._on_drag)
+            self.bind("<ButtonRelease-1>", self._on_release)
+
+        def configure_theme(self, theme: JournalWindowThemeSpec) -> None:
+            self._theme = theme
+            track = theme.panel
+            thumb = theme.muted if theme.is_dark else theme.border
+            self.configure(bg=track)
+            self.itemconfigure(self._track_id, fill=track, outline="")
+            self.itemconfigure(self._thumb_id, fill=thumb, outline="")
+            self._redraw()
+
+        def set(self, first: Any, last: Any) -> None:
+            try:
+                self._first = max(0.0, min(1.0, float(first)))
+                self._last = max(0.0, min(1.0, float(last)))
+            except (TypeError, ValueError):
+                self._first = 0.0
+                self._last = 1.0
+            self._set_hidden((self._last - self._first) >= 0.999)
+            self._redraw()
+
+        def _set_hidden(self, should_hide: bool) -> None:
+            if should_hide == self._hidden:
+                return
+            parent = self.master
+            info = self.grid_info()
+            if should_hide:
+                if not info:
+                    return
+                try:
+                    column = int(info.get("column", self._hidden_column or 0))
+                    self._hidden_column = column
+                    parent.grid_columnconfigure(column, minsize=0)
+                except (tk.TclError, TypeError, ValueError):
+                    pass
+                self.configure(width=0)
+                self.itemconfigure(self._track_id, state="hidden")
+                self.itemconfigure(self._thumb_id, state="hidden")
+                self._hidden = True
+                return
+            column = self._hidden_column
+            if column is not None:
+                try:
+                    parent.grid_columnconfigure(column, minsize=self._width)
+                except tk.TclError:
+                    pass
+            self.configure(width=self._width)
+            self.itemconfigure(self._track_id, state="normal")
+            self._hidden = False
+
+        def _thumb_bounds(self) -> Tuple[int, int]:
+            height = max(1, int(self.winfo_height()))
+            pad = 2
+            track_height = max(1, height - (pad * 2))
+            page = max(0.0, min(1.0, self._last - self._first))
+            if page >= 0.999:
+                return (0, 0)
+            thumb_height = max(28, int(track_height * page))
+            thumb_height = min(track_height, thumb_height)
+            max_first = max(0.001, 1.0 - page)
+            top = pad + int((track_height - thumb_height) * (self._first / max_first))
+            bottom = min(height - pad, top + thumb_height)
+            return (top, bottom)
+
+        def _redraw(self) -> None:
+            width = max(1, int(self.winfo_width() or self._width))
+            height = max(1, int(self.winfo_height()))
+            self.coords(self._track_id, 0, 0, width, height)
+            top, bottom = self._thumb_bounds()
+            if bottom <= top:
+                self.itemconfigure(self._thumb_id, state="hidden")
+                return
+            self.itemconfigure(self._thumb_id, state="normal")
+            self.coords(self._thumb_id, 2, top, max(3, width - 2), bottom)
+
+        def _on_press(self, event: Any) -> None:
+            top, bottom = self._thumb_bounds()
+            if bottom > top and top <= int(event.y) <= bottom:
+                self._drag_offset = int(event.y) - top
+                self.itemconfigure(self._thumb_id, fill=self._theme.accent)
+                return
+            if int(event.y) < top:
+                self._command("scroll", -1, "pages")
+            else:
+                self._command("scroll", 1, "pages")
+
+        def _on_drag(self, event: Any) -> None:
+            top, bottom = self._thumb_bounds()
+            if bottom <= top:
+                return
+            height = max(1, int(self.winfo_height()))
+            pad = 2
+            track_height = max(1, height - (pad * 2))
+            thumb_height = bottom - top
+            movable = max(1, track_height - thumb_height)
+            page = max(0.0, min(1.0, self._last - self._first))
+            max_first = max(0.0, 1.0 - page)
+            requested_top = int(event.y) - self._drag_offset
+            clamped_top = max(pad, min(pad + movable, requested_top))
+            new_first = ((clamped_top - pad) / movable) * max_first
+            self._command("moveto", f"{new_first:.6f}")
+
+        def _on_release(self, _event: Any) -> None:
+            thumb = self._theme.muted if self._theme.is_dark else self._theme.border
+            self.itemconfigure(self._thumb_id, fill=thumb)
 
 
 OPENAI_MODEL = "gpt-4o-mini"
@@ -6543,7 +6686,7 @@ def open_journal_window_editor(
         fill="both",
         expand=True,
         padx=t_init.pad_outer,
-        pady=(0, t_init.pad_center_y),
+        pady=(0, t_init.pad_center_y + JOURNAL_WINDOW_CONSOLE_RESERVE_BOTTOM),
     )
     center.grid_columnconfigure(0, weight=2)
     center.grid_columnconfigure(1, weight=2)
@@ -6583,19 +6726,15 @@ def open_journal_window_editor(
         highlightbackground=t_init.border,
         highlightcolor=t_init.accent,
     )
-    scroll_bar = tk.Scrollbar(
+    scroll_bar = JournalSlimScrollbar(
         editor_frame,
         command=text_box.yview,
-        bg=t_init.panel,
-        troughcolor=t_init.field,
-        activebackground=t_init.accent,
-        bd=0,
-        highlightthickness=0,
-        width=11,
+        theme=t_init,
+        width=JOURNAL_TEXT_SCROLLBAR_WIDTH,
     )
     text_box.configure(yscrollcommand=scroll_bar.set)
     text_box.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=12)
-    scroll_bar.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=12)
+    scroll_bar.grid(row=0, column=1, sticky="nsew", padx=(0, 12), pady=12)
     text_box.insert("1.0", draft_text)
     text_box.focus_set()
     root.after(50, text_box.focus_set)
@@ -6726,6 +6865,7 @@ def open_journal_window_editor(
     stt_frame.grid_rowconfigure(0, weight=0)
     stt_frame.grid_rowconfigure(1, weight=1)
     stt_frame.grid_columnconfigure(0, weight=1)
+    stt_frame.grid_columnconfigure(1, minsize=JOURNAL_TEXT_SCROLLBAR_WIDTH)
     stt_frame.grid_columnconfigure(2, minsize=JOURNAL_SIDE_ACTION_GRID_MINSIZE)
     stt_outer.grid_rowconfigure(2, weight=1)
 
@@ -6757,21 +6897,17 @@ def open_journal_window_editor(
         highlightbackground=t_init.border,
         highlightcolor=t_init.accent,
     )
-    stt_scroll = tk.Scrollbar(
+    stt_scroll = JournalSlimScrollbar(
         stt_frame,
         command=stt_box.yview,
-        bg=t_init.panel,
-        troughcolor=t_init.field,
-        activebackground=t_init.accent,
-        bd=0,
-        highlightthickness=0,
-        width=11,
+        theme=t_init,
+        width=JOURNAL_TEXT_SCROLLBAR_WIDTH,
     )
     stt_box.configure(yscrollcommand=stt_scroll.set)
     stt_box.grid(row=1, column=0, sticky="nsew", padx=(10, 0), pady=(4, 10))
-    stt_scroll.grid(row=1, column=1, sticky="ns", padx=(0, 2), pady=(4, 10))
+    stt_scroll.grid(row=1, column=1, sticky="nsew", padx=(0, 2), pady=(4, 10))
     transcribe_hover = tk.Frame(stt_frame, bg=t_init.panel)
-    transcribe_hover.grid(row=1, column=2, sticky="ns", padx=(2, 10), pady=(4, 10))
+    transcribe_hover.grid(row=1, column=2, sticky="nsew", padx=(2, 10), pady=(4, 10))
     _tid = t_init.transcribe_idle_disabled_config()
     transcription_model_combo_map: Dict[str, str] = {}
     transcription_model_selector_is_combo = False
@@ -6897,6 +7033,7 @@ def open_journal_window_editor(
     report_frame.grid(row=1, column=0, sticky="nsew")
     report_frame.grid_rowconfigure(0, weight=1)
     report_frame.grid_columnconfigure(0, weight=1)
+    report_frame.grid_columnconfigure(1, minsize=JOURNAL_TEXT_SCROLLBAR_WIDTH)
     report_frame.grid_columnconfigure(2, minsize=JOURNAL_SIDE_ACTION_GRID_MINSIZE)
     report_box = tk.Text(
         report_frame,
@@ -6916,26 +7053,26 @@ def open_journal_window_editor(
         highlightbackground=t_init.border,
         highlightcolor=t_init.accent,
     )
-    report_scroll = tk.Scrollbar(
+    report_scroll = JournalSlimScrollbar(
         report_frame,
         command=report_box.yview,
-        bg=t_init.panel,
-        troughcolor=t_init.field,
-        activebackground=t_init.accent,
-        bd=0,
-        highlightthickness=0,
-        width=11,
+        theme=t_init,
+        width=JOURNAL_TEXT_SCROLLBAR_WIDTH,
     )
     report_box.configure(yscrollcommand=report_scroll.set)
     report_box.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=(4, 10))
-    report_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 2), pady=(4, 10))
+    report_scroll.grid(row=0, column=1, sticky="nsew", padx=(0, 2), pady=(4, 10))
     gen_report_hover = tk.Frame(report_frame, bg=t_init.panel)
-    gen_report_hover.grid(row=0, column=2, sticky="ns", padx=(2, 10), pady=(4, 10))
+    gen_report_hover.grid(row=0, column=2, sticky="nsew", padx=(2, 10), pady=(4, 10))
     _, _gn, _gf, _gab, _gaf = t_init.gen_bind_rest()
+    gen_report_btn_row = tk.Frame(gen_report_hover, bg=t_init.panel)
+    gen_report_btn_row.pack(fill="x")
+    gen_report_btn_row.grid_columnconfigure(0, weight=1)
+    gen_report_btn_row.grid_columnconfigure(1, minsize=max(1, transcribe_model_btn.winfo_reqwidth()))
     gen_button = tk.Button(
-        gen_report_hover,
+        gen_report_btn_row,
         text="Generate report",
-        width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH,
+        width=JOURNAL_SIDE_ACTION_BTN_WIDTH_CH - 3,
         bg=_gn,
         fg=_gf,
         activebackground=_gab,
@@ -6946,8 +7083,37 @@ def open_journal_window_editor(
         pady=8,
         cursor="hand2",
     )
-    gen_button.pack()
+    gen_button.grid(row=0, column=0, columnspan=2, sticky="ew")
     report_box.insert("1.0", draft_report)
+
+    def _sync_journal_side_action_columns() -> None:
+        try:
+            root.update_idletasks()
+            action_width = max(
+                JOURNAL_SIDE_ACTION_GRID_MINSIZE,
+                int(transcribe_hover.winfo_reqwidth()),
+                int(transcribe_hover.winfo_width()),
+                int(transcribe_btn_row.winfo_reqwidth()),
+                int(transcribe_file_btn_row.winfo_reqwidth()),
+                int(receive_iphone_btn_row.winfo_reqwidth()),
+                int(gen_report_hover.winfo_reqwidth()),
+                int(gen_report_hover.winfo_width()),
+                int(gen_report_btn_row.winfo_reqwidth()),
+                int(gen_button.winfo_reqwidth()),
+            )
+            stt_frame.grid_columnconfigure(1, minsize=JOURNAL_TEXT_SCROLLBAR_WIDTH)
+            report_frame.grid_columnconfigure(1, minsize=JOURNAL_TEXT_SCROLLBAR_WIDTH)
+            stt_frame.grid_columnconfigure(2, minsize=action_width)
+            report_frame.grid_columnconfigure(2, minsize=action_width)
+            transcribe_hover.configure(width=action_width)
+            gen_report_hover.configure(width=action_width)
+            root.update_idletasks()
+        except tk.TclError:
+            pass
+
+    root.after_idle(_sync_journal_side_action_columns)
+    root.after(250, _sync_journal_side_action_columns)
+    root.after(1000, _sync_journal_side_action_columns)
 
     placeholder_frames: List[Any] = []
     placeholder_title_labels: List[Any] = []
@@ -12347,8 +12513,14 @@ def open_journal_window_editor(
         t = th()
         _update_iphone_receive_button()
         _refresh_transcription_model_selectors()
+        root.after_idle(_sync_journal_side_action_columns)
 
-        for row in (transcribe_btn_row, transcribe_file_btn_row, receive_iphone_btn_row):
+        for row in (
+            transcribe_btn_row,
+            transcribe_file_btn_row,
+            receive_iphone_btn_row,
+            gen_report_btn_row,
+        ):
             row.configure(bg=t.panel)
 
         def _set_model_buttons_enabled(enabled: bool) -> None:
@@ -13353,7 +13525,7 @@ def open_journal_window_editor(
         pady=6,
         cursor="hand2",
     )
-    restore_draft_btn.grid(row=0, column=6, sticky="e", padx=(8, 12), pady=12)
+    restore_draft_btn.grid(row=0, column=6, sticky="e", padx=(8, 0), pady=12)
     bind_button_hover_if_enabled(
         restore_draft_btn,
         lambda: th().toolbar_bind_rest(),
@@ -14821,7 +14993,10 @@ def open_journal_window_editor(
             activeforeground=t.text,
         )
         center.configure(bg=t.surface)
-        center.pack_configure(padx=t.pad_outer, pady=(0, t.pad_center_y))
+        center.pack_configure(
+            padx=t.pad_outer,
+            pady=(0, t.pad_center_y + JOURNAL_WINDOW_CONSOLE_RESERVE_BOTTOM),
+        )
         left_col.configure(bg=t.surface)
         journal_title_lbl.configure(
             bg=t.surface, fg=t.muted, font=t.section_label_font
@@ -14834,7 +15009,7 @@ def open_journal_window_editor(
             highlightbackground=t.border,
             highlightcolor=t.accent,
         )
-        scroll_bar.config(bg=t.panel, troughcolor=t.field, activebackground=t.accent)
+        scroll_bar.configure_theme(t)
         right_col.configure(bg=t.surface)
         stt_outer.configure(bg=t.surface)
         stt_header.configure(bg=t.surface)
@@ -14864,7 +15039,7 @@ def open_journal_window_editor(
             highlightbackground=t.border,
             highlightcolor=t.accent,
         )
-        stt_scroll.config(bg=t.panel, troughcolor=t.field, activebackground=t.accent)
+        stt_scroll.configure_theme(t)
         _update_iphone_receive_button()
         report_outer.configure(bg=t.surface)
         report_header.configure(bg=t.surface)
@@ -14874,6 +15049,7 @@ def open_journal_window_editor(
         report_status.configure(bg=t.surface, fg=t.muted)
         report_frame.configure(bg=t.panel)
         gen_report_hover.configure(bg=t.panel)
+        gen_report_btn_row.configure(bg=t.panel)
         report_box.config(
             bg=t.field,
             fg=t.text,
@@ -14881,7 +15057,8 @@ def open_journal_window_editor(
             highlightbackground=t.border,
             highlightcolor=t.accent,
         )
-        report_scroll.config(bg=t.panel, troughcolor=t.field, activebackground=t.accent)
+        report_scroll.configure_theme(t)
+        root.after_idle(_sync_journal_side_action_columns)
         stt_lang_lbl.configure(bg=t.panel, fg=t.muted)
         if ttk is not None and _jw_style is not None:
             _jw_style.configure("Journal.TCombobox", **t.ttk_combobox_kwargs())
