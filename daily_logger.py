@@ -5,6 +5,7 @@ from datetime import date, datetime
 import base64
 import contextlib
 import ctypes
+import hashlib
 import html
 import hmac
 import io
@@ -2184,56 +2185,209 @@ def _multipart_form_data(
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
+def _companion_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return ""
+
+
+def _companion_alpha_bbox(image: Any) -> Optional[Tuple[int, int, int, int]]:
+    try:
+        return image.getchannel("A").getbbox()
+    except Exception:
+        return None
+
+
+def _companion_edge_alpha_ratio(image: Any) -> float:
+    try:
+        alpha = image.getchannel("A")
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return 1.0
+        points = []
+        step = max(1, min(width, height) // 96)
+        for x in range(0, width, step):
+            points.append((x, 0))
+            points.append((x, height - 1))
+        for y in range(0, height, step):
+            points.append((0, y))
+            points.append((width - 1, y))
+        if not points:
+            return 0.0
+        opaque = sum(1 for x, y in points if alpha.getpixel((x, y)) > 18)
+        return opaque / len(points)
+    except Exception:
+        return 1.0
+
+
+def _companion_average_rgba(image: Any) -> Tuple[float, float, float]:
+    try:
+        small = image.convert("RGBA").resize((48, 48))
+        pixels = list(small.getdata())
+        total_alpha = sum(pixel[3] for pixel in pixels if pixel[3] > 12)
+        if total_alpha <= 0:
+            return (0.0, 0.0, 0.0)
+        red = sum(pixel[0] * pixel[3] for pixel in pixels if pixel[3] > 12) / total_alpha
+        green = sum(pixel[1] * pixel[3] for pixel in pixels if pixel[3] > 12) / total_alpha
+        blue = sum(pixel[2] * pixel[3] for pixel in pixels if pixel[3] > 12) / total_alpha
+        return (red, green, blue)
+    except Exception:
+        return (0.0, 0.0, 0.0)
+
+
+def _normalize_companion_frame_image(
+    image: Any,
+    *,
+    canvas_size: int = 1024,
+    body_ratio: float = 0.82,
+) -> Optional[Any]:
+    try:
+        from PIL import Image
+
+        frame = image.convert("RGBA")
+        output = io.BytesIO()
+        frame.save(output, format="PNG", optimize=True)
+        frame = Image.open(io.BytesIO(_normalize_desktop_pet_image_bytes(output.getvalue()))).convert("RGBA")
+        bbox = _companion_alpha_bbox(frame)
+        if bbox is None:
+            return None
+        if _companion_edge_alpha_ratio(frame) > 0.08:
+            return None
+        crop = frame.crop(bbox)
+        body_w = max(1, bbox[2] - bbox[0])
+        body_h = max(1, bbox[3] - bbox[1])
+        if body_w <= 4 or body_h <= 4:
+            return None
+        try:
+            resample = Image.Resampling.LANCZOS
+        except AttributeError:
+            resample = Image.LANCZOS
+        target_body = int(canvas_size * max(0.50, min(0.90, body_ratio)))
+        scale = min(target_body / body_h, (canvas_size * 0.86) / body_w)
+        new_w = max(1, int(body_w * scale))
+        new_h = max(1, int(body_h * scale))
+        crop = crop.resize((new_w, new_h), resample)
+        canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+        x = max(0, (canvas_size - new_w) // 2)
+        y = max(0, int(canvas_size * 0.91) - new_h)
+        canvas.alpha_composite(crop, (x, y))
+        return canvas
+    except Exception:
+        return None
+
+
+def _companion_frames_consistent(frames: List[Any]) -> bool:
+    if len(frames) < 2:
+        return False
+    base_bbox = _companion_alpha_bbox(frames[0])
+    if base_bbox is None:
+        return False
+    base_w = max(1, base_bbox[2] - base_bbox[0])
+    base_h = max(1, base_bbox[3] - base_bbox[1])
+    base_color = _companion_average_rgba(frames[0])
+    for frame in frames:
+        bbox = _companion_alpha_bbox(frame)
+        if bbox is None:
+            return False
+        width = max(1, bbox[2] - bbox[0])
+        height = max(1, bbox[3] - bbox[1])
+        if not (0.72 <= width / base_w <= 1.28 and 0.72 <= height / base_h <= 1.28):
+            return False
+        if _companion_edge_alpha_ratio(frame) > 0.04:
+            return False
+        color = _companion_average_rgba(frame)
+        drift = sum((color[i] - base_color[i]) ** 2 for i in range(3)) ** 0.5
+        if drift > 78:
+            return False
+    return True
+
+
+def _write_companion_animation_manifest(
+    output_dir: Path,
+    frames: List[Path],
+    *,
+    source_hash: str,
+    method: str,
+    fps: int = 6,
+) -> None:
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "version": 1,
+            "fps": max(1, int(fps)),
+            "method": method,
+            "source_sha256": source_hash,
+            "frames": [path.name for path in frames],
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        (output_dir / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
 def _write_local_companion_idle_frames(source_path: Path, output_dir: Path, *, frame_count: int = 8) -> List[Path]:
     try:
         from PIL import Image
 
         output_dir.mkdir(parents=True, exist_ok=True)
+        for stale in output_dir.glob("idle_*.png"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
         source = Image.open(source_path).convert("RGBA")
+        source = _normalize_companion_frame_image(source)
+        if source is None:
+            return []
         try:
             resize_filter = Image.Resampling.LANCZOS
-            rotate_filter = Image.Resampling.BICUBIC
         except AttributeError:
             resize_filter = Image.LANCZOS
-            rotate_filter = Image.BICUBIC
         written: List[Path] = []
         for index in range(max(1, int(frame_count))):
             phase = (index / max(1, frame_count)) * math.pi * 2.0
-            scale_x = 1.0 + math.sin(phase) * 0.018
-            scale_y = 1.0 - math.sin(phase) * 0.014
-            frame = source.copy()
-            if index == frame_count // 2:
-                frame = frame.resize(
-                    (
-                        max(1, int(frame.width * 1.006)),
-                        max(1, int(frame.height * 0.992)),
-                    ),
-                    resize_filter,
-                )
-            else:
-                frame = frame.resize(
-                    (
-                        max(1, int(frame.width * scale_x)),
-                        max(1, int(frame.height * scale_y)),
-                    ),
-                    resize_filter,
-                )
-            angle = math.sin(phase + 0.45) * 1.8
-            try:
-                frame = frame.rotate(angle, resample=rotate_filter, expand=True, fillcolor=(0, 0, 0, 0))
-            except TypeError:
-                frame = frame.rotate(angle, resample=rotate_filter, expand=True)
-            output = io.BytesIO()
-            frame.save(output, format="PNG", optimize=True)
+            frame = Image.new("RGBA", source.size, (0, 0, 0, 0))
+            bbox = _companion_alpha_bbox(source)
+            if bbox is None:
+                return []
+            crop = source.crop(bbox)
+            scale_x = 1.0 + math.sin(phase) * 0.010
+            scale_y = 1.0 - math.sin(phase) * 0.008
+            crop = crop.resize(
+                (max(1, int(crop.width * scale_x)), max(1, int(crop.height * scale_y))),
+                resize_filter,
+            )
+            x = max(0, (source.width - crop.width) // 2)
+            y = max(0, int(source.height * 0.91) - crop.height)
+            frame.alpha_composite(crop, (x, y))
             frame_path = output_dir / f"idle_{index:02d}.png"
-            frame_path.write_bytes(_normalize_desktop_pet_image_bytes(output.getvalue()))
+            frame.save(frame_path, format="PNG", optimize=True)
             written.append(frame_path)
+        _write_companion_animation_manifest(
+            output_dir,
+            written,
+            source_hash=_companion_file_sha256(source_path),
+            method="local_fixed_anchor",
+        )
         return written
     except Exception:
         return []
 
 
-def _extract_companion_idle_frames_from_sheet(sheet_bytes: bytes, output_dir: Path) -> List[Path]:
+def _extract_companion_idle_frames_from_sheet(
+    sheet_bytes: bytes,
+    output_dir: Path,
+    *,
+    source_hash: str,
+) -> List[Path]:
     try:
         from PIL import Image
 
@@ -2242,17 +2396,37 @@ def _extract_companion_idle_frames_from_sheet(sheet_bytes: bytes, output_dir: Pa
         if width < 256 or height < 256:
             return []
         output_dir.mkdir(parents=True, exist_ok=True)
-        frames: List[Path] = []
-        cell_w = width // 2
-        cell_h = height // 2
-        for index, (col, row) in enumerate(((0, 0), (1, 0), (0, 1), (1, 1))):
+        for stale in output_dir.glob("idle_*.png"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        normalized_frames: List[Any] = []
+        columns = 4
+        rows = 2
+        cell_w = width // columns
+        cell_h = height // rows
+        for index in range(columns * rows):
+            col = index % columns
+            row = index // columns
             crop = sheet.crop((col * cell_w, row * cell_h, (col + 1) * cell_w, (row + 1) * cell_h))
-            output = io.BytesIO()
-            crop.save(output, format="PNG", optimize=True)
-            cleaned = _normalize_desktop_pet_image_bytes(output.getvalue())
+            normalized = _normalize_companion_frame_image(crop)
+            if normalized is None:
+                return []
+            normalized_frames.append(normalized)
+        if not _companion_frames_consistent(normalized_frames):
+            return []
+        frames: List[Path] = []
+        for index, frame in enumerate(normalized_frames):
             frame_path = output_dir / f"idle_{index:02d}.png"
-            frame_path.write_bytes(cleaned)
+            frame.save(frame_path, format="PNG", optimize=True)
             frames.append(frame_path)
+        _write_companion_animation_manifest(
+            output_dir,
+            frames,
+            source_hash=source_hash,
+            method="ai_sprite_sheet",
+        )
         return frames
     except Exception:
         return []
@@ -2273,17 +2447,21 @@ def _generate_companion_idle_frames(
         image_file, ref_err = _prepare_pet_reference_image(companion_image_path)
         if ref_err or image_file is None:
             return []
+        source_hash = _companion_file_sha256(companion_image_path)
         safe_name = re.sub(r"[^A-Za-z0-9 _-]+", "", str(name or "Companion")).strip() or "Companion"
         notes = re.sub(r"\s+", " ", str(design_prompt or "")).strip()
         prompt = (
-            "Create a 2x2 transparent PNG sprite sheet for the exact same companion in the uploaded image. "
+            "Create a 4 columns by 2 rows transparent PNG sprite sheet for the exact same companion in the uploaded image. "
             f"The companion is named {safe_name} and is level {max(1, int(level or 1))}. "
-            "Use four idle animation frames of the same character, same outfit, same colors, same face, "
-            "same accessories, same proportions, and same art style. Frame 1 neutral, frame 2 gentle breathing up, "
-            "frame 3 tiny blink or sway, frame 4 settle back down. Keep each frame centered in its own quadrant "
-            "with the same scale. Do not draw grid lines, borders, labels, text, UI, scene background, colored "
-            "canvas, shadow box, or frame numbers. The area behind the character must be transparent in every cell. "
-            "This sprite sheet will be split into animation frames, so consistency matters more than a dramatic pose."
+            "Use eight idle animation frames of the same character, same outfit, same colors, same face, "
+            "same accessories, same proportions, and same art style. The character must stay centered and the feet/body "
+            "anchor must remain in the same place in every frame. Use only tiny character motion: subtle breathing, "
+            "small blink, small eye or hair movement, and a gentle hand/ear/cloth shift if it already exists. "
+            "Do not move the whole character around the cell. Do not add glow, fire, particles, magic effects, props, "
+            "weapons, pets, scene background, landscape, floor, shadow box, colored canvas, borders, labels, text, UI, "
+            "grid lines, or frame numbers. The area behind the character must be transparent in every cell. "
+            "This sprite sheet will be split into animation frames, so frame-to-frame consistency is more important "
+            "than dramatic motion."
         )
         if notes:
             prompt += f" User editable design notes: {notes}"
@@ -2323,7 +2501,7 @@ def _generate_companion_idle_frames(
                 return []
             with request.urlopen(url, timeout=90) as image_response:
                 raw = image_response.read()
-        return _extract_companion_idle_frames_from_sheet(raw, output_dir)
+        return _extract_companion_idle_frames_from_sheet(raw, output_dir, source_hash=source_hash)
     except Exception:
         return []
 
@@ -2346,9 +2524,11 @@ def generate_desktop_pet_image(
         "readable at small desktop-icon size, high-resolution crisp details, antialiased edges, and at least "
         "8 percent transparent padding around the body. No text, no logo, no UI frame, no colored canvas "
         "border, no square background, no black/solid background, no scene, no room, no landscape, no "
-        "gradient backdrop, no shadow box. The pixels behind the character must be transparent. "
+        "gradient backdrop, no glow, no fire, no particles, no aura, no floating effects, no separate weapon "
+        "effects, no unrelated props, no shadow box. Only include accessories or held items if they are part of "
+        "the character design itself. The pixels behind the character must be transparent. "
         f"It is level {pet_level}; higher level means slightly more confident, brighter, and magical, "
-        "but still simple and friendly."
+        "but still simple and friendly, without external visual effects."
     )
     prompt = (
         "Create one original cute Q-style chibi desktop companion sprite named "
@@ -2373,7 +2553,8 @@ def generate_desktop_pet_image(
             "or default cute blob. If the uploaded image is a person, make a chibi version of that person. "
             "If it is an animal, object, robot, or fantasy creature, make a chibi version of that exact "
             "subject. Keep it original and non-infringing, but reference resemblance is more important "
-            "than the default mascot direction. "
+            "than the default mascot direction. Remove backgrounds, glow effects, fire, particles, extra props, "
+            "and decorative scene elements from the reference; keep only the character/body design. "
             + sprite_rules
         )
         if notes:
@@ -9270,19 +9451,6 @@ def open_journal_window_editor(
             seconds=8,
         )
 
-    def _pet_motion_values(tick: int, *, scale: float = 1.0) -> Dict[str, float]:
-        phase = (max(0, int(tick)) % 72) / 72.0 * (math.pi * 2.0)
-        secondary = (max(0, int(tick)) % 120) / 120.0 * (math.pi * 2.0)
-        bob = -math.sin(phase) * 4.0 * scale
-        stretch = math.sin(phase) * 0.026 * scale
-        return {
-            "bob": bob,
-            "angle": (math.sin(secondary) * 3.2 + math.sin(phase * 2.0) * 0.7) * scale,
-            "scale_x": max(0.88, 1.0 + stretch),
-            "scale_y": max(0.88, 1.0 - stretch * 0.82),
-            "shadow": max(0.78, min(1.16, 1.0 + stretch * 1.8)),
-        }
-
     def _load_pet_photo(
         cache_name: str,
         max_size: Tuple[int, int],
@@ -9303,25 +9471,29 @@ def open_journal_window_editor(
 
             try:
                 resize_filter = Image.Resampling.LANCZOS
-                rotate_filter = Image.Resampling.BICUBIC
             except AttributeError:
                 resize_filter = Image.LANCZOS
-                rotate_filter = Image.BICUBIC
-            frame = (int(tick) // 2) % 36 if animate else 0
+            frame = 0
             frame_path = path
-            generated_frame = False
             if animate:
                 animation_dir = path.parent / "animation"
                 idle_frames = sorted(animation_dir.glob("idle_*.png")) if animation_dir.exists() else []
                 if idle_frames:
-                    frame_path = idle_frames[(int(tick) // 5) % len(idle_frames)]
-                    generated_frame = True
+                    manifest_ok = True
+                    manifest_path = animation_dir / "manifest.json"
+                    if manifest_path.exists():
+                        try:
+                            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                            source_hash = str(manifest.get("source_sha256") or "").strip()
+                            manifest_ok = not source_hash or source_hash == _companion_file_sha256(path)
+                        except Exception:
+                            manifest_ok = False
+                    if manifest_ok:
+                        frame = (int(tick) // 5) % len(idle_frames)
+                        frame_path = idle_frames[frame]
             stat = frame_path.stat()
             fingerprint = f"{stat.st_mtime_ns}:{stat.st_size}"
-            key = (
-                f"{cache_name}:{frame_path}:{fingerprint}:{max_size[0]}x{max_size[1]}:"
-                f"a{1 if animate and not generated_frame else 0}:f{frame}"
-            )
+            key = f"{cache_name}:{frame_path}:{fingerprint}:{max_size[0]}x{max_size[1]}:f{frame}"
             cached = pet_image_cache.get(key)
             if cached is not None:
                 return cached
@@ -9336,18 +9508,6 @@ def open_journal_window_editor(
                 pet_image_cache[source_key] = source.copy()
             image = source.copy()
             image.thumbnail(max_size, resize_filter)
-            if animate and not generated_frame and image.width > 0 and image.height > 0:
-                motion = _pet_motion_values(tick)
-                new_w = max(1, int(image.width * motion["scale_x"]))
-                new_h = max(1, int(image.height * motion["scale_y"]))
-                if new_w != image.width or new_h != image.height:
-                    image = image.resize((new_w, new_h), resize_filter)
-                angle = float(motion.get("angle", 0.0) or 0.0)
-                if abs(angle) >= 0.1:
-                    try:
-                        image = image.rotate(angle, resample=rotate_filter, expand=True, fillcolor=(0, 0, 0, 0))
-                    except TypeError:
-                        image = image.rotate(angle, resample=rotate_filter, expand=True)
             photo = ImageTk.PhotoImage(image)
             stale = [
                 k
@@ -9392,7 +9552,6 @@ def open_journal_window_editor(
         level, current_xp, needed_xp = _desktop_pet_level()
         breath = 4 if (tick // 12) % 2 == 0 else 0
         blink = (tick % 80) in (0, 1, 2)
-        motion = _pet_motion_values(tick, scale=1.25)
         y = (
             max(20.0, min(float(height - 132), float(pet_stage_drag_state.get("y", 0.0) or 0.0)))
             if pet_stage_drag_state.get("dragging")
@@ -9401,16 +9560,15 @@ def open_journal_window_editor(
         pet_stage_drag_state["hitbox"] = (x - 28, y, x + 132, y + 132)
         photo = _load_pet_photo("stage", (154, 154), tick=tick, animate=not bool(pet_stage_drag_state.get("dragging")))
         if photo is not None:
-            shadow_scale = float(motion.get("shadow", 1.0) or 1.0)
             pet_stage.create_oval(
-                x - (28 * shadow_scale),
+                x - 28,
                 y + 84,
-                x + 132 + (16 * (shadow_scale - 1.0)),
+                x + 132,
                 y + 126,
                 fill=t.panel,
                 outline="",
             )
-            pet_stage.create_image(x + 52, y + 68 + float(motion.get("bob", 0.0) or 0.0), image=photo)
+            pet_stage.create_image(x + 52, y + 68, image=photo)
             bubble_text = _active_pet_bubble_text()
             if bubble_text:
                 bubble_x = max(18, min(width - 258, x + 124))
@@ -9506,7 +9664,6 @@ def open_journal_window_editor(
             breath = 2 if (tick // 12) % 2 == 0 else 0
             blink = (tick % 70) in (0, 1, 2)
             shadow = t.field
-            motion = _pet_motion_values(tick, scale=0.58)
             photo = _load_pet_photo(
                 "journal",
                 (59, 59),
@@ -9514,16 +9671,15 @@ def open_journal_window_editor(
                 animate=not bool(journal_pet_state.get("dragging")),
             )
             if photo is not None:
-                shadow_scale = float(motion.get("shadow", 1.0) or 1.0)
                 journal_pet_canvas.create_oval(
-                    24 - (4 * shadow_scale),
+                    24,
                     43,
-                    82 + (4 * shadow_scale),
+                    82,
                     55,
                     fill=shadow,
                     outline="",
                 )
-                journal_pet_canvas.create_image(53, 28 + float(motion.get("bob", 0.0) or 0.0), image=photo)
+                journal_pet_canvas.create_image(53, 28, image=photo)
                 hitbox = (18.0, 2.0, 88.0, 56.0)
             else:
                 body = "#8FE6D6" if level < 5 else "#B8A2FF"
@@ -10069,8 +10225,7 @@ def open_journal_window_editor(
                 return
             tick = int(pet_overlay_state.get("tick", 0) or 0)
             level, _current_xp, _needed_xp = _desktop_pet_level()
-            motion = _pet_motion_values(tick, scale=1.05)
-            bounce = int(round(-float(motion.get("bob", 0.0) or 0.0)))
+            bounce = 0
             bubble_text = _active_pet_bubble_text()
             photo = _load_pet_photo(
                 "overlay",
@@ -10079,11 +10234,10 @@ def open_journal_window_editor(
                 animate=not bool(pet_overlay_state.get("dragging")),
             )
             if photo is not None:
-                shadow_scale = float(motion.get("shadow", 1.0) or 1.0)
                 canvas.create_oval(
-                    14 - (8 * shadow_scale),
+                    14,
                     96,
-                    134 + (8 * shadow_scale),
+                    134,
                     132,
                     fill="#2A2D44",
                     outline="",
@@ -10092,7 +10246,7 @@ def open_journal_window_editor(
                     _draw_pet_bubble(canvas, 8, 4, bubble_text, width_chars=16)
                 canvas.create_image(
                     74,
-                    (88 if bubble_text else 64) + float(motion.get("bob", 0.0) or 0.0),
+                    88 if bubble_text else 64,
                     image=photo,
                 )
                 return
