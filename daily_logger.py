@@ -107,6 +107,7 @@ COMPANION_INCOMING_DIR = COMPANION_ROOT_DIR / "_incoming"
 LEGACY_DESKTOP_PET_ASSET_DIR = USER_DATA_ROOT / "desktop_pet"
 DESKTOP_PET_ASSET_DIR = COMPANION_ROOT_DIR
 DESKTOP_PET_MODULE_DIR = COMPANION_ROOT_DIR / "modules"
+COMPANION_FEATURE_ENABLED = False
 LEGACY_DATA_DIR = BASE_DIR / "daily_logs"
 LEGACY_SETTINGS_DIR = BASE_DIR / "settings"
 MASTER_JOURNAL_SHEET = "Master Journal"
@@ -342,7 +343,6 @@ SIDEBAR_DEFAULT_MODULE_ORDER = (
     "journal",
     "ai_recap",
     "chatbot",
-    "desktop_pet",
     "console",
     "reader",
     "settings",
@@ -6513,11 +6513,12 @@ def open_journal_window_editor(
             button_row.lift()
 
     def show_page(page_key: str) -> None:
+        if page_key == "desktop_pet" and not COMPANION_FEATURE_ENABLED:
+            page_key = "journal"
         page_map = {
             "journal": journal_page,
             "ai_recap": ai_recap_page,
             "chatbot": chatbot_page,
-            "desktop_pet": desktop_pet_page,
             "console": console_page,
             "settings": settings_page,
             "module_library": module_library_page,
@@ -6540,10 +6541,11 @@ def open_journal_window_editor(
             _refresh_sidebar_module_styles()
         except NameError:
             pass
-        try:
-            _draw_journal_pet()
-        except NameError:
-            pass
+        if COMPANION_FEATURE_ENABLED:
+            try:
+                _draw_journal_pet()
+            except NameError:
+                pass
 
     page_toggle_buttons: List[Any] = []
     nav_summon_btn = tk.Button(
@@ -8058,7 +8060,11 @@ def open_journal_window_editor(
             return legacy_state
         return _default_companion_state(active=False)
 
-    pet_state = _load_desktop_pet_state()
+    pet_state = (
+        _load_desktop_pet_state()
+        if COMPANION_FEATURE_ENABLED
+        else _default_companion_state(active=False)
+    )
     pet_anim_state = {"tick": 0, "x": 42.0, "direction": 1}
     pet_art_busy = {"v": False}
     pet_chat_busy = {"v": False}
@@ -8982,6 +8988,8 @@ def open_journal_window_editor(
     pet_session_seen_units = {"v": _current_pet_feed_units()}
 
     def _add_desktop_pet_xp(amount: int, *, save: bool = True) -> None:
+        if not COMPANION_FEATURE_ENABLED:
+            return
         gain = max(0, int(amount))
         if gain <= 0:
             return
@@ -9004,6 +9012,8 @@ def open_journal_window_editor(
         _refresh_desktop_pet_ui()
 
     def _feed_desktop_pet_from_current_entry(*, force: bool = False) -> None:
+        if not COMPANION_FEATURE_ENABLED:
+            return
         if not bool(pet_state.get("active", False)):
             return
         units = _current_pet_feed_units()
@@ -9022,6 +9032,8 @@ def open_journal_window_editor(
             _set_pet_bubble(tr("pet.bubble_writing"), seconds=5)
 
     def _feed_desktop_pet_on_save(journal_text: str, speech_text: str, report_text: str) -> None:
+        if not COMPANION_FEATURE_ENABLED:
+            return
         if not bool(pet_state.get("active", False)):
             return
         total_units = len(re.sub(r"\s+", "", f"{journal_text} {speech_text} {report_text}"))
@@ -9075,6 +9087,8 @@ def open_journal_window_editor(
             return None
 
     def _draw_desktop_pet() -> None:
+        if not COMPANION_FEATURE_ENABLED:
+            return
         t = th()
         pet_stage.delete("all")
         width = max(280, int(pet_stage.winfo_width() or 520))
@@ -9145,6 +9159,8 @@ def open_journal_window_editor(
             _draw_pet_bubble(pet_stage, bubble_x, max(54, y - 20), bubble_text, width_chars=28)
 
     def _journal_pet_visible_now() -> bool:
+        if not COMPANION_FEATURE_ENABLED:
+            return False
         try:
             if root.state() in ("withdrawn", "iconic"):
                 return False
@@ -9186,6 +9202,8 @@ def open_journal_window_editor(
             return
 
     def _draw_journal_pet() -> None:
+        if not COMPANION_FEATURE_ENABLED:
+            return
         if not _journal_pet_visible_now():
             try:
                 journal_pet_canvas.delete("all")
@@ -9248,6 +9266,8 @@ def open_journal_window_editor(
             pass
 
     def _refresh_desktop_pet_ui() -> None:
+        if not COMPANION_FEATURE_ENABLED:
+            return
         active = bool(pet_state.get("active", False))
         if active and not _profile_dir_has_companion(COMPANION_CURRENT_DIR):
             pet_state.clear()
@@ -9986,40 +10006,43 @@ def open_journal_window_editor(
         except tk.TclError:
             return
 
-    pet_feed_btn.config(command=lambda: _feed_desktop_pet_from_current_entry(force=True))
-    pet_art_btn.config(command=_generate_desktop_pet_look)
-    pet_art_ref_btn.config(command=_generate_desktop_pet_look_from_image)
-    pet_name_save_btn.config(command=_save_companion_name)
-    pet_name_entry.bind("<Return>", lambda _event: (_save_companion_name(), "break")[1])
-    pet_desktop_btn.config(command=_toggle_desktop_pet_mode, state="normal", cursor="hand2")
-    pet_journal_btn.config(command=_toggle_journal_pet_visible, state="normal", cursor="hand2")
-    pet_export_btn.config(command=_export_current_companion_profile, state="normal", cursor="hand2")
-    pet_import_btn.config(command=_import_companion_profile, state="normal", cursor="hand2")
-    pet_folder_btn.config(command=_open_companion_folder, state="normal", cursor="hand2")
-    pet_delete_btn.config(command=_delete_current_companion, state="normal", cursor="hand2")
-    pet_bubble_btn.config(command=_toggle_pet_bubble_module)
-    pet_memory_btn.config(command=_toggle_pet_memory_module)
-    pet_tts_btn.config(command=_toggle_pet_tts_module)
-    pet_chat_btn.config(command=_toggle_pet_chat_module)
-    pet_chat_ask_btn.config(command=_ask_pet_chat)
-    pet_chat_entry.bind("<Return>", lambda _event: (_ask_pet_chat(), "break")[1])
-    pet_stage.bind("<ButtonPress-1>", _on_pet_stage_press, add="+")
-    pet_stage.bind("<B1-Motion>", _on_pet_stage_motion, add="+")
-    pet_stage.bind("<ButtonRelease-1>", _on_pet_stage_release, add="+")
-    journal_pet_canvas.bind("<ButtonPress-1>", _on_journal_pet_press, add="+")
-    journal_pet_canvas.bind("<B1-Motion>", _on_journal_pet_motion, add="+")
-    journal_pet_canvas.bind("<ButtonRelease-1>", _on_journal_pet_release, add="+")
-    journal_pet_canvas.bind("<Button-3>", lambda _event: (_toggle_journal_pet_visible(), "break")[1], add="+")
-    journal_page.bind("<Configure>", lambda _event: root.after_idle(_draw_journal_pet), add="+")
-    _refresh_desktop_pet_ui()
-    _refresh_pet_art_button()
-    _refresh_pet_module_ui()
-    root.after(120, _tick_desktop_pet)
-    root.after(120, _tick_pet_overlay)
-    journal_cleanup_callbacks.append(_destroy_pet_overlay)
-    journal_cleanup_callbacks.append(_destroy_journal_pet_window)
-    if bool(pet_state.get("desktop_enabled", False)):
-        root.after(500, lambda: _show_pet_overlay(drop=False))
+    if COMPANION_FEATURE_ENABLED:
+        pet_feed_btn.config(command=lambda: _feed_desktop_pet_from_current_entry(force=True))
+        pet_art_btn.config(command=_generate_desktop_pet_look)
+        pet_art_ref_btn.config(command=_generate_desktop_pet_look_from_image)
+        pet_name_save_btn.config(command=_save_companion_name)
+        pet_name_entry.bind("<Return>", lambda _event: (_save_companion_name(), "break")[1])
+        pet_desktop_btn.config(command=_toggle_desktop_pet_mode, state="normal", cursor="hand2")
+        pet_journal_btn.config(command=_toggle_journal_pet_visible, state="normal", cursor="hand2")
+        pet_export_btn.config(command=_export_current_companion_profile, state="normal", cursor="hand2")
+        pet_import_btn.config(command=_import_companion_profile, state="normal", cursor="hand2")
+        pet_folder_btn.config(command=_open_companion_folder, state="normal", cursor="hand2")
+        pet_delete_btn.config(command=_delete_current_companion, state="normal", cursor="hand2")
+        pet_bubble_btn.config(command=_toggle_pet_bubble_module)
+        pet_memory_btn.config(command=_toggle_pet_memory_module)
+        pet_tts_btn.config(command=_toggle_pet_tts_module)
+        pet_chat_btn.config(command=_toggle_pet_chat_module)
+        pet_chat_ask_btn.config(command=_ask_pet_chat)
+        pet_chat_entry.bind("<Return>", lambda _event: (_ask_pet_chat(), "break")[1])
+        pet_stage.bind("<ButtonPress-1>", _on_pet_stage_press, add="+")
+        pet_stage.bind("<B1-Motion>", _on_pet_stage_motion, add="+")
+        pet_stage.bind("<ButtonRelease-1>", _on_pet_stage_release, add="+")
+        journal_pet_canvas.bind("<ButtonPress-1>", _on_journal_pet_press, add="+")
+        journal_pet_canvas.bind("<B1-Motion>", _on_journal_pet_motion, add="+")
+        journal_pet_canvas.bind("<ButtonRelease-1>", _on_journal_pet_release, add="+")
+        journal_pet_canvas.bind("<Button-3>", lambda _event: (_toggle_journal_pet_visible(), "break")[1], add="+")
+        journal_page.bind("<Configure>", lambda _event: root.after_idle(_draw_journal_pet), add="+")
+        _refresh_desktop_pet_ui()
+        _refresh_pet_art_button()
+        _refresh_pet_module_ui()
+        root.after(120, _tick_desktop_pet)
+        root.after(120, _tick_pet_overlay)
+        journal_cleanup_callbacks.append(_destroy_pet_overlay)
+        journal_cleanup_callbacks.append(_destroy_journal_pet_window)
+        if bool(pet_state.get("desktop_enabled", False)):
+            root.after(500, lambda: _show_pet_overlay(drop=False))
+    else:
+        journal_cleanup_callbacks.append(_destroy_journal_pet_window)
 
     def _sync_journal_side_action_columns() -> None:
         try:
@@ -17392,9 +17415,8 @@ def open_journal_window_editor(
             show_page("chatbot")
             console_append("Switched to Chatbot page.")
             return
-        if cmd in {"PET", "DESKTOP PET", "桌宠"}:
-            show_page("desktop_pet")
-            console_append("Switched to Companion page.")
+        if cmd in {"PET", "DESKTOP PET", "桌宠", "COMPANION"}:
+            console_append("Companion has been removed from this build. The saved version is on the companion archive branch.")
             return
         if cmd == "CONSOLE":
             if sys.platform != "win32":
@@ -18218,7 +18240,6 @@ def open_journal_window_editor(
         "journal": {"label_key": "nav.journal", "fallback_en": "Journal", "fallback_zh": "日记", "page": "journal"},
         "ai_recap": {"label_key": "nav.ai_recap", "fallback_en": "AI Recap", "fallback_zh": "AI 回顾", "page": "ai_recap"},
         "chatbot": {"label_key": "nav.chatbot", "fallback_en": "Chatbot", "fallback_zh": "聊天助手", "page": "chatbot"},
-        "desktop_pet": {"label_key": "nav.desktop_pet", "fallback_en": "Companion", "fallback_zh": "桌宠", "page": "desktop_pet"},
         "console": {"label_key": "nav.console", "fallback_en": "Console", "fallback_zh": "控制台", "page": "console"},
         "reader": {
             "label_key": "nav.virtual_reader",
@@ -18247,7 +18268,7 @@ def open_journal_window_editor(
 
     def _default_sidebar_slots() -> List[str]:
         slots = [""] * SIDEBAR_TOTAL_SLOT_COUNT
-        for index, module_id in enumerate(("journal", "ai_recap", "chatbot", "desktop_pet", "console")):
+        for index, module_id in enumerate(("journal", "ai_recap", "chatbot", "console")):
             if index < SIDEBAR_TOP_SLOT_COUNT:
                 slots[index] = module_id
         slots[SIDEBAR_TOP_SLOT_COUNT] = "reader"
@@ -18342,8 +18363,6 @@ def open_journal_window_editor(
                 used.add(module_id)
         normalized = _normalize_sidebar_module_order(order)
         if not bool(prefs.get(SIDEBAR_DESKTOP_PET_MIGRATION_PREF_KEY, False)):
-            if _insert_sidebar_module_once(normalized, "desktop_pet", after="chatbot"):
-                prefs[SIDEBAR_MODULE_ORDER_PREF_KEY] = json.dumps(normalized)
             prefs[SIDEBAR_DESKTOP_PET_MIGRATION_PREF_KEY] = True
             save_preferences(prefs)
         return normalized
