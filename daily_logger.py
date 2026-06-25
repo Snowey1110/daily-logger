@@ -36,7 +36,7 @@ import uuid
 import wave
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib import error, request
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -2052,6 +2052,9 @@ def _normalize_desktop_pet_image_bytes(raw: bytes) -> bytes:
         width, height = image.size
         if width <= 0 or height <= 0:
             return raw
+        fast_cutout = _fast_clean_companion_cutout_image_bytes(image)
+        if fast_cutout is not None:
+            return fast_cutout
         pixels = image.load()
         edge_points: List[Tuple[int, int]] = []
         step = max(1, min(width, height) // 96)
@@ -2081,8 +2084,18 @@ def _normalize_desktop_pet_image_bytes(raw: bytes) -> bytes:
         def _near_background(rgb: Tuple[int, int, int], *, loose: bool = False) -> bool:
             if base_color is None:
                 return False
-            threshold = 58 if loose else 44
+            threshold = 104 if loose else 54
             return _dist2(rgb, base_color) <= threshold * threshold
+
+        def _brightness(rgb: Tuple[int, int, int]) -> float:
+            return (int(rgb[0]) + int(rgb[1]) + int(rgb[2])) / 3.0
+
+        def _looks_like_line_art(rgb: Tuple[int, int, int]) -> bool:
+            return _brightness(rgb) <= 62 and (max(rgb) - min(rgb)) >= 8
+
+        def _looks_like_chroma_green(rgb: Tuple[int, int, int]) -> bool:
+            r, g, b = rgb
+            return g >= 125 and r <= 105 and b <= 190 and (g - r) >= 45 and (g - b) >= 20
 
         # Remove any edge-connected generated background first. This catches the
         # occasional colored square/halo even when the model ignored transparency.
@@ -2098,32 +2111,159 @@ def _normalize_desktop_pet_image_bytes(raw: bytes) -> bytes:
                 pixels[x, y] = (r, g, b, 0)
             elif not _near_background((r, g, b), loose=True):
                 continue
+            elif _looks_like_line_art((r, g, b)):
+                continue
             else:
                 pixels[x, y] = (r, g, b, 0)
             stack.extend(((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)))
 
-        # Fade tiny leftover edge halos that sit directly against transparent
-        # pixels, without touching the solid character body.
-        transparent_neighbors: List[Tuple[int, int, int, int]] = []
-        for y in range(height):
-            for x in range(width):
-                r, g, b, a = pixels[x, y]
-                if a <= 0 or not _near_background((r, g, b), loose=True):
-                    continue
-                near_clear = False
-                for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-                    if 0 <= nx < width and 0 <= ny < height and pixels[nx, ny][3] <= 8:
-                        near_clear = True
-                        break
-                if near_clear:
-                    transparent_neighbors.append((x, y, r, g, b))
-        for x, y, r, g, b in transparent_neighbors:
-            distance = _dist2((r, g, b), base_color) if base_color is not None else 999999
-            if distance <= 42 * 42:
+        def _has_clear_neighbor(px: int, py: int, *, radius: int = 1) -> bool:
+            for ny in range(max(0, py - radius), min(height, py + radius + 1)):
+                for nx in range(max(0, px - radius), min(width, px + radius + 1)):
+                    if nx == px and ny == py:
+                        continue
+                    if pixels[nx, ny][3] <= 8:
+                        return True
+            return False
+
+        rough_alpha = image.getchannel("A")
+        rough_bbox = rough_alpha.getbbox()
+        run_cutout_edge_cleanup = True
+        if rough_bbox:
+            try:
+                mask = rough_alpha.crop(rough_bbox).resize((64, 64))
+                coverage = sum(1 for value in mask.getdata() if value > 8) / float(64 * 64)
+                run_cutout_edge_cleanup = coverage <= 0.74
+            except Exception:
+                run_cutout_edge_cleanup = True
+
+        if run_cutout_edge_cleanup:
+            # Remove green chroma-key bleed and model-added neon outlines around the
+            # character. These pixels are most visible on transparent companion windows.
+            green_halo: List[Tuple[int, int]] = []
+            for y in range(height):
+                for x in range(width):
+                    r, g, b, a = pixels[x, y]
+                    if a <= 0:
+                        continue
+                    if _looks_like_chroma_green((r, g, b)) and _has_clear_neighbor(x, y, radius=3):
+                        green_halo.append((x, y))
+            for x, y in green_halo:
+                r, g, b, _a = pixels[x, y]
                 pixels[x, y] = (r, g, b, 0)
-            else:
-                old = pixels[x, y]
-                pixels[x, y] = (old[0], old[1], old[2], min(old[3], 80))
+
+            # Fade tiny leftover edge halos that sit directly against transparent
+            # pixels, without touching the solid character body.
+            transparent_neighbors: List[Tuple[int, int, int, int]] = []
+            for y in range(height):
+                for x in range(width):
+                    r, g, b, a = pixels[x, y]
+                    if a <= 0 or not _near_background((r, g, b), loose=True):
+                        continue
+                    if _has_clear_neighbor(x, y, radius=1):
+                        transparent_neighbors.append((x, y, r, g, b))
+            for x, y, r, g, b in transparent_neighbors:
+                distance = _dist2((r, g, b), base_color) if base_color is not None else 999999
+                if distance <= 42 * 42:
+                    pixels[x, y] = (r, g, b, 0)
+                else:
+                    old = pixels[x, y]
+                    pixels[x, y] = (old[0], old[1], old[2], min(old[3], 80))
+
+        # Remove wide generated floor shadows or glow pads. Keep compact dark
+        # shoes/feet by only dropping lower components that are much wider than tall.
+        alpha = image.getchannel("A")
+        rough_bbox = alpha.getbbox()
+        run_shadow_components = False
+        if run_cutout_edge_cleanup and rough_bbox:
+            try:
+                mask = alpha.crop(rough_bbox).resize((64, 64))
+                coverage = sum(1 for value in mask.getdata() if value > 8) / float(64 * 64)
+                run_shadow_components = coverage <= 0.72
+            except Exception:
+                run_shadow_components = False
+        if run_shadow_components:
+            visited_mask = bytearray(width * height)
+            for start_y in range(height):
+                for start_x in range(width):
+                    offset = start_y * width + start_x
+                    if visited_mask[offset] or alpha.getpixel((start_x, start_y)) <= 8:
+                        continue
+                    queue = [(start_x, start_y)]
+                    visited_mask[offset] = 1
+                    component: List[Tuple[int, int]] = []
+                    min_x = max_x = start_x
+                    min_y = max_y = start_y
+                    while queue:
+                        cx, cy = queue.pop()
+                        component.append((cx, cy))
+                        if cx < min_x:
+                            min_x = cx
+                        elif cx > max_x:
+                            max_x = cx
+                        if cy < min_y:
+                            min_y = cy
+                        elif cy > max_y:
+                            max_y = cy
+                        for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                            if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                                continue
+                            no = ny * width + nx
+                            if visited_mask[no] or alpha.getpixel((nx, ny)) <= 8:
+                                continue
+                            visited_mask[no] = 1
+                            queue.append((nx, ny))
+                    comp_w = max(1, max_x - min_x + 1)
+                    comp_h = max(1, max_y - min_y + 1)
+                    lower = max_y >= int(height * 0.62)
+                    wide_shadow = lower and comp_w >= comp_h * 2.15 and comp_h <= int(height * 0.22)
+                    if not wide_shadow:
+                        continue
+                    for cx, cy in component:
+                        r, g, b, _a = pixels[cx, cy]
+                        pixels[cx, cy] = (r, g, b, 0)
+
+        baseline_bbox = image.getchannel("A").getbbox()
+        if baseline_bbox:
+            bx0, by0, bx1, by1 = baseline_bbox
+            body_h = max(1, by1 - by0)
+            shadow_start = int(by0 + body_h * 0.84)
+
+            def _has_foreground_above(px: int, py: int) -> bool:
+                for ny in range(max(by0, py - 32), py):
+                    for nx in range(max(bx0, px - 2), min(bx1, px + 3)):
+                        rr, gg, bb, aa = pixels[nx, ny]
+                        if aa <= 80:
+                            continue
+                        bright = (rr + gg + bb) / 3.0
+                        sat = max(rr, gg, bb) - min(rr, gg, bb)
+                        if bright <= 124 or sat >= 100:
+                            return True
+                return False
+
+            for y in range(max(0, shadow_start), min(height, by1)):
+                wide_run: List[Tuple[int, int]] = []
+                candidate_run: List[Tuple[int, int]] = []
+                for x in range(max(0, bx0), min(width, bx1)):
+                    r, g, b, a = pixels[x, y]
+                    brightness = (r + g + b) / 3.0
+                    saturation = max(r, g, b) - min(r, g, b)
+                    if a > 0 and brightness >= 145 and saturation <= 150:
+                        pixels[x, y] = (r, g, b, 0)
+                    is_wide_shadow_candidate = a > 20 and brightness >= 122 and saturation <= 148
+                    if a > 20 and brightness >= 108 and saturation <= 160 and not _has_foreground_above(x, y):
+                        pixels[x, y] = (r, g, b, 0)
+                    if is_wide_shadow_candidate:
+                        candidate_run.append((x, y))
+                    else:
+                        if len(candidate_run) >= max(20, int((bx1 - bx0) * 0.035)):
+                            wide_run.extend(candidate_run)
+                        candidate_run = []
+                if len(candidate_run) >= max(20, int((bx1 - bx0) * 0.035)):
+                    wide_run.extend(candidate_run)
+                for x, y in wide_run:
+                    r, g, b, _a = pixels[x, y]
+                    pixels[x, y] = (r, g, b, 0)
 
         bbox = image.getchannel("A").getbbox()
         if bbox:
@@ -2140,23 +2280,190 @@ def _normalize_desktop_pet_image_bytes(raw: bytes) -> bytes:
         return raw
 
 
-def _prepare_pet_reference_image(path: Path) -> Tuple[Optional[Tuple[str, bytes, str]], Optional[str]]:
+def _sanitize_companion_image_file(path: Path) -> bool:
     try:
         if not path.exists() or not path.is_file():
-            return None, "Reference image was not found."
-        if path.stat().st_size > 50 * 1024 * 1024:
+            return False
+        raw = path.read_bytes()
+        if _companion_png_has_scene_like_alpha(raw):
+            return False
+        normalized = _normalize_desktop_pet_image_bytes(raw)
+        if not normalized or normalized == raw:
+            return False
+        try:
+            from PIL import Image
+
+            check = Image.open(io.BytesIO(normalized)).convert("RGBA")
+            try:
+                if (
+                    check.getchannel("A").getbbox() is None
+                    or _companion_alpha_fill_ratio(check) > 0.82
+                    or _companion_has_scene_like_alpha(check)
+                ):
+                    return False
+            finally:
+                try:
+                    check.close()
+                except Exception:
+                    pass
+        except Exception:
+            return False
+        tmp_path = path.with_suffix(path.suffix + ".cleanup_tmp")
+        tmp_path.write_bytes(normalized)
+        tmp_path.replace(path)
+        return True
+    except Exception:
+        return False
+
+
+def _prepare_pet_reference_image_bytes(
+    raw: bytes,
+    *,
+    filename: str = "reference.png",
+) -> Tuple[Optional[Tuple[str, bytes, str]], Optional[str]]:
+    try:
+        if not raw:
+            return None, "Reference image was empty."
+        if len(raw) > 50 * 1024 * 1024:
             return None, "Reference image is larger than 50 MB."
         from PIL import Image
 
-        with Image.open(path) as image:
+        with Image.open(io.BytesIO(raw)) as image:
             image.thumbnail((1536, 1536))
             if image.mode not in ("RGB", "RGBA"):
                 image = image.convert("RGBA")
             output = io.BytesIO()
             image.save(output, format="PNG")
-        return ("reference.png", output.getvalue(), "image/png"), None
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(filename).name or "reference.png")
+        return (safe_name if safe_name.lower().endswith(".png") else "reference.png", output.getvalue(), "image/png"), None
     except Exception as exc:
         return None, f"Could not read the reference image: {exc}"
+
+
+def _prepare_pet_reference_image(path: Path) -> Tuple[Optional[Tuple[str, bytes, str]], Optional[str]]:
+    try:
+        if not path.exists() or not path.is_file():
+            return None, "Reference image was not found."
+        return _prepare_pet_reference_image_bytes(path.read_bytes(), filename=path.name)
+    except Exception as exc:
+        return None, f"Could not read the reference image: {exc}"
+
+
+def _download_companion_reference_image(url: str) -> Tuple[Optional[Tuple[str, bytes, str]], Optional[str]]:
+    try:
+        req = request.Request(
+            url,
+            headers={
+                "User-Agent": "DailyLogger/1.0 companion reference lookup",
+                "Accept": "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5",
+            },
+        )
+        with request.urlopen(req, timeout=12) as response:
+            raw = response.read(12 * 1024 * 1024)
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+        if not raw:
+            return None, "Online reference image was empty."
+        if "svg" in content_type:
+            return None, "SVG online reference images are not supported."
+        filename = Path(urlparse(url).path).name or "online_reference.png"
+        return _prepare_pet_reference_image_bytes(raw, filename=filename)
+    except Exception as exc:
+        return None, f"Could not download online reference image: {exc}"
+
+
+def _lookup_companion_anime_reference(query: str) -> Tuple[str, Optional[Tuple[str, bytes, str]]]:
+    try:
+        params = urlencode({"q": query, "limit": "1"})
+        req = request.Request(
+            f"https://api.jikan.moe/v4/characters?{params}",
+            headers={"User-Agent": "DailyLogger/1.0 companion reference lookup"},
+        )
+        with request.urlopen(req, timeout=12) as response:
+            parsed_body = json.loads(response.read().decode("utf-8"))
+        first = ((parsed_body.get("data") or []) + [{}])[0]
+        if not isinstance(first, dict) or not first.get("name"):
+            return "", None
+        name = re.sub(r"\s+", " ", str(first.get("name") or query)).strip()
+        about = re.sub(r"\s+", " ", str(first.get("about") or "")).strip()
+        if len(about) > 600:
+            about = about[:600].rsplit(" ", 1)[0].rstrip() + "..."
+        context = f"Anime character reference match: {name}."
+        if about:
+            context += f" Character notes: {about}"
+        image_url = (
+            ((first.get("images") or {}).get("jpg") or {}).get("image_url")
+            or ((first.get("images") or {}).get("webp") or {}).get("image_url")
+            or ""
+        )
+        image_file = None
+        if isinstance(image_url, str) and image_url.strip():
+            image_file, _image_error = _download_companion_reference_image(image_url.strip())
+        return context, image_file
+    except Exception:
+        return "", None
+
+
+def _lookup_companion_online_reference(query: str) -> Tuple[str, Optional[Tuple[str, bytes, str]], Optional[str]]:
+    text = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not text:
+        return "", None, None
+    parsed = urlparse(text)
+    if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+        image_file, image_error = _download_companion_reference_image(text)
+        if image_error:
+            return "", None, image_error
+        host = parsed.netloc
+        return f"Online image reference from {host}.", image_file, None
+    try:
+        params = urlencode(
+            {
+                "action": "query",
+                "generator": "search",
+                "gsrsearch": f"{text} anime character",
+                "gsrlimit": "1",
+                "prop": "pageimages|extracts",
+                "piprop": "thumbnail",
+                "pithumbsize": "768",
+                "exintro": "1",
+                "explaintext": "1",
+                "format": "json",
+            }
+        )
+        req = request.Request(
+            f"https://en.wikipedia.org/w/api.php?{params}",
+            headers={"User-Agent": "DailyLogger/1.0 companion reference lookup"},
+        )
+        with request.urlopen(req, timeout=12) as response:
+            parsed_body = json.loads(response.read().decode("utf-8"))
+        pages = (parsed_body.get("query") or {}).get("pages") or {}
+        if not pages:
+            anime_context, anime_image = _lookup_companion_anime_reference(text)
+            if anime_context or anime_image:
+                return anime_context, anime_image, None
+            return "", None, f"Could not find an online reference for '{text}'."
+        page = next(iter(pages.values()))
+        title = str(page.get("title") or text).strip()
+        extract = re.sub(r"\s+", " ", str(page.get("extract") or "")).strip()
+        if len(extract) > 900:
+            extract = extract[:900].rsplit(" ", 1)[0].rstrip() + "..."
+        context = f"Online reference result: {title}."
+        if extract:
+            context += f" Summary: {extract}"
+        image_file: Optional[Tuple[str, bytes, str]] = None
+        thumbnail = (page.get("thumbnail") or {}).get("source")
+        if isinstance(thumbnail, str) and thumbnail.strip():
+            image_file, _image_error = _download_companion_reference_image(thumbnail.strip())
+        anime_context, anime_image = _lookup_companion_anime_reference(text)
+        if anime_context:
+            context += f" {anime_context}"
+        if image_file is None and anime_image is not None:
+            image_file = anime_image
+        return context, image_file, None
+    except Exception as exc:
+        anime_context, anime_image = _lookup_companion_anime_reference(text)
+        if anime_context or anime_image:
+            return anime_context, anime_image, None
+        return "", None, f"Could not look up online reference: {exc}"
 
 
 def _multipart_form_data(
@@ -2185,6 +2492,70 @@ def _multipart_form_data(
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
+def _refine_companion_cutout_with_openai(
+    api_key: str,
+    raw: bytes,
+    *,
+    name: str,
+    design_prompt: str = "",
+) -> Optional[bytes]:
+    try:
+        if not raw:
+            return None
+        safe_name = re.sub(r"[^A-Za-z0-9 _-]+", "", str(name or "Companion")).strip() or "Companion"
+        notes = re.sub(r"\s+", " ", str(design_prompt or "")).strip()
+        prompt = (
+            "Edit the uploaded image into a clean transparent PNG companion sprite. "
+            f"Keep the same exact character identity for {safe_name}: same face, outfit, colors, ears/hair, body shape, "
+            "pose language, proportions, and art style. Remove everything that is not the character: background, "
+            "floor, ground shadow, drop shadow, contact shadow, glow, aura, fire, particles, colored outline, green "
+            "outline, rim glow, border, canvas, scene, room, landscape, labels, and text. Do not replace the character "
+            "with a generic mascot. Return one full-body character only with transparent pixels behind and below it."
+        )
+        if notes:
+            prompt += f" User editable design notes: {notes}"
+        fields = {
+            "model": OPENAI_REFERENCE_IMAGE_MODEL,
+            "prompt": prompt,
+            "n": "1",
+            "size": "1024x1024",
+            "quality": OPENAI_IMAGE_QUALITY,
+            "background": "transparent",
+            "output_format": "png",
+        }
+        if "mini" not in OPENAI_REFERENCE_IMAGE_MODEL.lower():
+            fields["input_fidelity"] = "high"
+        payload, content_type = _multipart_form_data(
+            fields,
+            {"image": ("companion.png", raw, "image/png")},
+        )
+        req = request.Request(
+            OPENAI_IMAGE_EDITS_URL,
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": content_type,
+            },
+        )
+        with request.urlopen(req, timeout=180) as response:
+            body = response.read().decode("utf-8")
+        parsed = json.loads(body)
+        first = (parsed.get("data") or [{}])[0]
+        if not isinstance(first, dict):
+            return None
+        b64 = str(first.get("b64_json") or "").strip()
+        if b64:
+            return base64.b64decode(b64)
+        url = str(first.get("url") or "").strip()
+        if not url:
+            return None
+        with request.urlopen(url, timeout=90) as image_response:
+            return image_response.read()
+    except Exception:
+        return None
+
+
 def _companion_file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     try:
@@ -2199,6 +2570,167 @@ def _companion_file_sha256(path: Path) -> str:
 def _companion_alpha_bbox(image: Any) -> Optional[Tuple[int, int, int, int]]:
     try:
         return image.getchannel("A").getbbox()
+    except Exception:
+        return None
+
+
+def _companion_alpha_fill_ratio(image: Any) -> float:
+    try:
+        alpha = image.getchannel("A")
+        bbox = alpha.getbbox()
+        if bbox is None:
+            return 1.0
+        mask = alpha.crop(bbox).resize((64, 64))
+        return sum(1 for value in mask.getdata() if value > 8) / float(64 * 64)
+    except Exception:
+        return 1.0
+
+
+def _companion_has_scene_like_alpha(image: Any) -> bool:
+    try:
+        alpha = image.getchannel("A")
+        bbox = alpha.getbbox()
+        if bbox is None:
+            return False
+        mask = alpha.crop(bbox).resize((64, 64))
+
+        def _fill(x0: int, y0: int, x1: int, y1: int) -> float:
+            values = [mask.getpixel((x, y)) for y in range(y0, y1) for x in range(x0, x1)]
+            return sum(1 for value in values if value > 8) / float(max(1, len(values)))
+
+        overall = _fill(0, 0, 64, 64)
+        if overall <= 0.66:
+            return False
+        top = _fill(8, 0, 56, 8)
+        bottom = _fill(8, 56, 56, 64)
+        corners = (
+            _fill(0, 0, 16, 16)
+            + _fill(48, 0, 64, 16)
+            + _fill(0, 48, 16, 64)
+            + _fill(48, 48, 64, 64)
+        ) / 4.0
+        return (top >= 0.86 and bottom >= 0.66 and corners >= 0.40) or (
+            bottom >= 0.72 and top >= 0.70 and corners >= 0.34
+        )
+    except Exception:
+        return False
+
+
+def _companion_png_fill_ratio(raw: bytes) -> float:
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(raw)).convert("RGBA")
+        try:
+            return _companion_alpha_fill_ratio(image)
+        finally:
+            try:
+                image.close()
+            except Exception:
+                pass
+    except Exception:
+        return 1.0
+
+
+def _companion_png_has_scene_like_alpha(raw: bytes) -> bool:
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(raw)).convert("RGBA")
+        try:
+            return _companion_has_scene_like_alpha(image)
+        finally:
+            try:
+                image.close()
+            except Exception:
+                pass
+    except Exception:
+        return True
+
+
+def _fast_clean_companion_cutout_image_bytes(image: Any) -> Optional[bytes]:
+    try:
+        if _companion_edge_alpha_ratio(image) > 0.02:
+            return None
+        if _companion_alpha_fill_ratio(image) > 0.78:
+            return None
+        frame = image.convert("RGBA").copy()
+        width, height = frame.size
+        pixels = frame.load()
+        bbox = _companion_alpha_bbox(frame)
+        if bbox is None:
+            return None
+        bx0, by0, bx1, by1 = bbox
+
+        def _looks_like_chroma_green(rgb: Tuple[int, int, int]) -> bool:
+            r, g, b = rgb
+            return g >= 125 and r <= 105 and b <= 190 and (g - r) >= 45 and (g - b) >= 20
+
+        def _has_clear_neighbor(px: int, py: int, *, radius: int = 1) -> bool:
+            for ny in range(max(0, py - radius), min(height, py + radius + 1)):
+                for nx in range(max(0, px - radius), min(width, px + radius + 1)):
+                    if nx == px and ny == py:
+                        continue
+                    if pixels[nx, ny][3] <= 8:
+                        return True
+            return False
+
+        for y in range(max(0, by0 - 3), min(height, by1 + 3)):
+            for x in range(max(0, bx0 - 3), min(width, bx1 + 3)):
+                r, g, b, a = pixels[x, y]
+                if a > 0 and _looks_like_chroma_green((r, g, b)) and _has_clear_neighbor(x, y, radius=3):
+                    pixels[x, y] = (r, g, b, 0)
+
+        body_h = max(1, by1 - by0)
+        shadow_start = int(by0 + body_h * 0.84)
+
+        def _has_foreground_above(px: int, py: int) -> bool:
+            for ny in range(max(by0, py - 32), py):
+                for nx in range(max(bx0, px - 2), min(bx1, px + 3)):
+                    rr, gg, bb, aa = pixels[nx, ny]
+                    if aa <= 80:
+                        continue
+                    bright = (rr + gg + bb) / 3.0
+                    sat = max(rr, gg, bb) - min(rr, gg, bb)
+                    if bright <= 124 or sat >= 100:
+                        return True
+            return False
+
+        for y in range(max(0, shadow_start), min(height, by1)):
+            candidate_run: List[Tuple[int, int]] = []
+            wide_run: List[Tuple[int, int]] = []
+            for x in range(max(0, bx0), min(width, bx1)):
+                r, g, b, a = pixels[x, y]
+                brightness = (r + g + b) / 3.0
+                saturation = max(r, g, b) - min(r, g, b)
+                if a > 0 and brightness >= 145 and saturation <= 150:
+                    pixels[x, y] = (r, g, b, 0)
+                is_wide_shadow_candidate = a > 20 and brightness >= 122 and saturation <= 148
+                if a > 20 and brightness >= 108 and saturation <= 160 and not _has_foreground_above(x, y):
+                    pixels[x, y] = (r, g, b, 0)
+                if is_wide_shadow_candidate:
+                    candidate_run.append((x, y))
+                else:
+                    if len(candidate_run) >= max(20, int((bx1 - bx0) * 0.035)):
+                        wide_run.extend(candidate_run)
+                    candidate_run = []
+            if len(candidate_run) >= max(20, int((bx1 - bx0) * 0.035)):
+                wide_run.extend(candidate_run)
+            for x, y in wide_run:
+                r, g, b, _a = pixels[x, y]
+                pixels[x, y] = (r, g, b, 0)
+
+        bbox = _companion_alpha_bbox(frame)
+        if bbox:
+            pad = max(18, min(width, height) // 36)
+            left = max(0, bbox[0] - pad)
+            top = max(0, bbox[1] - pad)
+            right = min(width, bbox[2] + pad)
+            bottom = min(height, bbox[3] + pad)
+            frame = frame.crop((left, top, right, bottom))
+        output = io.BytesIO()
+        frame.save(output, format="PNG", optimize=True)
+        return output.getvalue()
     except Exception:
         return None
 
@@ -2240,12 +2772,48 @@ def _companion_average_rgba(image: Any) -> Tuple[float, float, float]:
         return (0.0, 0.0, 0.0)
 
 
-def _normalize_companion_frame_image(
-    image: Any,
-    *,
-    canvas_size: int = 1024,
-    body_ratio: float = 0.82,
-) -> Optional[Any]:
+def _companion_frames_have_visible_motion(frames: List[Any]) -> bool:
+    try:
+        if len(frames) < 2:
+            return False
+        try:
+            resample = frames[0].Resampling.LANCZOS  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                from PIL import Image
+
+                resample = Image.Resampling.LANCZOS
+            except Exception:
+                resample = 1
+        base = frames[0].convert("RGBA").resize((64, 64), resample)
+        base_pixels = list(base.getdata())
+        base_bbox = _companion_alpha_bbox(frames[0])
+        for frame in frames[1:]:
+            bbox = _companion_alpha_bbox(frame)
+            if base_bbox is not None and bbox is not None:
+                if (
+                    abs((bbox[2] - bbox[0]) - (base_bbox[2] - base_bbox[0])) >= 8
+                    or abs((bbox[3] - bbox[1]) - (base_bbox[3] - base_bbox[1])) >= 8
+                    or abs(bbox[1] - base_bbox[1]) >= 6
+                ):
+                    return True
+            sample = frame.convert("RGBA").resize((64, 64), resample)
+            pixels = list(sample.getdata())
+            diff_total = 0
+            alpha_seen = 0
+            for a, b in zip(base_pixels, pixels):
+                if a[3] <= 8 and b[3] <= 8:
+                    continue
+                alpha_seen += 1
+                diff_total += abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2]) + abs(a[3] - b[3])
+            if alpha_seen and (diff_total / alpha_seen) >= 4.5:
+                return True
+        return False
+    except Exception:
+        return True
+
+
+def _prepare_companion_frame_cutout(image: Any) -> Optional[Tuple[Any, Tuple[int, int, int, int]]]:
     try:
         from PIL import Image
 
@@ -2258,27 +2826,91 @@ def _normalize_companion_frame_image(
             return None
         if _companion_edge_alpha_ratio(frame) > 0.08:
             return None
-        crop = frame.crop(bbox)
-        body_w = max(1, bbox[2] - bbox[0])
-        body_h = max(1, bbox[3] - bbox[1])
-        if body_w <= 4 or body_h <= 4:
+        if _companion_alpha_fill_ratio(frame) > 0.82 or _companion_has_scene_like_alpha(frame):
             return None
+        if (bbox[2] - bbox[0]) <= 4 or (bbox[3] - bbox[1]) <= 4:
+            return None
+        return frame, bbox
+    except Exception:
+        return None
+
+
+def _normalize_companion_frame_sequence(
+    images: List[Any],
+    *,
+    canvas_size: int = 1024,
+    body_ratio: float = 0.82,
+) -> List[Any]:
+    try:
+        from PIL import Image
+
+        prepared: List[Tuple[Any, Tuple[int, int, int, int]]] = []
+        widths: List[int] = []
+        heights: List[int] = []
+        for image in images:
+            item = _prepare_companion_frame_cutout(image)
+            if item is None:
+                return []
+            frame, bbox = item
+            prepared.append((frame, bbox))
+            widths.append(max(1, bbox[2] - bbox[0]))
+            heights.append(max(1, bbox[3] - bbox[1]))
+        if not prepared:
+            return []
         try:
             resample = Image.Resampling.LANCZOS
         except AttributeError:
             resample = Image.LANCZOS
-        target_body = int(canvas_size * max(0.50, min(0.90, body_ratio)))
-        scale = min(target_body / body_h, (canvas_size * 0.86) / body_w)
-        new_w = max(1, int(body_w * scale))
-        new_h = max(1, int(body_h * scale))
-        crop = crop.resize((new_w, new_h), resample)
-        canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
-        x = max(0, (canvas_size - new_w) // 2)
-        y = max(0, int(canvas_size * 0.91) - new_h)
-        canvas.alpha_composite(crop, (x, y))
-        return canvas
+        median_width = sorted(widths)[len(widths) // 2]
+        median_height = sorted(heights)[len(heights) // 2]
+        target_height = int(canvas_size * max(0.50, min(0.90, body_ratio)))
+        max_width = int(canvas_size * 0.92)
+        target_height = min(
+            target_height,
+            max(1, int(max_width * median_height / max(1, median_width))),
+        )
+        baseline_y = int(canvas_size * 0.91)
+        normalized: List[Any] = []
+        for frame, bbox in prepared:
+            body_w = max(1, bbox[2] - bbox[0])
+            body_h = max(1, bbox[3] - bbox[1])
+            crop = frame.crop(bbox)
+            scale = target_height / body_h
+            new_w = max(1, int(round(body_w * scale)))
+            new_h = max(1, int(round(body_h * scale)))
+            if new_w > max_width:
+                scale = max_width / body_w
+                new_w = max(1, int(round(body_w * scale)))
+                new_h = max(1, int(round(body_h * scale)))
+            crop = crop.resize((new_w, new_h), resample)
+            crop_bbox = _companion_alpha_bbox(crop)
+            if crop_bbox is None:
+                return []
+            canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+            crop_center = (crop_bbox[0] + crop_bbox[2]) / 2.0
+            x = int(round((canvas_size / 2.0) - crop_center))
+            y = int(round(baseline_y - crop_bbox[3]))
+            x = max(-crop_bbox[0], min(canvas_size - crop_bbox[2], x))
+            y = max(-crop_bbox[1], min(canvas_size - crop_bbox[3], y))
+            canvas.alpha_composite(crop, (x, y))
+            normalized.append(canvas)
+        return normalized
     except Exception:
-        return None
+        return []
+
+
+def _normalize_companion_frame_image(
+    image: Any,
+    *,
+    canvas_size: int = 1024,
+    body_ratio: float = 0.82,
+) -> Optional[Any]:
+    frames = _normalize_companion_frame_sequence(
+        [image],
+        canvas_size=canvas_size,
+        body_ratio=body_ratio,
+    )
+    return frames[0] if frames else None
 
 
 def _companion_frames_consistent(frames: List[Any]) -> bool:
@@ -2304,7 +2936,30 @@ def _companion_frames_consistent(frames: List[Any]) -> bool:
         drift = sum((color[i] - base_color[i]) ** 2 for i in range(3)) ** 0.5
         if drift > 78:
             return False
-    return True
+    return _companion_frames_have_visible_motion(frames)
+
+
+COMPANION_FRAME_COUNT_OPTIONS = (4, 8, 12, 16)
+
+
+def _normalize_companion_frame_count(value: object) -> int:
+    try:
+        requested = int(str(value).strip())
+    except Exception:
+        requested = 8
+    if requested in COMPANION_FRAME_COUNT_OPTIONS:
+        return requested
+    return 8
+
+
+def _companion_sprite_grid(frame_count: int) -> Tuple[int, int]:
+    normalized = _normalize_companion_frame_count(frame_count)
+    return {
+        4: (2, 2),
+        8: (4, 2),
+        12: (4, 3),
+        16: (4, 4),
+    }[normalized]
 
 
 def _write_companion_animation_manifest(
@@ -2314,6 +2969,8 @@ def _write_companion_animation_manifest(
     source_hash: str,
     method: str,
     fps: int = 6,
+    grid_columns: Optional[int] = None,
+    grid_rows: Optional[int] = None,
 ) -> None:
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -2322,9 +2979,13 @@ def _write_companion_animation_manifest(
             "fps": max(1, int(fps)),
             "method": method,
             "source_sha256": source_hash,
+            "frame_count": len(frames),
             "frames": [path.name for path in frames],
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
+        if grid_columns is not None and grid_rows is not None:
+            manifest["grid_columns"] = max(1, int(grid_columns))
+            manifest["grid_rows"] = max(1, int(grid_rows))
         (output_dir / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -2337,12 +2998,19 @@ def _write_local_companion_idle_frames(source_path: Path, output_dir: Path, *, f
     try:
         from PIL import Image
 
+        frame_count = _normalize_companion_frame_count(frame_count)
+        columns, rows = _companion_sprite_grid(frame_count)
         output_dir.mkdir(parents=True, exist_ok=True)
         for stale in output_dir.glob("idle_*.png"):
             try:
                 stale.unlink()
             except OSError:
                 pass
+        try:
+            if _companion_png_has_scene_like_alpha(source_path.read_bytes()):
+                return []
+        except Exception:
+            return []
         source = Image.open(source_path).convert("RGBA")
         source = _normalize_companion_frame_image(source)
         if source is None:
@@ -2352,15 +3020,15 @@ def _write_local_companion_idle_frames(source_path: Path, output_dir: Path, *, f
         except AttributeError:
             resize_filter = Image.LANCZOS
         written: List[Path] = []
-        for index in range(max(1, int(frame_count))):
+        for index in range(frame_count):
             phase = (index / max(1, frame_count)) * math.pi * 2.0
             frame = Image.new("RGBA", source.size, (0, 0, 0, 0))
             bbox = _companion_alpha_bbox(source)
             if bbox is None:
                 return []
             crop = source.crop(bbox)
-            scale_x = 1.0 + math.sin(phase) * 0.010
-            scale_y = 1.0 - math.sin(phase) * 0.008
+            scale_x = 1.0 + math.sin(phase) * 0.024
+            scale_y = 1.0 - math.sin(phase) * 0.032
             crop = crop.resize(
                 (max(1, int(crop.width * scale_x)), max(1, int(crop.height * scale_y))),
                 resize_filter,
@@ -2376,6 +3044,9 @@ def _write_local_companion_idle_frames(source_path: Path, output_dir: Path, *, f
             written,
             source_hash=_companion_file_sha256(source_path),
             method="local_fixed_anchor",
+            fps=8,
+            grid_columns=columns,
+            grid_rows=rows,
         )
         return written
     except Exception:
@@ -2387,10 +3058,12 @@ def _extract_companion_idle_frames_from_sheet(
     output_dir: Path,
     *,
     source_hash: str,
+    frame_count: int = 8,
 ) -> List[Path]:
     try:
         from PIL import Image
 
+        frame_count = _normalize_companion_frame_count(frame_count)
         sheet = Image.open(io.BytesIO(sheet_bytes)).convert("RGBA")
         width, height = sheet.size
         if width < 256 or height < 256:
@@ -2401,19 +3074,18 @@ def _extract_companion_idle_frames_from_sheet(
                 stale.unlink()
             except OSError:
                 pass
-        normalized_frames: List[Any] = []
-        columns = 4
-        rows = 2
+        raw_frames: List[Any] = []
+        columns, rows = _companion_sprite_grid(frame_count)
         cell_w = width // columns
         cell_h = height // rows
-        for index in range(columns * rows):
+        for index in range(frame_count):
             col = index % columns
             row = index // columns
             crop = sheet.crop((col * cell_w, row * cell_h, (col + 1) * cell_w, (row + 1) * cell_h))
-            normalized = _normalize_companion_frame_image(crop)
-            if normalized is None:
-                return []
-            normalized_frames.append(normalized)
+            raw_frames.append(crop)
+        normalized_frames = _normalize_companion_frame_sequence(raw_frames)
+        if len(normalized_frames) != frame_count:
+            return []
         if not _companion_frames_consistent(normalized_frames):
             return []
         frames: List[Path] = []
@@ -2426,6 +3098,9 @@ def _extract_companion_idle_frames_from_sheet(
             frames,
             source_hash=source_hash,
             method="ai_sprite_sheet",
+            fps=8,
+            grid_columns=columns,
+            grid_rows=rows,
         )
         return frames
     except Exception:
@@ -2440,10 +3115,13 @@ def _generate_companion_idle_frames(
     name: str,
     level: int,
     design_prompt: str = "",
+    frame_count: int = 8,
 ) -> List[Path]:
     try:
         if not companion_image_path.exists():
             return []
+        frame_count = _normalize_companion_frame_count(frame_count)
+        columns, rows = _companion_sprite_grid(frame_count)
         image_file, ref_err = _prepare_pet_reference_image(companion_image_path)
         if ref_err or image_file is None:
             return []
@@ -2451,20 +3129,25 @@ def _generate_companion_idle_frames(
         safe_name = re.sub(r"[^A-Za-z0-9 _-]+", "", str(name or "Companion")).strip() or "Companion"
         notes = re.sub(r"\s+", " ", str(design_prompt or "")).strip()
         prompt = (
-            "Create a 4 columns by 2 rows transparent PNG sprite sheet for the exact same companion in the uploaded image. "
+            f"Create a {frame_count}-frame transparent PNG sprite sheet in a {columns} columns by {rows} rows grid "
+            "for the exact same companion in the uploaded image. The full sprite sheet canvas must be 1024x1024. "
+            "Use a universal sprite template: every cell has the same transparent padding, the character centerline "
+            "is exactly at the horizontal center of the cell, the feet/body anchor sits on the same invisible baseline "
+            "near 91 percent of the cell height, and the character height stays the same in every cell. "
             f"The companion is named {safe_name} and is level {max(1, int(level or 1))}. "
-            "Use eight idle animation frames of the same character, same outfit, same colors, same face, "
+            f"Use exactly {frame_count} idle animation frames of the same character, same outfit, same colors, same face, "
             "same accessories, same proportions, and same art style. The character must stay centered and the feet/body "
             "anchor must remain in the same place in every frame. Use only tiny character motion: subtle breathing, "
             "small blink, small eye or hair movement, and a gentle hand/ear/cloth shift if it already exists. "
             "Do not move the whole character around the cell. Do not add glow, fire, particles, magic effects, props, "
-            "weapons, pets, scene background, landscape, floor, shadow box, colored canvas, borders, labels, text, UI, "
-            "grid lines, or frame numbers. The area behind the character must be transparent in every cell. "
+            "weapons, pets, scene background, landscape, floor, ground shadow, drop shadow, contact shadow, colored "
+            "outline, green outline, rim glow, colored canvas, borders, labels, text, UI, grid lines, or frame numbers. "
+            "The area behind and below the character must be transparent in every cell. "
             "This sprite sheet will be split into animation frames, so frame-to-frame consistency is more important "
             "than dramatic motion."
         )
         if notes:
-            prompt += f" User editable design notes: {notes}"
+            prompt += f" User character preferences: {notes}"
         fields = {
             "model": OPENAI_REFERENCE_IMAGE_MODEL,
             "prompt": prompt,
@@ -2501,7 +3184,12 @@ def _generate_companion_idle_frames(
                 return []
             with request.urlopen(url, timeout=90) as image_response:
                 raw = image_response.read()
-        return _extract_companion_idle_frames_from_sheet(raw, output_dir, source_hash=source_hash)
+        return _extract_companion_idle_frames_from_sheet(
+            raw,
+            output_dir,
+            source_hash=source_hash,
+            frame_count=frame_count,
+        )
     except Exception:
         return []
 
@@ -2512,21 +3200,34 @@ def generate_desktop_pet_image(
     reference_image_path: Optional[Path] = None,
     output_dir: Optional[Path] = None,
     design_prompt: str = "",
+    animation_frame_count: int = 8,
+    online_reference_query: str = "",
 ) -> Tuple[Optional[Path], Optional[str]]:
     api_key = get_openai_api_key()
     if not api_key:
         return None, "OPENAI_API_KEY is not set. Add your token first, then generate the companion look."
 
     pet_level = max(1, int(level or 1))
+    animation_frame_count = _normalize_companion_frame_count(animation_frame_count)
     safe_name = re.sub(r"[^A-Za-z0-9 _-]+", "", str(name or "Companion")).strip() or "Companion"
+    online_reference_context = ""
+    online_reference_file: Optional[Tuple[str, bytes, str]] = None
+    online_reference_query = re.sub(r"\s+", " ", str(online_reference_query or "")).strip()
+    if online_reference_query:
+        online_reference_context, online_reference_file, online_error = _lookup_companion_online_reference(
+            online_reference_query
+        )
+        if online_error:
+            return None, online_error
     sprite_rules = (
         "Transparent background, full body, front three-quarter view, soft rounded shapes, clean outline, "
         "readable at small desktop-icon size, high-resolution crisp details, antialiased edges, and at least "
         "8 percent transparent padding around the body. No text, no logo, no UI frame, no colored canvas "
         "border, no square background, no black/solid background, no scene, no room, no landscape, no "
         "gradient backdrop, no glow, no fire, no particles, no aura, no floating effects, no separate weapon "
-        "effects, no unrelated props, no shadow box. Only include accessories or held items if they are part of "
-        "the character design itself. The pixels behind the character must be transparent. "
+        "effects, no unrelated props, no shadow box, no ground shadow, no drop shadow, no contact shadow, "
+        "no green outline, no colored outline, no rim glow. Only include accessories or held items if they are part of "
+        "the character design itself. The pixels behind and below the character must be transparent. "
         f"It is level {pet_level}; higher level means slightly more confident, brighter, and magical, "
         "but still simple and friendly, without external visual effects."
     )
@@ -2539,7 +3240,14 @@ def generate_desktop_pet_image(
     )
     notes = re.sub(r"\s+", " ", str(design_prompt or "")).strip()
     if notes:
-        prompt += f" User editable design notes: {notes}"
+        prompt += f" User character preferences: {notes}"
+    if online_reference_context:
+        prompt += (
+            f" Online character reference context: {online_reference_context} "
+            "Use it only to understand broad recognizable cues such as color mood, silhouette, personality, "
+            "and accessory direction. Create an original non-infringing companion, not an exact clone, exact costume, "
+            "or copyrighted character reproduction."
+        )
     if reference_image_path is not None:
         reference_file, ref_err = _prepare_pet_reference_image(Path(reference_image_path))
         if ref_err or reference_file is None:
@@ -2558,7 +3266,12 @@ def generate_desktop_pet_image(
             + sprite_rules
         )
         if notes:
-            prompt += f" User editable design notes: {notes}"
+            prompt += f" User character preferences: {notes}"
+        if online_reference_context:
+            prompt += (
+                f" Online character reference context: {online_reference_context} "
+                "Use it only for broad inspiration. The final companion must remain original and non-infringing."
+            )
         edit_model = OPENAI_REFERENCE_IMAGE_MODEL
         fields = {
             "model": edit_model,
@@ -2574,6 +3287,44 @@ def generate_desktop_pet_image(
         payload, content_type = _multipart_form_data(
             fields,
             {"image": reference_file},
+        )
+        req = request.Request(
+            OPENAI_IMAGE_EDITS_URL,
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": content_type,
+            },
+        )
+    elif online_reference_file is not None:
+        prompt = (
+            "Use the uploaded online image reference only to understand broad character cues for a new original "
+            "cute Q-style chibi desktop companion sprite. Do not make an exact copy of the referenced anime/game "
+            "character, do not reproduce the exact costume, and do not resemble an existing copyrighted character too closely. "
+            "Borrow only high-level ideas such as color family, personality, silhouette energy, or accessory direction. "
+            f"The companion is named {safe_name}. "
+            + sprite_rules
+        )
+        if notes:
+            prompt += f" User character preferences: {notes}"
+        if online_reference_context:
+            prompt += f" Online character reference context: {online_reference_context}"
+        edit_model = OPENAI_REFERENCE_IMAGE_MODEL
+        fields = {
+            "model": edit_model,
+            "prompt": prompt,
+            "n": "1",
+            "size": "1024x1024",
+            "quality": OPENAI_IMAGE_QUALITY,
+            "background": "transparent",
+            "output_format": "png",
+        }
+        if "mini" not in edit_model.lower():
+            fields["input_fidelity"] = "high"
+        payload, content_type = _multipart_form_data(
+            fields,
+            {"image": online_reference_file},
         )
         req = request.Request(
             OPENAI_IMAGE_EDITS_URL,
@@ -2633,6 +3384,17 @@ def generate_desktop_pet_image(
         if not raw:
             return None, "Image generation returned an empty image."
         raw = _normalize_desktop_pet_image_bytes(raw)
+        if _companion_png_fill_ratio(raw) > 0.82 or _companion_png_has_scene_like_alpha(raw):
+            repaired = _refine_companion_cutout_with_openai(
+                api_key,
+                raw,
+                name=safe_name,
+                design_prompt=notes,
+            )
+            if repaired:
+                repaired = _normalize_desktop_pet_image_bytes(repaired)
+                if _companion_png_fill_ratio(repaired) <= 0.82 and not _companion_png_has_scene_like_alpha(repaired):
+                    raw = repaired
         target_dir = Path(output_dir) if output_dir is not None else DESKTOP_PET_ASSET_DIR
         target_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2648,9 +3410,10 @@ def generate_desktop_pet_image(
             name=safe_name,
             level=pet_level,
             design_prompt=notes,
+            frame_count=animation_frame_count,
         )
         if not frames:
-            _write_local_companion_idle_frames(path, animation_dir)
+            _write_local_companion_idle_frames(path, animation_dir, frame_count=animation_frame_count)
         return path, None
     except Exception as exc:
         return None, f"Could not save generated pet image: {exc}"
@@ -7758,7 +8521,7 @@ def open_journal_window_editor(
     gen_button.grid(row=0, column=0, columnspan=2, sticky="ew")
     report_box.insert("1.0", draft_report)
 
-    journal_pet_transparent = "#00ff7f"
+    journal_pet_transparent = "#010203"
     journal_pet_window = tk.Toplevel(root)
     journal_pet_window.overrideredirect(True)
     journal_pet_window.transient(root)
@@ -8474,6 +9237,7 @@ def open_journal_window_editor(
     pet_bubble_state = {"text": "", "until": 0.0, "last_auto": 0.0}
     pet_tts_state: Dict[str, Any] = {"proc": None, "last": 0.0, "error": ""}
     pet_image_cache: Dict[str, Any] = {}
+    pet_asset_cleanup_state = {"fingerprint": ""}
     journal_widget_refs: Dict[str, Any] = {"restore_draft_btn": None}
     journal_pet_state: Dict[str, Any] = {
         "dragging": False,
@@ -9451,6 +10215,55 @@ def open_journal_window_editor(
             seconds=8,
         )
 
+    def _ensure_companion_image_assets_clean() -> None:
+        if not bool(pet_state.get("active", False)):
+            return
+        image_path = Path(str(pet_state.get("image_path") or ""))
+        if not image_path.exists():
+            return
+        try:
+            stat = image_path.stat()
+            fingerprint = f"{image_path}:{stat.st_mtime_ns}:{stat.st_size}"
+        except OSError:
+            return
+        if pet_asset_cleanup_state.get("fingerprint") == fingerprint:
+            return
+        animation_dir = image_path.parent / "animation"
+        rebuild_frames = False
+        try:
+            source_scene_like = _companion_png_has_scene_like_alpha(image_path.read_bytes())
+        except Exception:
+            source_scene_like = True
+        idle_frames = sorted(animation_dir.glob("idle_*.png")) if animation_dir.exists() else []
+        manifest_path = animation_dir / "manifest.json"
+        if idle_frames and manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                source_hash = str(manifest.get("source_sha256") or "").strip()
+                if not source_scene_like and source_hash and source_hash != _companion_file_sha256(image_path):
+                    rebuild_frames = True
+            except Exception:
+                rebuild_frames = not source_scene_like
+        elif not idle_frames and not source_scene_like:
+            rebuild_frames = True
+        if rebuild_frames:
+            try:
+                if animation_dir.exists():
+                    shutil.rmtree(animation_dir)
+            except Exception:
+                pass
+            _write_local_companion_idle_frames(image_path, animation_dir)
+            pet_image_cache.clear()
+            try:
+                _write_companion_state_to_dir(COMPANION_CURRENT_DIR, pet_state)
+            except Exception:
+                pass
+        try:
+            stat = image_path.stat()
+            pet_asset_cleanup_state["fingerprint"] = f"{image_path}:{stat.st_mtime_ns}:{stat.st_size}"
+        except OSError:
+            pet_asset_cleanup_state["fingerprint"] = fingerprint
+
     def _load_pet_photo(
         cache_name: str,
         max_size: Tuple[int, int],
@@ -9475,6 +10288,7 @@ def open_journal_window_editor(
                 resize_filter = Image.LANCZOS
             frame = 0
             frame_path = path
+            fps = 8
             if animate:
                 animation_dir = path.parent / "animation"
                 idle_frames = sorted(animation_dir.glob("idle_*.png")) if animation_dir.exists() else []
@@ -9486,10 +10300,12 @@ def open_journal_window_editor(
                             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                             source_hash = str(manifest.get("source_sha256") or "").strip()
                             manifest_ok = not source_hash or source_hash == _companion_file_sha256(path)
+                            fps = max(1, min(24, int(manifest.get("fps") or fps)))
                         except Exception:
                             manifest_ok = False
                     if manifest_ok:
-                        frame = (int(tick) // 5) % len(idle_frames)
+                        frame_step = max(1, int(round(1000 / (max(1, fps) * 90))))
+                        frame = (int(tick) // frame_step) % len(idle_frames)
                         frame_path = idle_frames[frame]
             stat = frame_path.stat()
             fingerprint = f"{stat.st_mtime_ns}:{stat.st_size}"
@@ -9560,14 +10376,6 @@ def open_journal_window_editor(
         pet_stage_drag_state["hitbox"] = (x - 28, y, x + 132, y + 132)
         photo = _load_pet_photo("stage", (154, 154), tick=tick, animate=not bool(pet_stage_drag_state.get("dragging")))
         if photo is not None:
-            pet_stage.create_oval(
-                x - 28,
-                y + 84,
-                x + 132,
-                y + 126,
-                fill=t.panel,
-                outline="",
-            )
             pet_stage.create_image(x + 52, y + 68, image=photo)
             bubble_text = _active_pet_bubble_text()
             if bubble_text:
@@ -9578,7 +10386,6 @@ def open_journal_window_editor(
         belly = "#F7F5FF"
         accent = "#FFB86B" if level < 8 else "#FFE066"
         outline = t.accent
-        pet_stage.create_oval(x - 28, y + 34, x + 112, y + 104, fill=t.panel, outline="")
         pet_stage.create_oval(x + 4 - breath, y + 28, x + 104 + breath, y + 124, fill=body, outline=outline, width=2)
         pet_stage.create_oval(x + 26, y + 60, x + 82, y + 112, fill=belly, outline="")
         pet_stage.create_oval(x + 6, y + 8, x + 100, y + 88, fill=body, outline=outline, width=2)
@@ -9671,14 +10478,6 @@ def open_journal_window_editor(
                 animate=not bool(journal_pet_state.get("dragging")),
             )
             if photo is not None:
-                journal_pet_canvas.create_oval(
-                    24,
-                    43,
-                    82,
-                    55,
-                    fill=shadow,
-                    outline="",
-                )
                 journal_pet_canvas.create_image(53, 28, image=photo)
                 hitbox = (18.0, 2.0, 88.0, 56.0)
             else:
@@ -9688,7 +10487,6 @@ def open_journal_window_editor(
                 outline = t.accent
                 x = 24
                 y = 2
-                journal_pet_canvas.create_oval(x - 1, y + 42, x + 62, y + 56, fill=shadow, outline="")
                 journal_pet_canvas.create_oval(x + 10 - breath, y + 30, x + 50 + breath, y + 56, fill=body, outline=outline, width=2)
                 journal_pet_canvas.create_oval(x + 21, y + 39, x + 39, y + 55, fill=belly, outline="")
                 journal_pet_canvas.create_oval(x + 8, y + 9, x + 52, y + 43, fill=body, outline=outline, width=2)
@@ -9727,6 +10525,8 @@ def open_journal_window_editor(
             pet_image_cache.clear()
             _save_desktop_pet_state()
             active = False
+        if active:
+            _ensure_companion_image_assets_clean()
         level, current_xp, needed_xp = _desktop_pet_level()
         profile = _pet_growth_profile(level)
         if active:
@@ -9819,28 +10619,116 @@ def open_journal_window_editor(
                     cursor="hand2",
                 )
 
-    def _ask_companion_design_prompt() -> Optional[str]:
+    def _ask_companion_creator_options() -> Optional[Dict[str, Any]]:
         t = th()
-        result: Dict[str, Optional[str]] = {"value": None}
+        result: Dict[str, Optional[Dict[str, Any]]] = {"value": None}
         prompt_win = tk.Toplevel(root)
-        prompt_win.title(tr("pet.prompt_title"))
+        prompt_win.title(tr("pet.creator_title"))
         prompt_win.configure(bg=t.surface)
         prompt_win.transient(root)
         prompt_win.grab_set()
-        prompt_win.geometry("560x360")
-        prompt_win.minsize(420, 280)
+        prompt_win.geometry("640x520")
+        prompt_win.minsize(500, 400)
         prompt_win.grid_columnconfigure(0, weight=1)
-        prompt_win.grid_rowconfigure(1, weight=1)
+        prompt_win.grid_rowconfigure(5, weight=1)
         tk.Label(
             prompt_win,
-            text=tr("pet.prompt_body"),
+            text=tr("pet.creator_body"),
             bg=t.surface,
             fg=t.muted,
             font=("Segoe UI", 10),
             anchor="w",
             justify="left",
-            wraplength=500,
+            wraplength=540,
         ).grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 10))
+
+        frame_row = tk.Frame(prompt_win, bg=t.surface)
+        frame_row.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 12))
+        frame_row.grid_columnconfigure(1, weight=1)
+        tk.Label(
+            frame_row,
+            text=tr("pet.creator_frames_label"),
+            bg=t.surface,
+            fg=t.text,
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        frame_count_var = tk.StringVar(value="8")
+        frame_menu = tk.OptionMenu(
+            frame_row,
+            frame_count_var,
+            *[str(value) for value in COMPANION_FRAME_COUNT_OPTIONS],
+        )
+        frame_menu.configure(
+            bg=t.field,
+            fg=t.text,
+            activebackground=t.secondary_hover,
+            activeforeground=t.text,
+            highlightthickness=1,
+            highlightbackground=t.border,
+            relief="flat",
+            font=("Segoe UI", 10),
+            cursor="hand2",
+            width=8,
+        )
+        try:
+            frame_menu["menu"].configure(
+                bg=t.field,
+                fg=t.text,
+                activebackground=t.accent,
+                activeforeground="white",
+                relief="flat",
+                font=("Segoe UI", 10),
+            )
+        except tk.TclError:
+            pass
+        frame_menu.grid(row=0, column=1, sticky="w")
+
+        online_row = tk.Frame(prompt_win, bg=t.surface)
+        online_row.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 12))
+        online_row.grid_columnconfigure(1, weight=1)
+        tk.Label(
+            online_row,
+            text=tr("pet.creator_online_label"),
+            bg=t.surface,
+            fg=t.text,
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        online_reference_var = tk.StringVar(value="")
+        online_entry = tk.Entry(
+            online_row,
+            textvariable=online_reference_var,
+            bg=t.field,
+            fg=t.text,
+            insertbackground=t.text,
+            relief="flat",
+            font=("Segoe UI", 10),
+            highlightthickness=1,
+            highlightbackground=t.border,
+            highlightcolor=t.accent,
+        )
+        online_entry.grid(row=0, column=1, sticky="ew")
+        tk.Label(
+            prompt_win,
+            text=tr("pet.creator_online_hint"),
+            bg=t.surface,
+            fg=t.muted,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=580,
+        ).grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 10))
+
+        tk.Label(
+            prompt_win,
+            text=tr("pet.creator_preference_label"),
+            bg=t.surface,
+            fg=t.text,
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+        ).grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 8))
+
         prompt_text = tk.Text(
             prompt_win,
             bg=t.field,
@@ -9854,18 +10742,27 @@ def open_journal_window_editor(
             highlightbackground=t.border,
             highlightcolor=t.accent,
         )
-        prompt_text.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        prompt_text.grid(row=5, column=0, sticky="nsew", padx=18, pady=(0, 12))
         prompt_text.insert("1.0", tr("pet.prompt_default"))
         button_bar = tk.Frame(prompt_win, bg=t.surface)
-        button_bar.grid(row=2, column=0, sticky="e", padx=18, pady=(0, 18))
+        button_bar.grid(row=6, column=0, sticky="e", padx=18, pady=(0, 18))
 
-        def _close_with_value(value: Optional[str]) -> None:
+        def _close_with_value(value: Optional[Dict[str, Any]]) -> None:
             result["value"] = value
             try:
                 prompt_win.grab_release()
             except tk.TclError:
                 pass
             prompt_win.destroy()
+
+        def _generate_from_creator() -> None:
+            _close_with_value(
+                {
+                    "design_prompt": prompt_text.get("1.0", "end-1c").strip(),
+                    "frame_count": _normalize_companion_frame_count(frame_count_var.get()),
+                    "online_reference_query": online_reference_var.get().strip(),
+                }
+            )
 
         cancel_btn = tk.Button(
             button_bar,
@@ -9885,7 +10782,7 @@ def open_journal_window_editor(
         generate_btn = tk.Button(
             button_bar,
             text=tr("pet.prompt_generate"),
-            command=lambda: _close_with_value(prompt_text.get("1.0", "end-1c").strip()),
+            command=_generate_from_creator,
             bg=t.accent,
             fg="white",
             activebackground=t.hover_primary,
@@ -9900,9 +10797,9 @@ def open_journal_window_editor(
         prompt_win.protocol("WM_DELETE_WINDOW", lambda: _close_with_value(None))
         try:
             root.update_idletasks()
-            x = root.winfo_rootx() + max(40, (root.winfo_width() - 560) // 2)
-            y = root.winfo_rooty() + max(40, (root.winfo_height() - 360) // 2)
-            prompt_win.geometry(f"560x360+{x}+{y}")
+            x = root.winfo_rootx() + max(40, (root.winfo_width() - 640) // 2)
+            y = root.winfo_rooty() + max(40, (root.winfo_height() - 520) // 2)
+            prompt_win.geometry(f"640x520+{x}+{y}")
         except tk.TclError:
             pass
         prompt_text.focus_set()
@@ -9916,11 +10813,17 @@ def open_journal_window_editor(
             messagebox.showerror(tr("pet.title"), tr("pet.no_api_key"))
             return
         design_prompt = ""
+        animation_frame_count = 8
+        online_reference_query = ""
         if reference_image is None:
-            chosen_prompt = _ask_companion_design_prompt()
-            if chosen_prompt is None:
+            creator_options = _ask_companion_creator_options()
+            if creator_options is None:
                 return
-            design_prompt = chosen_prompt
+            design_prompt = str(creator_options.get("design_prompt") or "")
+            animation_frame_count = _normalize_companion_frame_count(
+                creator_options.get("frame_count", 8)
+            )
+            online_reference_query = str(creator_options.get("online_reference_query") or "").strip()
         elif not messagebox.askyesno(tr("pet.generate_confirm_title"), tr("pet.generate_confirm")):
             return
         level, _, _ = _desktop_pet_level()
@@ -9942,6 +10845,8 @@ def open_journal_window_editor(
                 reference_image_path=reference_image,
                 output_dir=COMPANION_INCOMING_DIR,
                 design_prompt=design_prompt,
+                animation_frame_count=animation_frame_count,
+                online_reference_query=online_reference_query,
             )
             root.after(0, lambda p=path, e=err: _done(p, e))
 
@@ -9974,7 +10879,11 @@ def open_journal_window_editor(
                         shutil.rmtree(target_animation_dir)
                     shutil.move(str(source_animation_dir), str(target_animation_dir))
                 if not any(target_animation_dir.glob("idle_*.png")):
-                    _write_local_companion_idle_frames(target_image, target_animation_dir)
+                    _write_local_companion_idle_frames(
+                        target_image,
+                        target_animation_dir,
+                        frame_count=animation_frame_count,
+                    )
             except Exception as exc:
                 pet_mood_lbl.config(text=tr("pet.generate_failed"))
                 messagebox.showerror(tr("pet.title"), tr("pet.profile_replace_failed").format(error=str(exc))[:4000])
@@ -10234,14 +11143,6 @@ def open_journal_window_editor(
                 animate=not bool(pet_overlay_state.get("dragging")),
             )
             if photo is not None:
-                canvas.create_oval(
-                    14,
-                    96,
-                    134,
-                    132,
-                    fill="#2A2D44",
-                    outline="",
-                )
                 if bubble_text:
                     _draw_pet_bubble(canvas, 8, 4, bubble_text, width_chars=16)
                 canvas.create_image(
@@ -10258,7 +11159,6 @@ def open_journal_window_editor(
             y = (32 if bubble_text else 12) - bounce
             if bubble_text:
                 _draw_pet_bubble(canvas, 8, 4, bubble_text, width_chars=16)
-            canvas.create_oval(x - 10, y + 58, x + 110, y + 118, fill="#2A2D44", outline="")
             canvas.create_oval(x + 8, y + 42, x + 92, y + 124, fill=body, outline=outline, width=2)
             canvas.create_oval(x + 30, y + 72, x + 72, y + 116, fill=belly, outline="")
             canvas.create_oval(x + 8, y + 18, x + 92, y + 88, fill=body, outline=outline, width=2)
@@ -10320,7 +11220,7 @@ def open_journal_window_editor(
                 return
         except tk.TclError:
             pet_overlay_state["window"] = None
-        transparent = "#00ff7f"
+        transparent = "#010203"
         win = tk.Toplevel(root)
         win.overrideredirect(True)
         try:
